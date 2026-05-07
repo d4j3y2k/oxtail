@@ -1,7 +1,9 @@
+import { birthTimeMatchStrategy } from "./birthTimeMatchStrategy.js";
 import { envStrategy } from "./envStrategy.js";
 import type { DetectContext, DetectStrategy, SessionIdResult } from "./types.js";
 
 export type { DetectContext, DetectStrategy, SessionIdResult } from "./types.js";
+export { birthTimeMatchStrategy } from "./birthTimeMatchStrategy.js";
 export { envStrategy } from "./envStrategy.js";
 
 export function composeDetectors(strategies: DetectStrategy[]) {
@@ -14,5 +16,4 @@ export function composeDetectors(strategies: DetectStrategy[]) {
   };
 }
 
-// Default composer. Birth-time strategy is added in Phase 5.
-export const detectSessionId = composeDetectors([envStrategy]);
+export const detectSessionId = composeDetectors([envStrategy, birthTimeMatchStrategy]);
