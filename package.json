@@ -1,0 +1,21 @@
+{
+  "name": "oxtail",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Coordination layer for parallel AI coding agent sessions, exposed over MCP.",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.0"
+  }
+}
