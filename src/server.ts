@@ -5,7 +5,7 @@ import * as z from "zod/v4";
 import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { dirname, join, sep } from "node:path";
-import { detectClient, type ClientType } from "./clients.js";
+import { clientFromHandshake, detectClient, type ClientType } from "./clients.js";
 import {
   buildEntry,
   findByTmuxSession,
@@ -51,6 +51,8 @@ type ReadResult = {
 
 const TMUX_LIST_FORMAT =
   "#{session_name}|#{session_path}|#{session_created}|#{session_attached}|#{session_windows}";
+
+const TMUX_PANES_FORMAT = "#{session_name}|#{pane_current_path}";
 
 function inferProjectRoot(start: string): string {
   let dir = start;
@@ -110,13 +112,41 @@ function listTmuxSessionsRaw(): {
   return { rows, error: null };
 }
 
+function listTmuxPaneCwds(): Map<string, string[]> {
+  let raw: string;
+  try {
+    raw = execFileSync("tmux", ["list-panes", "-a", "-F", TMUX_PANES_FORMAT], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch {
+    return new Map();
+  }
+  const out = new Map<string, string[]>();
+  for (const line of raw.split("\n")) {
+    if (!line) continue;
+    const [name, path] = line.split("|");
+    if (!name || !path) continue;
+    const arr = out.get(name);
+    if (arr) arr.push(path);
+    else out.set(name, [path]);
+  }
+  return out;
+}
+
 function buildListResult(input: { project_root?: string }): ListResult {
   const explicit = typeof input.project_root === "string" && input.project_root.length > 0;
   const root = explicit ? input.project_root! : inferProjectRoot(process.cwd());
   const resolvedRoot = safeRealpath(root);
 
   const { rows, error } = listTmuxSessionsRaw();
-  const matched = rows.filter((s) => isDescendantOrEqual(s.path, resolvedRoot));
+  const paneCwds = listTmuxPaneCwds();
+  const matched = rows.filter((s) => {
+    if (isDescendantOrEqual(s.path, resolvedRoot)) return true;
+    const cwds = paneCwds.get(s.name);
+    if (!cwds) return false;
+    return cwds.some((p) => isDescendantOrEqual(safeRealpath(p), resolvedRoot));
+  });
 
   const registry = readAll();
   const byTmux = new Map<string, (typeof registry)[number]>();
@@ -238,7 +268,18 @@ process.on("SIGTERM", () => {
   process.exit(0);
 });
 
-const server = new McpServer({ name: "oxtail", version: "0.2.0" });
+const server = new McpServer({ name: "oxtail", version: "0.2.1" });
+
+server.server.oninitialized = (): void => {
+  const info = server.server.getClientVersion();
+  if (!info) return;
+  const refined = clientFromHandshake(info);
+  if (refined.type === entry.client.type && refined.session_id === entry.client.session_id) {
+    return;
+  }
+  entry.client = refined;
+  register(entry);
+};
 
 server.registerTool(
   "list_project_sessions",

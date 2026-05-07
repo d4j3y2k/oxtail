@@ -43,3 +43,38 @@ export function detectClient(env = process.env, cwd = process.cwd()): ClientInfo
 
   return { type: "unknown", session_id: null, transcript_path: null, cwd };
 }
+
+export type ClientInfoHeader = { name?: string; version?: string };
+
+export function clientFromHandshake(
+  info: ClientInfoHeader | undefined,
+  env = process.env,
+  cwd = process.cwd(),
+): ClientInfo {
+  const name = info?.name?.toLowerCase() ?? "";
+
+  if (name.includes("claude")) {
+    const sessionId = env.CLAUDE_CODE_SESSION_ID ?? null;
+    const transcript_path = sessionId
+      ? join(
+          homedir(),
+          ".claude",
+          "projects",
+          encodeCwdForClaudeProjects(cwd),
+          `${sessionId}.jsonl`,
+        )
+      : null;
+    return { type: "claude-code", session_id: sessionId, transcript_path, cwd };
+  }
+
+  if (name.includes("codex")) {
+    return {
+      type: "codex",
+      session_id: env.CODEX_SESSION_ID ?? null,
+      transcript_path: null,
+      cwd,
+    };
+  }
+
+  return detectClient(env, cwd);
+}
