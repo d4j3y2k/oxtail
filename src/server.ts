@@ -9,8 +9,10 @@ import {
   clientFromHandshake,
   detectClient,
   enrichSessionId,
+  transcriptPathFor,
   type ClientType,
 } from "./clients.js";
+import { diagnoseDetect } from "./detect/index.js";
 import {
   buildEntry,
   findByTmuxSession,
@@ -358,6 +360,94 @@ server.registerTool(
   async ({ name, mode, limit, pane_lines }) => {
     const result = readSession({ name, mode, limit, pane_lines });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+server.registerTool(
+  "register_my_session",
+  {
+    description:
+      "Pin this MCP server's session_id directly. Use this when automatic detection (env/birth-time) is missing or ambiguous — for example, when the agent has its own session_id available in its shell env (e.g. $CLAUDE_CODE_SESSION_ID) but the MCP server doesn't. Updates the registry entry in place and persists.",
+    inputSchema: {
+      session_id: z
+        .string()
+        .min(1)
+        .describe("The session id to record for this MCP server's owning agent."),
+    },
+  },
+  async ({ session_id }) => {
+    entry.client = {
+      ...entry.client,
+      session_id,
+      transcript_path:
+        entry.client.type === "unknown"
+          ? entry.client.transcript_path
+          : transcriptPathFor(entry.client.type, session_id, entry.client.cwd),
+    };
+    register(entry);
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              schema_version: 1,
+              ok: true,
+              entry: {
+                server_pid: entry.server_pid,
+                started_at: entry.started_at,
+                tmux_session: entry.tmux_session,
+                client: entry.client,
+              },
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
+server.registerTool(
+  "get_my_session",
+  {
+    description:
+      "Returns this MCP server's own registry entry plus a per-strategy detection diagnosis (env, birth-time). Useful for debugging why client_session_id resolution did or didn't work.",
+    inputSchema: {},
+  },
+  async () => {
+    const diagnosis =
+      entry.client.type === "unknown"
+        ? { per_strategy: {}, winning: null }
+        : diagnoseDetect({
+            type: entry.client.type,
+            cwd: entry.client.cwd,
+            started_at: entry.started_at,
+            env: process.env,
+          });
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              schema_version: 1,
+              entry: {
+                server_pid: entry.server_pid,
+                started_at: entry.started_at,
+                tmux_pane: entry.tmux_pane,
+                tmux_session: entry.tmux_session,
+                client: entry.client,
+              },
+              detect_diagnosis: diagnosis,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
   },
 );
 
