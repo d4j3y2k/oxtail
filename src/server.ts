@@ -9,10 +9,12 @@ import {
   clientFromHandshake,
   detectClient,
   enrichSessionId,
+  enrichWithDiagnosis,
   transcriptPathFor,
   type ClientType,
 } from "./clients.js";
 import { diagnoseDetect } from "./detect/index.js";
+import { trace } from "./trace.js";
 import {
   buildEntry,
   findByTmuxSession,
@@ -260,7 +262,11 @@ function readSession(input: {
 
 const client = detectClient();
 const entry = buildEntry(client);
-entry.client = enrichSessionId(entry.client, entry.started_at);
+{
+  const { client: enriched, diagnosis } = enrichWithDiagnosis(entry.client, entry.started_at);
+  emitDetectTrace("startup", diagnosis);
+  entry.client = enriched;
+}
 register(entry);
 
 const cleanup = (): void => {
@@ -281,26 +287,41 @@ const server = new McpServer({ name: "oxtail", version: "0.2.1" });
 const LATE_REDETECT_DELAYS_MS = [1_000, 5_000, 30_000, 5 * 60_000];
 let lateRedetectScheduled = false;
 
+function emitDetectTrace(trigger: string, diagnosis: ReturnType<typeof diagnoseDetect> | null): void {
+  if (!diagnosis) return;
+  trace("detect_run", {
+    trigger,
+    winning_strategy: diagnosis.winning?.strategy ?? null,
+    session_id: diagnosis.winning?.session_id ?? null,
+    per_strategy: diagnosis.per_strategy,
+  });
+}
+
 function scheduleLateRedetect(): void {
   if (lateRedetectScheduled) return;
   lateRedetectScheduled = true;
-  for (const delay of LATE_REDETECT_DELAYS_MS) {
+  LATE_REDETECT_DELAYS_MS.forEach((delay) => {
     // unref so these never keep the process alive past its natural lifetime
     setTimeout(() => {
       if (entry.client.session_id) return;
-      const refined = enrichSessionId(entry.client, entry.started_at);
+      const { client: refined, diagnosis } = enrichWithDiagnosis(entry.client, entry.started_at);
+      emitDetectTrace(`retry+${delay}ms`, diagnosis);
       if (refined.session_id && refined.session_id !== entry.client.session_id) {
         entry.client = refined;
         register(entry);
       }
     }, delay).unref();
-  }
+  });
 }
 
 server.server.oninitialized = (): void => {
   const info = server.server.getClientVersion();
   if (!info) return;
-  const refined = enrichSessionId(clientFromHandshake(info), entry.started_at);
+  const { client: refined, diagnosis } = enrichWithDiagnosis(
+    clientFromHandshake(info),
+    entry.started_at,
+  );
+  emitDetectTrace("oninitialized", diagnosis);
   if (refined.type !== entry.client.type || refined.session_id !== entry.client.session_id) {
     entry.client = refined;
     register(entry);

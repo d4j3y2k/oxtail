@@ -1,7 +1,7 @@
 import { existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { detectSessionId } from "./detect/index.js";
+import { diagnoseDetect, type DetectDiagnosis } from "./detect/index.js";
 
 export type ClientType = "claude-code" | "codex" | "unknown";
 
@@ -37,29 +37,45 @@ export function transcriptPathFor(
 }
 
 // Run the detection composer to fill in `session_id` and `transcript_path`
-// when the env-based detection couldn't get them. Idempotent: if the client
-// already has a session_id, returns it unchanged.
-export function enrichSessionId(
+// when env-based detection couldn't get them. Returns the (possibly updated)
+// client plus the per-strategy diagnosis (or null if detection was skipped
+// because the client was already resolved or its type is unknown).
+export function enrichWithDiagnosis(
   client: ClientInfo,
   started_at: number,
   env: NodeJS.ProcessEnv = process.env,
-): ClientInfo {
-  if (client.session_id) return client;
-  if (client.type === "unknown") return client;
-
-  const result = detectSessionId({
+): { client: ClientInfo; diagnosis: DetectDiagnosis | null } {
+  if (client.session_id || client.type === "unknown") {
+    return { client, diagnosis: null };
+  }
+  const diagnosis = diagnoseDetect({
     type: client.type,
     cwd: client.cwd,
     started_at,
     env,
   });
-  if (!result) return client;
-
+  if (!diagnosis.winning) return { client, diagnosis };
   return {
-    ...client,
-    session_id: result.session_id,
-    transcript_path: transcriptPathFor(client.type, result.session_id, client.cwd),
+    client: {
+      ...client,
+      session_id: diagnosis.winning.session_id,
+      transcript_path: transcriptPathFor(
+        client.type,
+        diagnosis.winning.session_id,
+        client.cwd,
+      ),
+    },
+    diagnosis,
   };
+}
+
+// Convenience wrapper when the caller doesn't need the diagnosis.
+export function enrichSessionId(
+  client: ClientInfo,
+  started_at: number,
+  env: NodeJS.ProcessEnv = process.env,
+): ClientInfo {
+  return enrichWithDiagnosis(client, started_at, env).client;
 }
 
 // Codex stores transcripts at ~/.codex/sessions/<Y>/<M>/<D>/rollout-<iso>-<uuid>.jsonl
