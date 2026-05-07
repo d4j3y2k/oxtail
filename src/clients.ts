@@ -1,6 +1,7 @@
 import { existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { detectSessionId } from "./detect/index.js";
 
 export type ClientType = "claude-code" | "codex" | "unknown";
 
@@ -23,6 +24,42 @@ function claudeTranscriptPath(sessionId: string, cwd: string): string {
     encodeCwdForClaudeProjects(cwd),
     `${sessionId}.jsonl`,
   );
+}
+
+export function transcriptPathFor(
+  type: ClientType,
+  sessionId: string,
+  cwd: string,
+): string | null {
+  if (type === "claude-code") return claudeTranscriptPath(sessionId, cwd);
+  if (type === "codex") return findCodexTranscriptPath(sessionId);
+  return null;
+}
+
+// Run the detection composer to fill in `session_id` and `transcript_path`
+// when the env-based detection couldn't get them. Idempotent: if the client
+// already has a session_id, returns it unchanged.
+export function enrichSessionId(
+  client: ClientInfo,
+  started_at: number,
+  env: NodeJS.ProcessEnv = process.env,
+): ClientInfo {
+  if (client.session_id) return client;
+  if (client.type === "unknown") return client;
+
+  const result = detectSessionId({
+    type: client.type,
+    cwd: client.cwd,
+    started_at,
+    env,
+  });
+  if (!result) return client;
+
+  return {
+    ...client,
+    session_id: result.session_id,
+    transcript_path: transcriptPathFor(client.type, result.session_id, client.cwd),
+  };
 }
 
 // Codex stores transcripts at ~/.codex/sessions/<Y>/<M>/<D>/rollout-<iso>-<uuid>.jsonl

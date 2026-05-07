@@ -5,7 +5,12 @@ import * as z from "zod/v4";
 import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { dirname, join, sep } from "node:path";
-import { clientFromHandshake, detectClient, type ClientType } from "./clients.js";
+import {
+  clientFromHandshake,
+  detectClient,
+  enrichSessionId,
+  type ClientType,
+} from "./clients.js";
 import {
   buildEntry,
   findByTmuxSession,
@@ -253,6 +258,7 @@ function readSession(input: {
 
 const client = detectClient();
 const entry = buildEntry(client);
+entry.client = enrichSessionId(entry.client, entry.started_at);
 register(entry);
 
 const cleanup = (): void => {
@@ -273,7 +279,7 @@ const server = new McpServer({ name: "oxtail", version: "0.2.1" });
 server.server.oninitialized = (): void => {
   const info = server.server.getClientVersion();
   if (!info) return;
-  const refined = clientFromHandshake(info);
+  const refined = enrichSessionId(clientFromHandshake(info), entry.started_at);
   if (refined.type === entry.client.type && refined.session_id === entry.client.session_id) {
     return;
   }
