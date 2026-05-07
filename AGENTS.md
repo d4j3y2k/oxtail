@@ -17,11 +17,11 @@ Scope is **project-root as the unit**. Sessions in `~/dev/foo` see each other; s
 - **Registry (leaning):** `tmux list-sessions` filtered by project-derived names, rather than a custom JSON registry. Free dead-session detection, free naming, no daemon to maintain. Decision pending real-use signals.
 - **Project scoping:** project root inferred from session CWD at agent startup.
 
-## Status: pre-implementation
+## Status: v1 shipped, dogfooding
 
-The repo exists. Nothing has been built. Current phase is **observation**: daily-driving Termius + tmux + plain SSH and logging coordination friction moments — concrete instances where one session would have benefited from seeing another. Those moments will name the first 1–2 MCP tools, rather than committing to a speculative API up front.
+v1 is live. The first tool, `list_project_sessions(project_root)`, is implemented as a stdio MCP server backed by `tmux list-sessions`. Registered both project-locally (via `.mcp.json` using `tsx ./src/server.ts` for the dev loop) and globally (in `~/.claude.json` and `~/.codex/config.toml`, pointing at `dist/server.js`).
 
-The likely first tool when work begins: `list_project_sessions(project_root)` — minimum viable "who else is here?" endpoint.
+Current phase is **dogfooding**: use it in real parallel-agent work and log friction in `NOTES.md` as it surfaces. The next tool will be named by observation, not by speculation. See `NOTES.md` for review notes; see the v1 plan at `~/.claude/plans/cozy-forging-hickey.md` for design rationale and deferred items.
 
 ## How to collaborate on this project
 
