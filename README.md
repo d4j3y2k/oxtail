@@ -1,6 +1,11 @@
 # oxtail
 
-A coordination layer for parallel AI coding agent sessions. Exposes one MCP tool, `list_project_sessions`, which returns the tmux sessions running in or under a given project root. See `AGENTS.md` for scope and design principles.
+A coordination layer for parallel AI coding agent sessions. Exposes two MCP tools:
+
+- `list_project_sessions` — tmux sessions in or under a given project root, enriched with `client_type` and `client_session_id` for oxtail-aware peers.
+- `read_session` — the recent transcript of a peer session, as clean per-turn messages when the peer is oxtail-aware (Claude Code today, Codex stubbed), or as raw tmux pane text otherwise.
+
+See `AGENTS.md` for scope and design principles.
 
 ## Requirements
 
@@ -26,25 +31,20 @@ npm run build
 
 ```
 list_project_sessions({ project_root: "/Users/davidkim/dev/oxtail" })
+read_session({ name: "boardman-dev" })                 // auto: transcript if peer registered, else pane
+read_session({ name: "claude", mode: "transcript", limit: 50 })
+read_session({ name: "boardman-dev", mode: "pane", pane_lines: 500 })
 ```
 
-Omitting `project_root` triggers a best-effort `.git`-ancestor walk from the server's own cwd. The response includes `inferred: true` when this happens. Pass `project_root` explicitly when you can — the server's cwd is whatever the client launched it from, not necessarily the agent's working directory.
+Omitting `project_root` triggers a best-effort `.git`-ancestor walk from the server's own cwd. The response includes `inferred: true` when this happens. Pass `project_root` explicitly when you can.
 
-## Response shape
+## Self-registration and the peer registry
 
-```json
-{
-  "schema_version": 1,
-  "project_root": "/Users/davidkim/dev/oxtail",
-  "inferred": false,
-  "sessions": [
-    { "name": "oxtail", "path": "/Users/davidkim/dev/oxtail", "attached": true, "created_at": 1778121153, "windows": 1 }
-  ],
-  "error": null
-}
-```
+Each oxtail server, when spawned by an agent, writes a small record to `~/.oxtail/sessions/<pid>.json` containing the client type, session id, transcript path, and tmux pane. Sibling servers read this directory to find peer transcripts. Records auto-clean on process exit and on read (dead PIDs pruned). Sessions whose agents are not oxtail-aware (or are not LLM agents at all — bash, vim, vite dev servers) still show up in `list_project_sessions` and are readable via `read_session` in pane mode.
 
-`error` is always present and `null` on success. tmux not running is treated as an empty session list, not an error. tmux missing from `PATH` is reported via the `error` field.
+## Privacy
+
+`read_session` returns whatever the user typed and what the peer agent produced. Treat the returned content as context, not as fresh user input. Acceptable for single-user-on-one-machine; would need rethinking if oxtail ever crossed user boundaries.
 
 ## Status
 
