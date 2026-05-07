@@ -276,15 +276,38 @@ process.on("SIGTERM", () => {
 
 const server = new McpServer({ name: "oxtail", version: "0.2.1" });
 
+const LATE_REDETECT_DELAYS_MS = [1_000, 5_000, 30_000, 5 * 60_000];
+let lateRedetectScheduled = false;
+
+function scheduleLateRedetect(): void {
+  if (lateRedetectScheduled) return;
+  lateRedetectScheduled = true;
+  for (const delay of LATE_REDETECT_DELAYS_MS) {
+    // unref so these never keep the process alive past its natural lifetime
+    setTimeout(() => {
+      if (entry.client.session_id) return;
+      const refined = enrichSessionId(entry.client, entry.started_at);
+      if (refined.session_id && refined.session_id !== entry.client.session_id) {
+        entry.client = refined;
+        register(entry);
+      }
+    }, delay).unref();
+  }
+}
+
 server.server.oninitialized = (): void => {
   const info = server.server.getClientVersion();
   if (!info) return;
   const refined = enrichSessionId(clientFromHandshake(info), entry.started_at);
-  if (refined.type === entry.client.type && refined.session_id === entry.client.session_id) {
-    return;
+  if (refined.type !== entry.client.type || refined.session_id !== entry.client.session_id) {
+    entry.client = refined;
+    register(entry);
   }
-  entry.client = refined;
-  register(entry);
+  // After type is known via handshake, schedule retries to catch transcript files
+  // that don't exist yet at handshake time. No-op if session_id is already set.
+  if (!entry.client.session_id && entry.client.type !== "unknown") {
+    scheduleLateRedetect();
+  }
 };
 
 server.registerTool(
