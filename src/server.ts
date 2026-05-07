@@ -282,7 +282,7 @@ process.on("SIGTERM", () => {
   process.exit(0);
 });
 
-const server = new McpServer({ name: "oxtail", version: "0.2.1" });
+const server = new McpServer({ name: "oxtail", version: "0.3.0" });
 
 const LATE_REDETECT_DELAYS_MS = [1_000, 5_000, 30_000, 5 * 60_000];
 let lateRedetectScheduled = false;

@@ -17,11 +17,13 @@ Scope is **project-root as the unit**. Sessions in `~/dev/foo` see each other; s
 - **Registry (leaning):** `tmux list-sessions` filtered by project-derived names, rather than a custom JSON registry. Free dead-session detection, free naming, no daemon to maintain. Decision pending real-use signals.
 - **Project scoping:** project root inferred from session CWD at agent startup.
 
-## Status: v1 shipped, dogfooding
+## Status: v0.3.0 shipped, dogfooding
 
-v1 is live. The first tool, `list_project_sessions(project_root)`, is implemented as a stdio MCP server backed by `tmux list-sessions`. Registered both project-locally (via `.mcp.json` using `tsx ./src/server.ts` for the dev loop) and globally (in `~/.claude.json` and `~/.codex/config.toml`, pointing at `dist/server.js`).
+v0.3.0 is live with four MCP tools: `list_project_sessions`, `read_session`, `register_my_session`, and `get_my_session`. Registered both project-locally (via `.mcp.json` using `tsx ./src/server.ts` for the dev loop) and globally (in `~/.claude.json` and `~/.codex/config.toml`, pointing at `dist/server.js`).
 
-Current phase is **dogfooding**: use it in real parallel-agent work and log friction in `NOTES.md` as it surfaces. The next tool will be named by observation, not by speculation. See `NOTES.md` for review notes; see the v1 plan at `~/.claude/plans/cozy-forging-hickey.md` for design rationale and deferred items.
+The big v0.3.0 change: peer `client_session_id` and `transcript_path` now resolve reliably for Claude Code and Codex peers, even though Claude Code strips its session-id env var from MCP children. Detection layers in `src/detect/` — env, then birth-time fingerprint matching of transcript files, with a `register_my_session` escape hatch — see `README.md` for details.
+
+Current phase remains **dogfooding**: use the tools in real parallel-agent work, log friction in `NOTES.md`. See the v0.3.0 plan at `~/.claude/plans/humming-chasing-flame.md` for the design rationale and `~/.claude/plans/cozy-forging-hickey.md` for the original v1 plan.
 
 ## How to collaborate on this project
 
