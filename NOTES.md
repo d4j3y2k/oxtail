@@ -42,3 +42,21 @@ Clarify in the README and tool description that callers should pass `project_roo
 ## Pushback
 
 README and global registration snippets may be premature if this repo is still observation-driven. A first note should capture the observed friction that justified leaving pre-implementation, then the smallest local MCP implementation can follow. That keeps the project history aligned with the stated discipline in `AGENTS.md`.
+
+## 2026-05-08 dogfooding: Codex self-registration env mismatch
+
+- In this Codex session, `get_my_session` correctly surfaced the unresolved `client.session_id` and recommended the `register_my_session` escape hatch.
+- The suggested shell command was `echo $CODEX_COMPANION_SESSION_ID`, but that variable was empty in the Codex shell. Available related vars included `CODEX_THREAD_ID`.
+- `CODEX_THREAD_ID` matched the UUID in the active rollout transcript path: `~/.codex/sessions/2026/05/08/rollout-2026-05-08T09-28-33-019e07c6-8e39-7d00-aa6f-cdff47651add.jsonl`.
+- Registering `CODEX_THREAD_ID` with `register_my_session` succeeded, and `list_project_sessions` then showed `oxtail3` with `client_type: codex` and the correct `client_session_id`.
+
+Follow-up: support `CODEX_THREAD_ID` as the preferred Codex env strategy alias and use it in `next_step` guidance. **Resolved (2026-05-09):** `src/detect/envStrategy.ts:4` checks `CODEX_THREAD_ID` first, falling back to `CODEX_COMPANION_SESSION_ID`. `src/detect/index.ts:53–58` emits `echo $CODEX_THREAD_ID` in `next_step` for Codex clients. Tests at `src/detect/envStrategy.test.ts:29` and `src/detect/index.test.ts:60` cover both behaviors.
+
+## 2026-05-08 dogfooding: self-registration UX/context overhead
+
+- Registering this Codex session succeeded via the intended path: `get_my_session`, shell-read `CODEX_THREAD_ID`, `register_my_session`, then verify with `get_my_session`.
+- Operator feedback: this felt too long-winded for a tool whose purpose is lightweight shared context across multiple sessions.
+- The skill currently behaves like a visible workflow recipe. That is mechanically correct, but it spends chat/context on implementation ceremony.
+- Desired UX for routine use: quiet execution and a final compact result, ideally just registration success, `session_id`, and `transcript_path`.
+
+Follow-up: tighten the registration skill and/or add a single high-level MCP/tooling path so the common case does not bloat the transcript. **Resolved (2026-05-09):** `claim_session` is the single high-level path. The Claude `oxtail-join` command and Codex `oxtail-register` skill now use it — two tool calls (Bash echo + claim_session) instead of three or four, with a compact `{ ok, session_id, transcript_path }` response.

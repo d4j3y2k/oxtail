@@ -17,13 +17,15 @@ Scope is **project-root as the unit**. Sessions in `~/dev/foo` see each other; s
 - **Registry (leaning):** `tmux list-sessions` filtered by project-derived names, rather than a custom JSON registry. Free dead-session detection, free naming, no daemon to maintain. Decision pending real-use signals.
 - **Project scoping:** project root inferred from session CWD at agent startup.
 
-## Status: v0.3.0 shipped, dogfooding
+## Status: v0.4.0 shipped, dogfooding
 
-v0.3.0 is live with four MCP tools: `list_project_sessions`, `read_session`, `register_my_session`, and `get_my_session`. Registered both project-locally (via `.mcp.json` using `tsx ./src/server.ts` for the dev loop) and globally (in `~/.claude.json` and `~/.codex/config.toml`, pointing at `dist/server.js`).
+Six MCP tools live: `list_project_sessions`, `read_session`, `claim_session`, `set_my_state`, `register_my_session`, and `get_my_session`. Registered both project-locally (via `.mcp.json` using `tsx ./src/server.ts` for the dev loop) and globally (in `~/.claude.json` and `~/.codex/config.toml`, pointing at `dist/server.js`).
 
-The big v0.3.0 change: peer `client_session_id` and `transcript_path` now resolve reliably for Claude Code and Codex peers, even though Claude Code strips its session-id env var from MCP children. Detection layers in `src/detect/` — env, then birth-time fingerprint matching of transcript files, with a `register_my_session` escape hatch — see `README.md` for details.
+The v0.4.0 change: peer `client_session_id` and `transcript_path` now resolve reliably for Claude Code and Codex peers, even though Claude Code strips its session-id env var from MCP children. Detection layers in `src/detect/` — env, then birth-time fingerprint matching of transcript files, with a `claim_session` escape hatch (`register_my_session` is kept for debugging) — see `README.md` for details.
 
-Current phase remains **dogfooding**: use the tools in real parallel-agent work, log friction in `NOTES.md`. See the v0.3.0 plan at `~/.claude/plans/humming-chasing-flame.md` for the design rationale and `~/.claude/plans/cozy-forging-hickey.md` for the original v1 plan.
+The follow-on additions (`claim_session`, `set_my_state`) introduce a peer-awareness layer: `list_project_sessions` now surfaces each peer's `state` card so an agent can learn what its peers are doing without paying for `read_session`. Raw transcripts become the deep-dive fallback, not the default mode of peer awareness.
+
+Current phase remains **dogfooding**: use the tools in real parallel-agent work, log friction in `NOTES.md`. See the v0.3.0 plan at `~/.claude/plans/humming-chasing-flame.md` for the design rationale, `~/.claude/plans/cozy-forging-hickey.md` for the original v1 plan, and `~/.claude/plans/inherited-knitting-owl.md` for the peer-awareness layer.
 
 ## How to collaborate on this project
 

@@ -57,6 +57,24 @@ export function readClaudeTranscript(path: string, limit = 100): TranscriptResul
   return { messages: tail, truncated, total_messages: messages.length };
 }
 
+// Codex CLI injects two kinds of blocks into the first user message of a
+// rollout that look identical to user input at the role/type level:
+//   1. The AGENTS.md preamble, prefixed with the literal "# AGENTS.md
+//      instructions for " and wrapped in <INSTRUCTIONS>...</INSTRUCTIONS>.
+//   2. An <environment_context>...</environment_context> block.
+// Both prefixes are emitted by Codex itself, not typed by the user, so we
+// drop them at the block level — preserving any other blocks in the same
+// message in the unlikely case a real user authored mixed content.
+export function isCodexInjectedBlock(text: string): boolean {
+  const t = text.trimStart();
+  if (t.startsWith("# AGENTS.md instructions for ")) return true;
+  const trimmed = text.trim();
+  if (trimmed.startsWith("<environment_context>") && trimmed.endsWith("</environment_context>")) {
+    return true;
+  }
+  return false;
+}
+
 function extractTextFromCodexContent(content: unknown): string {
   if (!Array.isArray(content)) return "";
   const parts: string[] = [];
@@ -64,6 +82,7 @@ function extractTextFromCodexContent(content: unknown): string {
     if (!block || typeof block !== "object") continue;
     const b = block as { type?: string; text?: string };
     if ((b.type === "input_text" || b.type === "output_text") && typeof b.text === "string") {
+      if (isCodexInjectedBlock(b.text)) continue;
       parts.push(b.text);
     }
   }

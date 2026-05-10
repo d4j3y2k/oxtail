@@ -10,6 +10,7 @@ import {
   pickByDelta,
   type Candidate,
 } from "./birthTimeMatchStrategy.js";
+import { isAbstain } from "./types.js";
 
 // ----- pickByDelta (pure) -----
 
@@ -31,39 +32,21 @@ test("pickByDelta: rejects candidates outside 5min window", () => {
   assert.equal(r, null);
 });
 
-test("pickByDelta: smallest positive delta wins among multiple", () => {
+test("pickByDelta: multiple positive-delta candidates returns null (ambiguous)", () => {
   const cands: Candidate[] = [
     { session_id: "A", birth_ms: 100_000 },
     { session_id: "B", birth_ms: 50_000 },
     { session_id: "C", birth_ms: 200_000 },
   ];
   const r = pickByDelta(cands, 10_000);
-  assert.equal(r?.session_id, "B");
-});
-
-test("pickByDelta: ambiguity within 2s returns null", () => {
-  const cands: Candidate[] = [
-    { session_id: "A", birth_ms: 10_500 },
-    { session_id: "B", birth_ms: 11_500 },
-  ];
-  const r = pickByDelta(cands, 10_000);
-  assert.equal(r, null, "1s spread is within 2s ambiguity window");
-});
-
-test("pickByDelta: well-separated candidates are not ambiguous", () => {
-  const cands: Candidate[] = [
-    { session_id: "A", birth_ms: 11_000 },
-    { session_id: "B", birth_ms: 14_000 },
-  ];
-  const r = pickByDelta(cands, 10_000);
-  assert.equal(r?.session_id, "A", "3s spread is outside 2s ambiguity window");
+  assert.equal(r, null, "any 2+ in-window candidates means another Claude is in this project");
 });
 
 test("pickByDelta: empty candidates returns null", () => {
   assert.equal(pickByDelta([], 10_000), null);
 });
 
-test("pickByDelta: real-world two-session case", () => {
+test("pickByDelta: real-world two-session case — older server null, newer resolves", () => {
   // From spike data:
   // MCP server pid 7155 started 1778156500 (08:21:40)
   // MCP server pid 9274 started 1778156607 (08:23:27)
@@ -74,10 +57,12 @@ test("pickByDelta: real-world two-session case", () => {
     { session_id: "c412dc1a", birth_ms: 1778156590_000 },
     { session_id: "a0152bce", birth_ms: 1778156639_000 },
   ];
+  // pid 7155 sees both transcripts as positive delta -> ambiguous, null
   const for7155 = pickByDelta(cands, 1778156500_000);
+  assert.equal(for7155, null, "older server can't disambiguate; falls through to register_my_session");
+  // pid 9274 sees only a0152bce as positive (c412dc1a was born before it started)
   const for9274 = pickByDelta(cands, 1778156607_000);
-  assert.equal(for7155?.session_id, "c412dc1a", "pid 7155 -> c412dc1a");
-  assert.equal(for9274?.session_id, "a0152bce", "pid 9274 -> a0152bce (smallest positive delta)");
+  assert.equal(for9274?.session_id, "a0152bce", "newer server still resolves cleanly");
 });
 
 // ----- listClaudeCandidates (real fs) -----
@@ -177,18 +162,20 @@ test("birthTimeMatchStrategy: claude-code resolves a freshly-created transcript"
       started_at: startedAt,
       env: {},
     });
-    assert.equal(result, null);
+    assert.ok(isAbstain(result));
+    assert.match(result.reason, /no transcript files/);
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
 });
 
-test("birthTimeMatchStrategy: unknown client type returns null", () => {
+test("birthTimeMatchStrategy: unknown client type abstains with reason", () => {
   const result = birthTimeMatchStrategy({
     type: "unknown",
     cwd: "/anywhere",
     started_at: Math.floor(Date.now() / 1000),
     env: {},
   });
-  assert.equal(result, null);
+  assert.ok(isAbstain(result));
+  assert.match(result.reason, /unknown/);
 });

@@ -1,32 +1,26 @@
 import { closeSync, existsSync, openSync, readSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { DetectStrategy } from "./types.js";
+import type { DetectStrategy, StrategyAbstention } from "./types.js";
 
 const FIVE_MIN_MS = 5 * 60 * 1000;
-const AMBIGUITY_WINDOW_MS = 2 * 1000;
 const UUID_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/;
 
 export type Candidate = { session_id: string; birth_ms: number };
 
-// Pure ranking logic — separated from IO so it can be unit tested directly.
+// Returns the unique post-start candidate inside the window, or null if there
+// are zero or multiple. Multiple positive-delta candidates means another
+// Claude Code is sharing this project; we can't safely guess which transcript
+// belongs to us, so we fall through to register_my_session.
 export function pickByDelta(
   candidates: Candidate[],
   startedAtMs: number,
   windowMs = FIVE_MIN_MS,
-  ambiguityWindowMs = AMBIGUITY_WINDOW_MS,
 ): Candidate | null {
   const ranked = candidates
     .map((c) => ({ ...c, delta: c.birth_ms - startedAtMs }))
-    .filter((c) => c.delta > 0 && c.delta <= windowMs)
-    .sort((a, b) => a.delta - b.delta);
-  if (!ranked.length) return null;
-  if (
-    ranked.length >= 2 &&
-    Math.abs(ranked[0].delta - ranked[1].delta) <= ambiguityWindowMs
-  ) {
-    return null;
-  }
+    .filter((c) => c.delta > 0 && c.delta <= windowMs);
+  if (ranked.length !== 1) return null;
   return { session_id: ranked[0].session_id, birth_ms: ranked[0].birth_ms };
 }
 
@@ -146,15 +140,48 @@ export function listCodexCandidates(cwd: string, base = homedir()): Candidate[] 
   return listCodexCandidatesIn(recentCodexDateDirs(sessionsBase), cwd);
 }
 
+function abstainReason(
+  type: "claude-code" | "codex",
+  candidates: Candidate[],
+  startedAtMs: number,
+): StrategyAbstention {
+  if (candidates.length === 0) {
+    const where =
+      type === "claude-code" ? "~/.claude/projects/<encoded-cwd>" : "~/.codex/sessions/<recent>";
+    return {
+      abstain: true,
+      reason: `no transcript files in ${where} for this cwd; agent may not have started a transcript yet.`,
+    };
+  }
+  const ranked = candidates
+    .map((c) => ({ ...c, delta: c.birth_ms - startedAtMs }))
+    .filter((c) => c.delta > 0 && c.delta <= FIVE_MIN_MS);
+  if (ranked.length === 0) {
+    return {
+      abstain: true,
+      reason: `${candidates.length} transcript(s) in dir but none post-date this MCP server's started_at; transcript hasn't been created yet (retries scheduled).`,
+    };
+  }
+  return {
+    abstain: true,
+    structural: true,
+    reason: `${ranked.length} post-start transcripts in 5min window — ambiguous (multiple agents in this project). Cannot safely guess which is ours; call register_my_session.`,
+  };
+}
+
 export const birthTimeMatchStrategy: DetectStrategy = (ctx) => {
+  if (ctx.type === "unknown") {
+    return {
+      abstain: true,
+      reason: "client type unknown — no transcript directory to scan.",
+    };
+  }
   const startedAtMs = ctx.started_at * 1000;
   const candidates =
-    ctx.type === "claude-code"
-      ? listClaudeCandidates(ctx.cwd)
-      : ctx.type === "codex"
-        ? listCodexCandidates(ctx.cwd)
-        : [];
+    ctx.type === "claude-code" ? listClaudeCandidates(ctx.cwd) : listCodexCandidates(ctx.cwd);
   const pick = pickByDelta(candidates, startedAtMs);
-  if (!pick) return null;
-  return { session_id: pick.session_id, source: "birth-time", confidence: "medium" };
+  if (pick) {
+    return { session_id: pick.session_id, source: "birth-time", confidence: "medium" };
+  }
+  return abstainReason(ctx.type, candidates, startedAtMs);
 };

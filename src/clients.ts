@@ -2,6 +2,8 @@ import { existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { diagnoseDetect, type DetectDiagnosis } from "./detect/index.js";
+import { codexSessionIdFromEnv } from "./detect/envStrategy.js";
+import type { DetectSource } from "./detect/types.js";
 
 export type ClientType = "claude-code" | "codex" | "unknown";
 
@@ -9,6 +11,7 @@ export type ClientInfo = {
   type: ClientType;
   session_id: string | null;
   transcript_path: string | null;
+  session_id_source: DetectSource | null;
   cwd: string;
 };
 
@@ -64,6 +67,7 @@ export function enrichWithDiagnosis(
         diagnosis.winning.session_id,
         client.cwd,
       ),
+      session_id_source: diagnosis.winning.source,
     },
     diagnosis,
   };
@@ -127,21 +131,23 @@ export function detectClient(env = process.env, cwd = process.cwd()): ClientInfo
       type: "claude-code",
       session_id: sessionId,
       transcript_path: claudeTranscriptPath(sessionId, cwd),
+      session_id_source: "env",
       cwd,
     };
   }
 
-  if (env.CODEX_HOME || env.CODEX_COMPANION_SESSION_ID || env.CODEX_RUNTIME) {
-    const sessionId = env.CODEX_COMPANION_SESSION_ID ?? null;
+  if (env.CODEX_HOME || env.CODEX_THREAD_ID || env.CODEX_COMPANION_SESSION_ID || env.CODEX_RUNTIME) {
+    const sessionId = codexSessionIdFromEnv(env);
     return {
       type: "codex",
       session_id: sessionId,
       transcript_path: sessionId ? findCodexTranscriptPath(sessionId) : null,
+      session_id_source: sessionId ? "env" : null,
       cwd,
     };
   }
 
-  return { type: "unknown", session_id: null, transcript_path: null, cwd };
+  return { type: "unknown", session_id: null, transcript_path: null, session_id_source: null, cwd };
 }
 
 export type ClientInfoHeader = { name?: string; version?: string };
@@ -159,16 +165,18 @@ export function clientFromHandshake(
       type: "claude-code",
       session_id: sessionId,
       transcript_path: sessionId ? claudeTranscriptPath(sessionId, cwd) : null,
+      session_id_source: sessionId ? "env" : null,
       cwd,
     };
   }
 
   if (name.includes("codex")) {
-    const sessionId = env.CODEX_COMPANION_SESSION_ID ?? null;
+    const sessionId = codexSessionIdFromEnv(env);
     return {
       type: "codex",
       session_id: sessionId,
       transcript_path: sessionId ? findCodexTranscriptPath(sessionId) : null,
+      session_id_source: sessionId ? "env" : null,
       cwd,
     };
   }
