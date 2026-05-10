@@ -1,2 +1,5 @@
 node_modules/
 dist/
+.claude/projects/
+.claude/cache/
+.claude/settings.local.json

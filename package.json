@@ -1,14 +1,49 @@
 {
   "name": "oxtail",
   "version": "0.4.0",
-  "private": true,
+  "private": false,
   "type": "module",
   "description": "Coordination layer for parallel AI coding agent sessions, exposed over MCP.",
+  "main": "dist/server.js",
+  "bin": {
+    "oxtail": "dist/server.js"
+  },
+  "files": [
+    "dist",
+    "integrations",
+    ".claude/commands/oxtail-join.md",
+    "AGENTS.md",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "tsx watch src/server.ts",
     "start": "node dist/server.js",
-    "test": "node --import tsx --test 'src/**/*.test.ts'"
+    "test": "node --import tsx --test 'src/**/*.test.ts'",
+    "prepack": "rm -rf dist && npm run build",
+    "prepublishOnly": "npm test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/d4j3y2k/oxtail.git"
+  },
+  "homepage": "https://github.com/d4j3y2k/oxtail#readme",
+  "bugs": {
+    "url": "https://github.com/d4j3y2k/oxtail/issues"
+  },
+  "author": "David Kim <d4j3y2k@gmail.com>",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "claude-code",
+    "codex",
+    "tmux",
+    "agents",
+    "model-context-protocol"
+  ],
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

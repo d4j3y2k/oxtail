@@ -2,12 +2,12 @@
 
 A coordination layer for parallel AI coding agent sessions. Multiple Claude Code or Codex CLI sessions working in the same project root become aware of each other through an MCP server (running locally) that exposes peer-discovery and cross-session-state tools.
 
-Scope is **project-root as the unit**. Sessions in `~/dev/foo` see each other; sessions in `~/dev/bar` see each other; cross-project there is no visibility, by design.
+Scope is **project-root as the unit**. Sessions in one project root see each other; sessions in another see each other; cross-project there is no visibility, by design.
 
 ## What this isn't
 
-- **Not a phone client.** An earlier experiment (`~/dev/x-mux`) explored a custom phone PWA for AI coding agents. It's paused — Termius + tmux + plain SSH won the daily-drive comparison. The actual unmet need is coordination logic, not a custom client.
-- **Not a competitor to Terminator** (`~/dev/terminal-orchestrator`). Terminator is a desktop multi-agent orchestration tool with its own coherent UI. oxtail is a server-side layer that any client can leverage. Both coexist; oxtail is intentionally a separate repo to keep Terminator's identity clean.
+- **Not a phone client.** An earlier client-side experiment explored a custom phone PWA for AI coding agents. It's paused — Termius + tmux + plain SSH won the daily-drive comparison. The actual unmet need is coordination logic, not a custom client.
+- **Not a competitor to Terminator.** Terminator is a separate desktop multi-agent orchestration tool with its own coherent UI. oxtail is a server-side layer that any MCP client can leverage. Both coexist; oxtail is intentionally a separate repo to keep Terminator's identity clean.
 - **Not a wrapper around tmux.** tmux is the implementation primitive most likely to back the session registry, but oxtail's identity is "agent peer awareness," not "session multiplexing." Don't bake "tmux" into tool names or public surface.
 
 ## Architecture sketch
@@ -25,14 +25,14 @@ The v0.4.0 change: peer `client_session_id` and `transcript_path` now resolve re
 
 The follow-on additions (`claim_session`, `set_my_state`) introduce a peer-awareness layer: `list_project_sessions` now surfaces each peer's `state` card so an agent can learn what its peers are doing without paying for `read_session`. Raw transcripts become the deep-dive fallback, not the default mode of peer awareness.
 
-Current phase remains **dogfooding**: use the tools in real parallel-agent work, log friction in `NOTES.md`. See the v0.3.0 plan at `~/.claude/plans/humming-chasing-flame.md` for the design rationale, `~/.claude/plans/cozy-forging-hickey.md` for the original v1 plan, and `~/.claude/plans/inherited-knitting-owl.md` for the peer-awareness layer.
+Current phase remains **dogfooding**: use the tools in real parallel-agent work, log friction in `NOTES.md`. Each version (v1 list_project_sessions → v0.2 read_session → v0.3 reliable peer identity → v0.4 peer-awareness state cards) shipped only after observed friction named the next addition; the same gating applies to whatever comes next.
 
 ## How to collaborate on this project
 
-- **Do not start scaffolding.** No `package.json`, no MCP server stub, no skills, no tests — until the developer explicitly says it's time. Speculative structure will lock in design before observation has informed it.
-- **Ask clarifying questions** about scope, architecture, the eventual MCP tool set, anything unclear. Surfacing assumptions now is the most useful contribution.
-- **Keep observation notes in `NOTES.md`** (or a single scratchpad). Don't sprawl across multiple unstructured files. The point of the observation phase is concentrated raw material for the eventual design pass.
-- **The `2026-05-06` lesson from x-mux applies here:** don't change code based on theories — change it based on observed deltas between actual behavior and current capability. Theorizing an orchestration API before real friction surfaces is the same antipattern as theorizing a UI fix before instrumenting.
+- **Don't add features without observed friction.** Speculative structure locks in design before observation has informed it. The publish-readiness work (LICENSE, README restructure, npm metadata) was the exception, because "ship it so a third party can install it" is itself the observed need.
+- **Ask clarifying questions** about scope, architecture, the MCP tool set, anything unclear. Surfacing assumptions matters more than guessing.
+- **Keep observation notes in `NOTES.md`** (or a single scratchpad). Don't sprawl across multiple unstructured files.
+- **Don't change code based on theories — change it based on observed deltas** between actual behavior and current capability. Theorizing an orchestration API before real friction surfaces is the same antipattern as theorizing a UI fix before instrumenting.
 
 ## Design principles (locked in)
 

@@ -1,6 +1,6 @@
 # Claude Plan Feedback
 
-Feedback on Claude's saved plan at `/Users/davidkim/.claude/plans/cozy-forging-hickey.md`.
+Feedback captured during the original v1 planning pass (when `list_project_sessions` was the only proposed MCP tool). Kept as historical context for how the project's discipline of "observation before implementation" played out.
 
 ## Strong parts
 
@@ -30,7 +30,7 @@ Suggested response shape:
 ```json
 {
   "schema_version": 1,
-  "project_root": "/Users/davidkim/dev/oxtail",
+  "project_root": "/Users/example/project",
   "inferred": true,
   "sessions": [],
   "error": null

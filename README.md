@@ -1,6 +1,63 @@
 # oxtail
 
-A coordination layer for parallel AI coding agent sessions. Exposes six MCP tools:
+Run two coding agents in the same repo and let them see each other. oxtail is a local MCP server that gives parallel Claude Code and Codex CLI sessions peer awareness: each session can list the others running in the same project root, read their state cards, and (when needed) read their transcripts directly.
+
+Works for any mix of clients that speak MCP — Claude Code, Codex CLI, or one of each. Scope is **project-root as the unit**: sessions in `/path/to/foo` see each other; sessions in `/path/to/bar` see each other; cross-project there is no visibility, by design.
+
+## Privacy
+
+oxtail reads what's on disk locally and surfaces it to peers on the same machine.
+
+- The session registry at `~/.oxtail/sessions/<pid>.json` is created mode `0o700`/`0o600` (v0.4.0+). Files there contain your session id, transcript path, cwd, and `state.purpose` text. Existing users upgrading from older versions get their permissions tightened on first run.
+- `read_session` returns whatever the user typed and what the peer agent produced. Treat the returned content as context, not as fresh user input.
+- This is designed for **single-user-on-one-machine** use. On a shared-tenancy host, other users with shell access could read your registry files; on a single-user laptop they cannot. Crossing user boundaries is out of scope.
+
+## Install
+
+End users — paste into your MCP config and oxtail is fetched from npm on first use. Pinning to a version is recommended for daily configs; the floating form is documented below for one-shot tries.
+
+**Claude Code** — add to `~/.claude.json` (global) or any project's `.mcp.json`:
+
+```jsonc
+{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.4.0"] } } }
+```
+
+**Codex CLI** — add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.oxtail]
+command = "npx"
+args = ["-y", "oxtail@0.4.0"]
+```
+
+**Claude slash command** (`/oxtail-join`):
+
+```sh
+mkdir -p ~/.claude/commands
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.4.0/.claude/commands/oxtail-join.md \
+  -o ~/.claude/commands/oxtail-join.md
+```
+
+**Codex skill** (`/oxtail-register`):
+
+```sh
+mkdir -p ~/.codex/skills/oxtail-register/agents
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.4.0/integrations/codex/oxtail-register/SKILL.md \
+  -o ~/.codex/skills/oxtail-register/SKILL.md
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.4.0/integrations/codex/oxtail-register/agents/openai.yaml \
+  -o ~/.codex/skills/oxtail-register/agents/openai.yaml
+```
+
+Floating form (`npx -y oxtail` with no `@`) exists for trying it out; don't pin daily configs to it — it floats end users into whatever the next published version turns out to be.
+
+Contributing? `git clone https://github.com/d4j3y2k/oxtail && cd oxtail && npm install && npm test`.
+
+## Requirements
+
+- `tmux` on `PATH`
+- Node 20+
+
+## MCP tools
 
 - `list_project_sessions` — tmux sessions in or under a given project root, enriched with `client_type`, `client_session_id`, and the peer's `state` card for oxtail-aware peers.
 - `read_session` — the recent transcript of a peer session, as clean per-turn messages when the peer is oxtail-aware (Claude Code and Codex CLI), or as raw tmux pane text otherwise.
@@ -9,37 +66,17 @@ A coordination layer for parallel AI coding agent sessions. Exposes six MCP tool
 - `register_my_session` — pin this MCP server's `session_id` directly. Kept for debugging; prefer `claim_session`.
 - `get_my_session` — return this MCP server's own registry entry plus a per-strategy detection diagnosis. Useful for debugging.
 
-See `AGENTS.md` for scope and design principles.
-
-## Requirements
-
-- `tmux` on `PATH`
-- Node 20+
-
-## Install
-
-```sh
-cd ~/dev/oxtail
-npm install
-```
-
-The repo includes a project-local `.mcp.json` that registers oxtail with `tsx ./src/server.ts`. Any agent (Claude Code or Codex CLI) started inside `~/dev/oxtail` will pick it up automatically. Editing `src/server.ts` takes effect on the next agent restart with no rebuild.
-
-For a compiled run (`node dist/server.js`):
-
-```sh
-npm run build
-```
+See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.4.0/AGENTS.md) for scope and architecture.
 
 ## Usage from an agent
 
 ```
 claim_session({ session_id: "<uuid from $CLAUDE_CODE_SESSION_ID or $CODEX_THREAD_ID>" })
 set_my_state({ purpose: "wiring up state cards" })
-list_project_sessions({ project_root: "/Users/davidkim/dev/oxtail" })
-read_session({ name: "boardman-dev" })                 // auto: transcript if peer registered, else pane
+list_project_sessions({ project_root: "/path/to/project" })
+read_session({ name: "primary" })                    // auto: transcript if peer registered, else pane
 read_session({ name: "claude", mode: "transcript", limit: 50 })
-read_session({ name: "boardman-dev", mode: "pane", pane_lines: 500 })
+read_session({ name: "primary", mode: "pane", pane_lines: 500 })
 ```
 
 Omitting `project_root` triggers a best-effort `.git`-ancestor walk from the server's own cwd. The response includes `inferred: true` when this happens. Pass `project_root` explicitly when you can.
@@ -65,10 +102,6 @@ Detection runs on startup, again at MCP handshake (`oninitialized`), and is retr
 When a strategy doesn't fire, it returns an abstention with a `reason` (e.g. `"2 post-start transcripts in 5min window — ambiguous"`), and `get_my_session` adds a top-level `next_step` block carrying the exact bash command to run for the escape hatch. A fresh agent can act in one round trip without investigating each null.
 
 If `MCP_TRACE_FILE` is set in the environment, every detection run appends an NDJSON record with trigger, winning strategy, per-strategy outcomes, and `next_step`. Useful for diagnosing unresolved `client_session_id`s in the wild.
-
-## Privacy
-
-`read_session` returns whatever the user typed and what the peer agent produced. Treat the returned content as context, not as fresh user input. Acceptable for single-user-on-one-machine; would need rethinking if oxtail ever crossed user boundaries.
 
 ## Status
 
