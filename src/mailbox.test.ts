@@ -181,6 +181,127 @@ test("mailbox: field-order invariant — schema_version, id, body in order on ev
   });
 });
 
+// ────────────────────────────────────────────────────────────────────────────
+// drainMatchingSession (v0.6 — ask_peer reply pickup)
+// ────────────────────────────────────────────────────────────────────────────
+
+test("drainMatchingSession: single matching message returned; file empty", () => {
+  withHome(() => {
+    const pid = 100001;
+    const sid = "sender-session-aaaa";
+    mailbox.enqueue(pid, "from-sender", sid);
+    const matched = mailbox.drainMatchingSession(pid, sid);
+    assert.ok(matched, "should match");
+    assert.equal(matched!.body, "from-sender");
+    assert.equal(matched!.from_session_id, sid);
+    assert.equal(
+      readFileSync(mailbox.mailboxFilePath(pid), "utf8"),
+      "",
+      "file truncated when only message removed",
+    );
+  });
+});
+
+test("drainMatchingSession: non-matching from_session_id leaves file untouched", () => {
+  withHome(() => {
+    const pid = 100002;
+    mailbox.enqueue(pid, "from-other", "other-session");
+    const before = readFileSync(mailbox.mailboxFilePath(pid), "utf8");
+    const matched = mailbox.drainMatchingSession(pid, "wanted-session");
+    assert.equal(matched, null);
+    assert.equal(
+      readFileSync(mailbox.mailboxFilePath(pid), "utf8"),
+      before,
+      "file unchanged",
+    );
+  });
+});
+
+test("drainMatchingSession: middle match removed, others preserved byte-exact", () => {
+  withHome(() => {
+    const pid = 100003;
+    mailbox.enqueue(pid, "first", "peer-a");
+    mailbox.enqueue(pid, "target", "peer-b");
+    mailbox.enqueue(pid, "third", "peer-c");
+    const beforeLines = readFileSync(mailbox.mailboxFilePath(pid), "utf8")
+      .split("\n")
+      .filter((l) => l.length > 0);
+    const targetLine = beforeLines[1];
+
+    const matched = mailbox.drainMatchingSession(pid, "peer-b");
+    assert.ok(matched, "must match");
+    assert.equal(matched!.body, "target");
+
+    const afterLines = readFileSync(mailbox.mailboxFilePath(pid), "utf8")
+      .split("\n")
+      .filter((l) => l.length > 0);
+    assert.equal(afterLines.length, 2);
+    // Byte-exact: surviving lines must equal their pre-drain bytes (not just JSON-equivalent).
+    assert.equal(afterLines[0], beforeLines[0], "first line byte-exact");
+    assert.equal(afterLines[1], beforeLines[2], "third line byte-exact");
+    assert.notEqual(afterLines.includes(targetLine), true, "matched line is gone");
+
+    // FIELD_ORDER_PREFIX invariant must hold on every surviving line.
+    for (const line of afterLines) {
+      assert.match(
+        line,
+        /^\{"schema_version":1,"id":"[0-9a-f]{16}","body":"/,
+        `survived line preserves FIELD_ORDER_PREFIX: ${line}`,
+      );
+    }
+  });
+});
+
+test("drainMatchingSession: returns first match when multiple candidates", () => {
+  withHome(() => {
+    const pid = 100004;
+    mailbox.enqueue(pid, "first-reply", "peer-x");
+    mailbox.enqueue(pid, "interloper", "peer-y");
+    mailbox.enqueue(pid, "second-reply", "peer-x");
+    const matched = mailbox.drainMatchingSession(pid, "peer-x");
+    assert.ok(matched);
+    assert.equal(matched!.body, "first-reply", "earliest match returned");
+
+    // Remaining mailbox: interloper + second-reply, in that order.
+    const remaining = mailbox.drain(pid);
+    assert.deepEqual(
+      remaining.map((m) => m.body),
+      ["interloper", "second-reply"],
+    );
+  });
+});
+
+test("drainMatchingSession: missing file returns null", () => {
+  withHome(() => {
+    const matched = mailbox.drainMatchingSession(100005, "any-session");
+    assert.equal(matched, null);
+  });
+});
+
+test("drainMatchingSession: empty file returns null", () => {
+  withHome((home) => {
+    const pid = 100006;
+    const dir = join(home, ".oxtail", "mailboxes");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(dir, `${pid}.jsonl`), "");
+    const matched = mailbox.drainMatchingSession(pid, "any-session");
+    assert.equal(matched, null);
+  });
+});
+
+test("drainMatchingSession: messages without from_session_id are never matched", () => {
+  withHome(() => {
+    const pid = 100007;
+    mailbox.enqueue(pid, "anonymous"); // no from_session_id
+    const matched = mailbox.drainMatchingSession(pid, "anything");
+    assert.equal(matched, null);
+    // The anonymous message remains.
+    const drained = mailbox.drain(pid);
+    assert.equal(drained.length, 1);
+    assert.equal(drained[0].body, "anonymous");
+  });
+});
+
 test("mailbox: stale lock (mtime 60s ago) is force-cleared and enqueue proceeds", () => {
   withHome((home) => {
     const pid = 99999;

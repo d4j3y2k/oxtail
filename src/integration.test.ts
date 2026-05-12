@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { register, type RegistryEntry } from "./registry.js";
-import { drain } from "./mailbox.js";
+import { drain, enqueue } from "./mailbox.js";
 
 const SERVER_ENTRY = resolve(import.meta.dirname, "server.ts");
 const TSX_BIN = resolve(import.meta.dirname, "..", "node_modules", ".bin", "tsx");
@@ -702,6 +702,206 @@ test("messaging: from_session_id present when sender has resolved id, absent whe
       const drainedAfter = drain(process.pid);
       assert.equal(drainedAfter.length, 1);
       assert.equal(drainedAfter[0].from_session_id, senderUuid);
+    } finally {
+      process.env.HOME = prev;
+    }
+  } finally {
+    await server.cleanup();
+  }
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// v0.6 ask_peer — blocking send + wait-for-reply
+// ────────────────────────────────────────────────────────────────────────────
+
+type AskPeerOk = {
+  schema_version: 1;
+  ok: true;
+  message_id: string;
+  reply: {
+    id: string;
+    body: string;
+    enqueued_at: number;
+    from_session_id: string | null;
+  } | null;
+  timed_out: boolean;
+};
+
+type AskPeerErr = {
+  schema_version: 1;
+  ok: false;
+  error: string;
+  message?: string;
+};
+
+test("ask_peer: peer replies via mailbox before timeout — returns the reply", async () => {
+  // Use a moderate timeout so we don't hit it if the test runner is slow.
+  const server = await spawnServer({ extraEnv: { MCP_ASK_PEER_TIMEOUT_MS: "10000" } });
+  try {
+    const peerSessionId = "ffffffff-1111-2222-3333-444444444444";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: peerSessionId,
+      tmux_session: "ask-peer-replier",
+      cwd: server.home,
+    });
+
+    // Sender (A) must have a session_id for from_session_id to be set on the
+    // outbound. Without it, the reply enqueue would have no from_session_id
+    // to filter on — but that filter goes the OTHER way (we filter replies BY
+    // the target's session_id). So A's session id isn't strictly required for
+    // this test, but claim it anyway to mirror real usage.
+    await callTool(server.client, "claim_session", {
+      session_id: "00000000-1111-2222-3333-555555555555",
+    });
+
+    // Find A's server pid so the test runner can enqueue a "reply" with
+    // from_session_id == peerSessionId into A's mailbox.
+    const me = await callTool<GetMySessionResponse>(server.client, "get_my_session");
+    const aPid = me.entry.server_pid;
+
+    // Schedule a reply to land ~700ms after ask_peer starts — past the 500ms
+    // grace, into the poll loop, but well before the 10s test timeout.
+    setTimeout(() => {
+      const prev = process.env.HOME;
+      process.env.HOME = server.home;
+      try {
+        enqueue(aPid, "B reporting in", peerSessionId);
+      } finally {
+        process.env.HOME = prev;
+      }
+    }, 700);
+
+    const t0 = Date.now();
+    const result = await callTool<AskPeerOk | AskPeerErr>(server.client, "ask_peer", {
+      target: "ask-peer-replier",
+      body: "ping from sender",
+    });
+    const elapsed = Date.now() - t0;
+
+    assert.equal(result.ok, true, `expected ok: ${JSON.stringify(result)}`);
+    const ok = result as AskPeerOk;
+    assert.equal(ok.timed_out, false, "should not have timed out");
+    assert.ok(ok.reply, "must have a reply");
+    assert.equal(ok.reply!.body, "B reporting in");
+    assert.equal(ok.reply!.from_session_id, peerSessionId);
+    // Allow generous upper bound for slow CI; reply should not have waited
+    // for the configured 10s timeout.
+    assert.ok(elapsed < 5000, `expected fast return, took ${elapsed}ms`);
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("ask_peer: no reply within timeout — returns timed_out: true, no error", async () => {
+  const server = await spawnServer({ extraEnv: { MCP_ASK_PEER_TIMEOUT_MS: "1500" } });
+  try {
+    const peerSessionId = "deadbeef-1111-2222-3333-444444444444";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: peerSessionId,
+      tmux_session: "ask-peer-silent",
+      cwd: server.home,
+    });
+
+    const t0 = Date.now();
+    const result = await callTool<AskPeerOk | AskPeerErr>(server.client, "ask_peer", {
+      target: "ask-peer-silent",
+      body: "knock knock",
+    });
+    const elapsed = Date.now() - t0;
+
+    assert.equal(result.ok, true);
+    const ok = result as AskPeerOk;
+    assert.equal(ok.timed_out, true);
+    assert.equal(ok.reply, null);
+    assert.ok(elapsed >= 1400, `should wait ~1.5s, took ${elapsed}ms`);
+    assert.ok(elapsed < 4000, `should not over-wait, took ${elapsed}ms`);
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("ask_peer: rejects target peer that has no client.session_id", async () => {
+  const server = await spawnServer({ extraEnv: { MCP_ASK_PEER_TIMEOUT_MS: "5000" } });
+  try {
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: null,
+      tmux_session: "ask-peer-anon",
+      cwd: server.home,
+    });
+
+    const result = await callTool<AskPeerOk | AskPeerErr>(server.client, "ask_peer", {
+      target: "ask-peer-anon",
+      body: "are you there",
+    });
+    assert.equal(result.ok, false);
+    const err = result as AskPeerErr;
+    assert.equal(err.error, "peer-has-no-session-id");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("ask_peer: unrelated peer messages stay in mailbox; only matching reply is consumed", async () => {
+  const server = await spawnServer({ extraEnv: { MCP_ASK_PEER_TIMEOUT_MS: "8000" } });
+  try {
+    const targetSid = "aaaaaaaa-2222-3333-4444-555555555555";
+    const intruderSid = "bbbbbbbb-2222-3333-4444-555555555555";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: targetSid,
+      tmux_session: "ask-peer-target",
+      cwd: server.home,
+    });
+    // The intruder doesn't need a registry entry — we just enqueue a stray
+    // message into A's mailbox with an arbitrary from_session_id below. ask_peer
+    // filters by the resolved target's session_id, so the intruder's session_id
+    // simply won't match.
+
+    await callTool(server.client, "claim_session", {
+      session_id: "11111111-2222-3333-4444-555555555555",
+    });
+    const me = await callTool<GetMySessionResponse>(server.client, "get_my_session");
+    const aPid = me.entry.server_pid;
+
+    // Enqueue an interloper message FIRST (before ask_peer starts polling),
+    // then the actual reply. ask_peer should drain the matching reply and
+    // leave the interloper.
+    const prev = process.env.HOME;
+    process.env.HOME = server.home;
+    try {
+      enqueue(aPid, "noise from C", intruderSid);
+    } finally {
+      process.env.HOME = prev;
+    }
+
+    setTimeout(() => {
+      const prev2 = process.env.HOME;
+      process.env.HOME = server.home;
+      try {
+        enqueue(aPid, "the real reply", targetSid);
+      } finally {
+        process.env.HOME = prev2;
+      }
+    }, 600);
+
+    const result = await callTool<AskPeerOk | AskPeerErr>(server.client, "ask_peer", {
+      target: "ask-peer-target",
+      body: "ping",
+    });
+    assert.equal(result.ok, true);
+    const ok = result as AskPeerOk;
+    assert.equal(ok.reply?.body, "the real reply");
+
+    // Interloper message must still be present.
+    process.env.HOME = server.home;
+    try {
+      const remaining = drain(aPid);
+      assert.equal(remaining.length, 1);
+      assert.equal(remaining[0].body, "noise from C");
+      assert.equal(remaining[0].from_session_id, intruderSid);
     } finally {
       process.env.HOME = prev;
     }

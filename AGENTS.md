@@ -17,17 +17,19 @@ Scope is **project-root as the unit**. Sessions in one project root see each oth
 - **Registry (leaning):** `tmux list-sessions` filtered by project-derived names, rather than a custom JSON registry. Free dead-session detection, free naming, no daemon to maintain. Decision pending real-use signals.
 - **Project scoping:** project root inferred from session CWD at agent startup.
 
-## Status: v0.5.0 shipped, dogfooding
+## Status: v0.6.0 shipped, dogfooding
 
-Eight MCP tools live: `list_project_sessions`, `read_session`, `claim_session`, `set_my_state`, `register_my_session`, `get_my_session`, plus the v0.5 messaging pair `send_message` and `read_my_messages`. Registered both project-locally (via `.mcp.json` using `tsx ./src/server.ts` for the dev loop) and globally (in `~/.claude.json` and `~/.codex/config.toml`, pointing at `dist/server.js`).
+Nine MCP tools live: `list_project_sessions`, `read_session`, `claim_session`, `set_my_state`, `register_my_session`, `get_my_session`, the v0.5 messaging pair `send_message` and `read_my_messages`, and the v0.6 delegate-and-wait primitive `ask_peer`. Registered both project-locally (via `.mcp.json` using `tsx ./src/server.ts` for the dev loop) and globally (in `~/.claude.json` and `~/.codex/config.toml`, pointing at `dist/server.js`).
 
 The v0.4.0 change: peer `client_session_id` and `transcript_path` now resolve reliably for Claude Code and Codex peers, even though Claude Code strips its session-id env var from MCP children. Detection layers in `src/detect/` — env, then birth-time fingerprint matching of transcript files, with a `claim_session` escape hatch (`register_my_session` is kept for debugging) — see `README.md` for details.
 
 The follow-on additions (`claim_session`, `set_my_state`) introduce a peer-awareness layer: `list_project_sessions` now surfaces each peer's `state` card so an agent can learn what its peers are doing without paying for `read_session`. Raw transcripts become the deep-dive fallback, not the default mode of peer awareness.
 
-Current phase remains **dogfooding**: use the tools in real parallel-agent work, log friction in `NOTES.md`. Each version (v0.1 list_project_sessions → v0.2 read_session → v0.3 reliable peer identity → v0.4 peer-awareness state cards → v0.5 peer-to-peer messaging) shipped only after observed friction named the next addition; the same gating applies to whatever comes next.
+Current phase remains **dogfooding**: use the tools in real parallel-agent work, log friction in `NOTES.md`. Each version (v0.1 list_project_sessions → v0.2 read_session → v0.3 reliable peer identity → v0.4 peer-awareness state cards → v0.5 peer-to-peer messaging → v0.6 delegate-and-wait) shipped only after observed friction named the next addition; the same gating applies to whatever comes next.
 
 The v0.5 change: two new MCP tools (`send_message`, `read_my_messages`) plus an opt-in `PreToolUse` hook installable via `npx oxtail install-hook`. Friction observed while pairing on Terminator — two agents in the same project root can see each other's state cards and transcripts but couldn't say anything to each other. Now they can. Claude Code peers see messages mid-turn (via the hook); Codex peers (or unhooked Claude Code) see them next-turn (via polling `read_my_messages`).
+
+The v0.6 change: one new MCP tool (`ask_peer`) that turns v0.5's async pings into synchronous delegate-and-wait. Friction observed while dogfooding v0.5 — `send_message` lets agents say things to each other, but the sender doesn't stay in-turn waiting for a reply, and an idle receiver doesn't get nudged. `ask_peer` blocks server-side until a reply with a matching `from_session_id` lands (or a fixed timeout elapses) and fires a `tmux send-keys` wake to rouse idle peers. The result: an agent talking to its user can delegate to a peer, exchange multiple rounds inside one of its own turns, and report back synthesized findings.
 
 ## How to collaborate on this project
 
@@ -45,6 +47,7 @@ The v0.5 change: two new MCP tools (`send_message`, `read_my_messages`) plus an 
 
 ## Recently shipped
 
+- **Delegate-and-wait (v0.6).** `ask_peer({ target, body })` blocks server-side until the peer replies (filtered by `from_session_id`) or a fixed timeout elapses, with a `tmux send-keys` wake fallback for idle peers. Late replies fall back to the v0.5 hook / poll delivery path. Target must have a registered `client.session_id`.
 - **Cross-session messaging (v0.5).** `send_message({ target, body })` + `read_my_messages()`. Mailbox lives at `~/.oxtail/mailboxes/<server_pid>.jsonl`, drained under an `mkdir`-based advisory lock. Opt-in PreToolUse hook (`npx oxtail install-hook`) for mid-turn delivery to Claude Code.
 
 ## Deliberately deferred

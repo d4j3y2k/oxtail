@@ -6,6 +6,7 @@ import {
   rmdirSync,
   statSync,
   truncateSync,
+  writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -181,6 +182,72 @@ export function drain(my_pid: number): Mailbox[] {
       if (err.code !== "ENOENT") throw err;
     }
     return out;
+  } finally {
+    releaseLock(my_pid);
+  }
+}
+
+// Drain the first message in this mailbox whose from_session_id matches
+// `from_session_id`, leaving any preceding and following messages untouched.
+// Used by ask_peer to consume exactly the reply it's waiting on without
+// stealing messages from concurrent peers.
+//
+// Critical invariant: surviving raw lines are written back byte-exact. The
+// awk extractor in assets/pretooluse.sh assumes the FIELD_ORDER_PREFIX layout;
+// re-serializing via JSON.stringify could reorder keys and silently break the
+// hook for messages that stay in the mailbox.
+export function drainMatchingSession(
+  my_pid: number,
+  from_session_id: string,
+): Mailbox | null {
+  acquireLock(my_pid);
+  try {
+    let raw: string;
+    try {
+      raw = readFileSync(mailboxPath(my_pid), "utf8");
+    } catch (e) {
+      const err = e as NodeJS.ErrnoException;
+      if (err.code === "ENOENT") return null;
+      throw err;
+    }
+    if (!raw) return null;
+    const lines = raw.split("\n").filter((l) => l.length > 0);
+    let matchIdx = -1;
+    let matchedMsg: Mailbox | null = null;
+    for (let i = 0; i < lines.length; i++) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(lines[i]);
+      } catch {
+        continue;
+      }
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        (parsed as Mailbox).schema_version === 1 &&
+        (parsed as Mailbox).from_session_id === from_session_id
+      ) {
+        matchIdx = i;
+        matchedMsg = parsed as Mailbox;
+        break;
+      }
+    }
+    if (matchIdx < 0 || !matchedMsg) return null;
+    const surviving = [
+      ...lines.slice(0, matchIdx),
+      ...lines.slice(matchIdx + 1),
+    ];
+    if (surviving.length === 0) {
+      try {
+        truncateSync(mailboxPath(my_pid), 0);
+      } catch (e) {
+        const err = e as NodeJS.ErrnoException;
+        if (err.code !== "ENOENT") throw err;
+      }
+    } else {
+      writeFileSync(mailboxPath(my_pid), surviving.join("\n") + "\n");
+    }
+    return matchedMsg;
   } finally {
     releaseLock(my_pid);
   }

@@ -19,7 +19,7 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 **Claude Code** — add to `~/.claude.json` (global) or any project's `.mcp.json`:
 
 ```jsonc
-{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.5.0"] } } }
+{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.6.0"] } } }
 ```
 
 **Codex CLI** — add to `~/.codex/config.toml`:
@@ -27,14 +27,14 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 ```toml
 [mcp_servers.oxtail]
 command = "npx"
-args = ["-y", "oxtail@0.5.0"]
+args = ["-y", "oxtail@0.6.0"]
 ```
 
 **Claude slash command** (`/oxtail-join`):
 
 ```sh
 mkdir -p ~/.claude/commands
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.5.0/.claude/commands/oxtail-join.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.6.0/.claude/commands/oxtail-join.md \
   -o ~/.claude/commands/oxtail-join.md
 ```
 
@@ -42,9 +42,9 @@ curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.5.0/.claude/commands
 
 ```sh
 mkdir -p ~/.codex/skills/oxtail-register/agents
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.5.0/integrations/codex/oxtail-register/SKILL.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.6.0/integrations/codex/oxtail-register/SKILL.md \
   -o ~/.codex/skills/oxtail-register/SKILL.md
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.5.0/integrations/codex/oxtail-register/agents/openai.yaml \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.6.0/integrations/codex/oxtail-register/agents/openai.yaml \
   -o ~/.codex/skills/oxtail-register/agents/openai.yaml
 ```
 
@@ -65,6 +65,7 @@ Contributing? `git clone https://github.com/d4j3y2k/oxtail && cd oxtail && npm i
 - `set_my_state` — write a small "state card" onto this session's registry entry so peers can see what we're doing without reading our transcript. v1 surfaces a single field, `purpose` (≤200 chars).
 - `send_message` — send a short text message to a peer session in the same project root. Target is a tmux session name or a raw `client_session_id` UUID. Body ≤ 8KB. Delivery is async via the peer's mailbox file. (v0.5+)
 - `read_my_messages` — drain this session's mailbox and return any queued messages. Codex peers (and unhooked Claude Code) poll this; Claude Code peers with the PreToolUse hook installed see messages mid-turn instead. (v0.5+)
+- `ask_peer` — send a message to a peer **and block until they reply** (or a fixed timeout elapses). Combines `send_message` with a server-side wait, plus a `tmux send-keys` wake to nudge idle peers. Returns the peer's reply body. Use this for synchronous delegate-and-wait dynamics; use `send_message` for fire-and-forget. (v0.6+)
 - `register_my_session` — pin this MCP server's `session_id` directly. Kept for debugging; prefer `claim_session`.
 - `get_my_session` — return this MCP server's own registry entry plus a per-strategy detection diagnosis. Useful for debugging.
 
@@ -81,6 +82,8 @@ read_session({ name: "claude", mode: "transcript", limit: 50 })
 read_session({ name: "primary", mode: "pane", pane_lines: 500 })
 send_message({ target: "primary", body: "<system-reminder>checking in</system-reminder>" })
 read_my_messages()
+ask_peer({ target: "primary", body: "[Handoff] please audit X and tell me what you find" })
+  // → blocks server-side until the peer replies via send_message, then returns their body
 ```
 
 Omitting `project_root` triggers a best-effort `.git`-ancestor walk from the server's own cwd. The response includes `inferred: true` when this happens. Pass `project_root` explicitly when you can.
@@ -129,6 +132,51 @@ If you have a PreToolUse hook installed that isn't from Terminator and isn't oxt
 
 oxtail trusts any process running as the **same local user** to enqueue messages. The mailbox directory is mode `0o700` (private), so other users on the host cannot read or write. **On a shared-tenancy box (containers, multi-user dev hosts, etc.), do not run oxtail-aware agents:** any local process under your user can inject `<system-reminder>` content directly into a Claude session. The threat boundary is the same as `~/.ssh/` — what your user processes do, you trust.
 
+## Delegate-and-wait (v0.6)
+
+`ask_peer` extends v0.5's mailbox transport into a synchronous primitive:
+
+```
+ask_peer({ target, body })
+  → { ok: true, message_id, reply: { id, body, enqueued_at, from_session_id } | null, timed_out }
+```
+
+Mechanics:
+
+1. Enqueue `body` into the target's mailbox (same as `send_message`).
+2. Wait ~500ms for a hook-delivered reply (rare path — handles the case where the peer was already mid-tool-call and replied immediately).
+3. Fire a `tmux send-keys` wake against the peer's pane: a single literal line `[oxtail] new peer message — run mcp__oxtail__read_my_messages and respond via mcp__oxtail__send_message` followed by Enter. This nudges idle peers without requiring the human at the other end to type.
+4. Poll the caller's mailbox at 200ms for a reply with `from_session_id == target.session_id`. Other peers' messages stay in the mailbox untouched.
+5. Return the reply on match, or `{ reply: null, timed_out: true }` after the fixed timeout. Late replies fall back to the normal v0.5 hook / `read_my_messages` path — never lost, just delivered out of band.
+
+Constraints:
+
+- The target peer must have a registered `client.session_id`. Codex peers must call `claim_session` / `register_my_session` first; without that, `ask_peer` returns `error: "peer-has-no-session-id"` rather than guessing.
+- Timeout is fixed (single server-side constant pinned conservatively under typical MCP-client abort windows). For longer dialogues, the calling agent chains multiple `ask_peer` calls in one turn rather than configuring a longer single block.
+- The wake is best-effort. If `tmux send-keys` fails (no tmux server, no pane, copy-mode), the peer may still respond on its own via polling — the only loss is the immediacy of the nudge.
+
+### Recommended permissions for autonomous agent-to-agent collaboration
+
+The user-approval prompt on every `ask_peer` call interrupts the back-and-forth dynamic. To allow agents to initiate delegation without per-call prompts, add to `~/.claude/settings.json`:
+
+```jsonc
+{
+  "permissions": {
+    "allow": [
+      "mcp__oxtail__ask_peer",
+      "mcp__oxtail__send_message",
+      "mcp__oxtail__read_my_messages"
+    ]
+  }
+}
+```
+
+Without an allowlist, Claude Code prompts on first use of each MCP tool with an "always allow" option — pick that once per project to get the same effect.
+
+### Body framing
+
+Peers see the body verbatim. A handoff is naturally read as an assignment, not chat, when framed that way — include an objective and a requested next action. The repo doesn't ship a fixed envelope convention yet; convention will follow real use.
+
 ## Self-registration and the peer registry
 
 Each oxtail server, when spawned by an agent, writes a small record to `~/.oxtail/sessions/<pid>.json` containing the client type, session id, transcript path, and tmux pane. Sibling servers read this directory to find peer transcripts. Records auto-clean on process exit and on read (dead PIDs pruned). Sessions whose agents are not oxtail-aware (or are not LLM agents at all — bash, vim, vite dev servers) still show up in `list_project_sessions` and are readable via `read_session` in pane mode.
@@ -149,4 +197,4 @@ If `MCP_TRACE_FILE` is set in the environment, every detection run appends an ND
 
 ## Status
 
-v0.5.0. Peer-to-peer messaging is live: `send_message` / `read_my_messages` over a per-pid mailbox file at `~/.oxtail/mailboxes/`. Claude Code peers receive mid-turn via an opt-in PreToolUse hook (`npx oxtail install-hook`); Codex CLI peers poll. Coexistence with Terminator's `_terminatorHook` verified in Claude Code 2.1.139.
+v0.6.0. Adds `ask_peer` on top of v0.5's mailbox transport: an agent can send a message and block until the peer replies, with an automatic `tmux send-keys` wake for idle peers. Combined with the existing PreToolUse hook, two Claude Code sessions can now sustain a back-and-forth handoff inside a single turn of the delegating agent. Codex peers are supported as targets once they've claimed a session.

@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as z from "zod/v4";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, sep } from "node:path";
 import {
@@ -818,6 +818,7 @@ server.registerTool(
       "Delivery is asynchronous: the message lands in the target's mailbox and is delivered mid-turn via the oxtail PreToolUse hook (Claude Code) or next-turn via read_my_messages (Codex, or any client without the hook installed).",
       "Sender-side wrapping: if you want the message to appear as a system-reminder, include the <system-reminder>...</system-reminder> tags in `body`. The mailbox is a dumb transport.",
       "Cross-project targets are rejected, never silently dropped.",
+      "For a blocking send-and-wait variant that pauses your turn until the peer replies, use ask_peer instead.",
     ].join(" "),
     inputSchema: {
       target: z
@@ -893,6 +894,254 @@ server.registerTool(
               drained: true,
               count: messages.length,
               messages,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
+// ask_peer (v0.6): blocking send + wait-for-reply. Builds on send_message's
+// async mailbox transport by holding the request open server-side until the
+// peer replies (filtered by from_session_id) or a fixed timeout elapses.
+//
+// TODO(v0.6): empirically pin ASK_PEER_TIMEOUT_MS against Claude Code's MCP
+// tool-call abort window. 45000ms is conservative; verify post-impl by
+// running a slow MCP tool and observing client behavior. The abort path
+// (re-enqueue) is load-bearing if the client aborts before we return.
+//
+// MCP_ASK_PEER_TIMEOUT_MS env override exists for tests — keeps integration
+// suite fast without forking the public schema.
+const ASK_PEER_TIMEOUT_MS = (() => {
+  const env = process.env.MCP_ASK_PEER_TIMEOUT_MS;
+  if (!env) return 45_000;
+  const n = Number(env);
+  return Number.isFinite(n) && n > 0 ? n : 45_000;
+})();
+const ASK_PEER_GRACE_MS = 500;
+const ASK_PEER_POLL_MS = 200;
+const ASK_PEER_WAKE_TEXT =
+  "[oxtail] new peer message — run mcp__oxtail__read_my_messages and respond via mcp__oxtail__send_message";
+
+function askPeerDelay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new Error("aborted"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    timer.unref?.();
+    function onAbort(): void {
+      clearTimeout(timer);
+      reject(new Error("aborted"));
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+// Best-effort wake: two send-keys calls so the text is interpreted literally
+// (-l) and Enter is parsed as a key event. The -l flag neutralizes any tmux
+// keysequences a malicious peer could plant in its registry entry. Failure to
+// reach tmux is non-fatal — the peer may still poll or hook-deliver on its own.
+function askPeerWake(pane: string | null, sessionName: string | null): boolean {
+  const target = pane ?? sessionName;
+  if (!target) {
+    trace("ask_peer_wake_skipped", { reason: "no-pane-or-session" });
+    return false;
+  }
+  try {
+    execFileSync("tmux", ["send-keys", "-t", target, "-l", ASK_PEER_WAKE_TEXT], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    execFileSync("tmux", ["send-keys", "-t", target, "Enter"], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    trace("ask_peer_wake_fired", { target });
+    return true;
+  } catch (e) {
+    trace("ask_peer_wake_failed", { target, error: String(e) });
+    return false;
+  }
+}
+
+// Poll my mailbox at ASK_PEER_POLL_MS until a matching reply lands or the
+// deadline elapses. Each tick checks mtime first and only acquires the
+// mailbox lock when there's a probable hit. The lock is held only inside
+// drainMatchingSession (sub-10ms) — never across the poll interval, so the
+// PreToolUse hook on subsequent caller tool calls is never starved.
+async function askPeerPoll(
+  my_pid: number,
+  from_session_id: string,
+  deadlineMs: number,
+  signal: AbortSignal,
+): Promise<mailbox.Mailbox | null> {
+  let lastMtime = -1;
+  const path = mailbox.mailboxFilePath(my_pid);
+  while (Date.now() < deadlineMs) {
+    if (signal.aborted) throw new Error("aborted");
+    let stat: { mtimeMs: number } | null = null;
+    try {
+      stat = statSync(path);
+    } catch {
+      // ENOENT: mailbox file not created yet; treat as no change
+    }
+    if (stat && stat.mtimeMs !== lastMtime) {
+      lastMtime = stat.mtimeMs;
+      const reply = mailbox.drainMatchingSession(my_pid, from_session_id);
+      if (reply) return reply;
+    }
+    const remaining = deadlineMs - Date.now();
+    if (remaining <= 0) break;
+    await askPeerDelay(Math.min(ASK_PEER_POLL_MS, remaining), signal);
+  }
+  return null;
+}
+
+server.registerTool(
+  "ask_peer",
+  {
+    description: [
+      "Send a message to a peer session and block until they reply (or timeout).",
+      "Use this when you want a synchronous back-and-forth with another agent in the same project root, rather than fire-and-forget like send_message.",
+      "Behavior: enqueues the body to the target's mailbox, waits ~500ms for a hook-delivered reply, then fires a tmux send-keys wake to nudge the peer if idle, then polls this session's mailbox at 200ms for a reply from the target.",
+      "Returns when the target sends a message back (via send_message) whose from_session_id matches them, or when ASK_PEER_TIMEOUT_MS elapses (returns reply: null, timed_out: true).",
+      "Target must have a registered client.session_id (Codex peers must call register_my_session first).",
+      "Late replies that arrive after timeout are delivered normally via read_my_messages / the PreToolUse hook.",
+      "Body framing: peers see the body verbatim. Include a short assignment-style framing (objective, what you want them to do) so they treat it as a delegation, not chat.",
+    ].join(" "),
+    inputSchema: {
+      target: z
+        .string()
+        .min(1)
+        .describe("tmux session name OR client_session_id (UUID) of the peer."),
+      body: z
+        .string()
+        .min(1)
+        .refine((s) => Buffer.byteLength(s, "utf8") <= 8192, {
+          message: "body exceeds 8192 UTF-8 bytes",
+        })
+        .describe("Message body, ≤8KB UTF-8."),
+    },
+  },
+  async ({ target, body }, extra) => {
+    const resolved = resolveTarget(target, entry);
+    if (!resolved.ok) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ schema_version: 1, ...resolved }, null, 2),
+          },
+        ],
+      };
+    }
+    const peer = resolved.entry;
+    const expectedSessionId = peer.client.session_id;
+    if (!expectedSessionId) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                schema_version: 1,
+                ok: false,
+                error: "peer-has-no-session-id",
+                message:
+                  "Target peer has no registered client.session_id. Ask the peer to call register_my_session before retrying ask_peer.",
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    const fromSessionId = entry.client.session_id ?? undefined;
+    const msg = mailbox.enqueue(peer.server_pid, body, fromSessionId);
+    const startedAt = Date.now();
+    const deadlineMs = startedAt + ASK_PEER_TIMEOUT_MS;
+    trace("ask_peer_start", {
+      target_session_id: expectedSessionId,
+      message_id: msg.id,
+    });
+
+    let reply: mailbox.Mailbox | null = null;
+    let aborted = false;
+    try {
+      // Grace window: rare hook-delivery path. If peer was mid-tool-call when
+      // our outbound arrived, their hook delivered it as additionalContext and
+      // their response may already be in our mailbox.
+      await askPeerDelay(ASK_PEER_GRACE_MS, extra.signal);
+      reply = mailbox.drainMatchingSession(entry.server_pid, expectedSessionId);
+
+      if (!reply) {
+        // Common path: peer was idle; fire wake + poll.
+        askPeerWake(peer.tmux_pane, peer.tmux_session);
+        reply = await askPeerPoll(
+          entry.server_pid,
+          expectedSessionId,
+          deadlineMs,
+          extra.signal,
+        );
+      }
+    } catch (e) {
+      if ((e as Error).message === "aborted") {
+        aborted = true;
+      } else {
+        throw e;
+      }
+    }
+
+    // Abort recovery: if the client aborted us between drain and response
+    // delivery, the reply is in memory but has been removed from the mailbox.
+    // Re-enqueue so it's not lost.
+    if (aborted && reply) {
+      try {
+        mailbox.enqueue(entry.server_pid, reply.body, reply.from_session_id);
+        trace("ask_peer_abort_reenqueue", { message_id: reply.id });
+      } catch (e) {
+        trace("ask_peer_abort_reenqueue_failed", {
+          message_id: reply.id,
+          error: String(e),
+        });
+      }
+      // Throw to signal the framework that the request did not complete.
+      throw new Error("ask_peer aborted by client");
+    }
+
+    trace("ask_peer_end", {
+      target_session_id: expectedSessionId,
+      message_id: msg.id,
+      duration_ms: Date.now() - startedAt,
+      timed_out: reply === null,
+    });
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              schema_version: 1,
+              ok: true,
+              message_id: msg.id,
+              reply: reply
+                ? {
+                    id: reply.id,
+                    body: reply.body,
+                    enqueued_at: reply.enqueued_at,
+                    from_session_id: reply.from_session_id ?? null,
+                  }
+                : null,
+              timed_out: reply === null,
             },
             null,
             2,
