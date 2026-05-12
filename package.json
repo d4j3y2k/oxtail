@@ -1,6 +1,6 @@
 {
   "name": "oxtail",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": false,
   "type": "module",
   "description": "Coordination layer for parallel AI coding agent sessions, exposed over MCP.",
@@ -10,6 +10,8 @@
   },
   "files": [
     "dist",
+    "scripts",
+    "assets",
     "integrations",
     ".claude/commands/oxtail-join.md",
     "AGENTS.md",
@@ -47,6 +49,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "jsonc-parser": "^3.3.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {

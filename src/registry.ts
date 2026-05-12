@@ -27,24 +27,28 @@ export type RegistryEntry = {
   state: StateCard | null;
 };
 
-const REGISTRY_DIR = join(homedir(), ".oxtail", "sessions");
+// Lazy so tests can swap HOME between cases; homedir() defers to $HOME on POSIX.
+function registryDir(): string {
+  return join(homedir(), ".oxtail", "sessions");
+}
 
 function ensureDir(): void {
-  if (!existsSync(REGISTRY_DIR)) {
-    mkdirSync(REGISTRY_DIR, { recursive: true, mode: 0o700 });
+  const dir = registryDir();
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
     return;
   }
   // Migration: tighten perms for users upgrading from <0.4.0, where the dir
   // and entries were created at default umask (typically 0o755 / 0o644).
   try {
-    chmodSync(REGISTRY_DIR, 0o700);
+    chmodSync(dir, 0o700);
   } catch {
     // not our dir or fs doesn't support; leave it
   }
-  for (const file of readdirSync(REGISTRY_DIR)) {
+  for (const file of readdirSync(dir)) {
     if (!file.endsWith(".json")) continue;
     try {
-      chmodSync(join(REGISTRY_DIR, file), 0o600);
+      chmodSync(join(dir, file), 0o600);
     } catch {
       // ignore
     }
@@ -52,7 +56,7 @@ function ensureDir(): void {
 }
 
 function entryPath(pid: number): string {
-  return join(REGISTRY_DIR, `${pid}.json`);
+  return join(registryDir(), `${pid}.json`);
 }
 
 function resolveTmuxSessionFromPane(pane: string | null): string | null {
@@ -191,11 +195,12 @@ function isAlive(pid: number): boolean {
 }
 
 export function readAll(): RegistryEntry[] {
-  if (!existsSync(REGISTRY_DIR)) return [];
+  const dir = registryDir();
+  if (!existsSync(dir)) return [];
   const out: RegistryEntry[] = [];
-  for (const file of readdirSync(REGISTRY_DIR)) {
+  for (const file of readdirSync(dir)) {
     if (!file.endsWith(".json")) continue;
-    const full = join(REGISTRY_DIR, file);
+    const full = join(dir, file);
     let entry: RegistryEntry;
     try {
       entry = JSON.parse(readFileSync(full, "utf8")) as RegistryEntry;

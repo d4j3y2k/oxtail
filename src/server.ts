@@ -4,6 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import * as z from "zod/v4";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, sep } from "node:path";
 import {
   clientFromHandshake,
@@ -25,6 +26,28 @@ import {
   type RegistryEntry,
   type StateCard,
 } from "./registry.js";
+import * as mailbox from "./mailbox.js";
+
+// CLI subcommand dispatch must run before any MCP setup so that
+// `npx oxtail install-hook` doesn't open an MCP transport or register a
+// session. Use named exports and await them; calling `await import(...)`
+// alone resolves at module-evaluation but would let process.exit(0) race
+// the script's async work.
+{
+  const sub = process.argv[2];
+  if (sub === "install-hook") {
+    const url = new URL("../scripts/install-hook.mjs", import.meta.url).href;
+    const mod = (await import(url)) as { install: () => Promise<void> };
+    await mod.install();
+    process.exit(0);
+  }
+  if (sub === "uninstall-hook") {
+    const url = new URL("../scripts/uninstall-hook.mjs", import.meta.url).href;
+    const mod = (await import(url)) as { uninstall: () => Promise<void> };
+    await mod.uninstall();
+    process.exit(0);
+  }
+}
 import {
   readClaudeTranscript,
   readCodexTranscript,
@@ -708,5 +731,195 @@ server.registerTool(
   },
 );
 
+// ────────────────────────────────────────────────────────────────────────────
+// send_message / read_my_messages (v0.5)
+// ────────────────────────────────────────────────────────────────────────────
+
+type ResolveOk = { ok: true; entry: RegistryEntry };
+type ResolveErr =
+  | { ok: false; error: "target-not-found" }
+  | { ok: false; error: "ambiguous-target"; candidates: string[] }
+  | { ok: false; error: "cross-project" }
+  | { ok: false; error: "self-send" };
+
+function projectRootsMatch(caller: RegistryEntry, peer: RegistryEntry): boolean {
+  const myRoot = safeRealpath(inferProjectRoot(caller.client.cwd));
+  const peerRoot = safeRealpath(inferProjectRoot(peer.client.cwd));
+  if (myRoot === peerRoot) return true;
+  if (isDescendantOrEqual(safeRealpath(peer.client.cwd), myRoot)) return true;
+  if (isDescendantOrEqual(safeRealpath(caller.client.cwd), peerRoot)) return true;
+  return false;
+}
+
+function isAliveLocal(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException;
+    return err.code === "EPERM";
+  }
+}
+
+function reReadRegistryEntry(server_pid: number): RegistryEntry | null {
+  // PID-reuse guard: re-read the on-disk file and compare started_at to the
+  // one we cached in memory at lookup time. A reused pid lands on a freshly
+  // written entry with a different started_at.
+  const path = join(homedir(), ".oxtail", "sessions", `${server_pid}.json`);
+  try {
+    const raw = readFileSync(path, "utf8");
+    return JSON.parse(raw) as RegistryEntry;
+  } catch {
+    return null;
+  }
+}
+
+const UUID_RE = /^[0-9a-f-]{36}$/;
+
+function resolveTarget(target: string, caller: RegistryEntry): ResolveOk | ResolveErr {
+  const all = readAll();
+  let candidates: RegistryEntry[];
+  if (UUID_RE.test(target)) {
+    candidates = all.filter((e) => e.client.session_id === target);
+  } else {
+    candidates = all.filter((e) => e.tmux_session === target);
+  }
+
+  // Liveness + PID-reuse guard: keep only entries whose pid is alive AND whose
+  // on-disk started_at still matches what readAll() returned. A reused pid
+  // would have been overwritten with a different started_at.
+  candidates = candidates.filter((e) => {
+    if (!isAliveLocal(e.server_pid)) return false;
+    const fresh = reReadRegistryEntry(e.server_pid);
+    if (!fresh) return false;
+    return fresh.started_at === e.started_at;
+  });
+
+  if (candidates.length === 0) return { ok: false, error: "target-not-found" };
+  if (candidates.length > 1) {
+    return {
+      ok: false,
+      error: "ambiguous-target",
+      candidates: candidates.map((c) => c.client.session_id ?? `pid:${c.server_pid}`),
+    };
+  }
+  const peer = candidates[0];
+  // Self-send by pid (definitive identity), not by tmux name / session_id.
+  if (peer.server_pid === caller.server_pid) return { ok: false, error: "self-send" };
+  if (!projectRootsMatch(caller, peer)) return { ok: false, error: "cross-project" };
+  return { ok: true, entry: peer };
+}
+
+server.registerTool(
+  "send_message",
+  {
+    description: [
+      "Send a short text message to a peer session in the same project root. Target may be a tmux session name (as shown by list_project_sessions) or a raw client_session_id (UUID).",
+      "Delivery is asynchronous: the message lands in the target's mailbox and is delivered mid-turn via the oxtail PreToolUse hook (Claude Code) or next-turn via read_my_messages (Codex, or any client without the hook installed).",
+      "Sender-side wrapping: if you want the message to appear as a system-reminder, include the <system-reminder>...</system-reminder> tags in `body`. The mailbox is a dumb transport.",
+      "Cross-project targets are rejected, never silently dropped.",
+    ].join(" "),
+    inputSchema: {
+      target: z
+        .string()
+        .min(1)
+        .describe("tmux session name OR client_session_id (UUID) of the peer."),
+      body: z
+        .string()
+        .min(1)
+        .refine((s) => Buffer.byteLength(s, "utf8") <= 8192, {
+          message: "body exceeds 8192 UTF-8 bytes",
+        })
+        .describe("Message body, ≤8KB UTF-8. The sender chooses the framing."),
+    },
+  },
+  async ({ target, body }) => {
+    const resolved = resolveTarget(target, entry);
+    if (!resolved.ok) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { schema_version: 1, ...resolved },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+    const peer = resolved.entry;
+    const fromSessionId = entry.client.session_id ?? undefined;
+    const msg = mailbox.enqueue(peer.server_pid, body, fromSessionId);
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              schema_version: 1,
+              ok: true,
+              message_id: msg.id,
+              target_session_id: peer.client.session_id,
+              target_server_pid: peer.server_pid,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
+server.registerTool(
+  "read_my_messages",
+  {
+    description:
+      "Drain this session's mailbox and return any messages peers have sent via send_message. Codex peers and any Claude Code peer without the PreToolUse hook installed must poll this tool explicitly; Claude Code peers with the hook installed will see messages mid-turn instead. Always safe to call — returns an empty list when the mailbox is empty.",
+    inputSchema: {},
+  },
+  async () => {
+    const messages = mailbox.drain(entry.server_pid);
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              schema_version: 1,
+              ok: true,
+              drained: true,
+              count: messages.length,
+              messages,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
+// Hook-install hint, emitted once per server startup when no `_oxtailHook`
+// marker is present in ~/.claude/settings.json. Stderr surfacing in Claude
+// Code is a soft assumption; if the hint never reaches the user they miss
+// the prompt and fall back to polling — acceptable.
+function maybeHookHint(): void {
+  if (entry.client.type !== "claude-code") return;
+  try {
+    const settings = readFileSync(join(homedir(), ".claude", "settings.json"), "utf8");
+    if (settings.includes("_oxtailHook")) return;
+  } catch {
+    // settings file missing is itself a signal the hook isn't installed
+  }
+  process.stderr.write(
+    "[oxtail] PreToolUse hook not installed — run `npx oxtail install-hook` to enable mid-turn peer messaging.\n",
+  );
+}
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
+maybeHookHint();

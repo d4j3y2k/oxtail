@@ -17,15 +17,17 @@ Scope is **project-root as the unit**. Sessions in one project root see each oth
 - **Registry (leaning):** `tmux list-sessions` filtered by project-derived names, rather than a custom JSON registry. Free dead-session detection, free naming, no daemon to maintain. Decision pending real-use signals.
 - **Project scoping:** project root inferred from session CWD at agent startup.
 
-## Status: v0.4.0 shipped, dogfooding
+## Status: v0.5.0 shipped, dogfooding
 
-Six MCP tools live: `list_project_sessions`, `read_session`, `claim_session`, `set_my_state`, `register_my_session`, and `get_my_session`. Registered both project-locally (via `.mcp.json` using `tsx ./src/server.ts` for the dev loop) and globally (in `~/.claude.json` and `~/.codex/config.toml`, pointing at `dist/server.js`).
+Eight MCP tools live: `list_project_sessions`, `read_session`, `claim_session`, `set_my_state`, `register_my_session`, `get_my_session`, plus the v0.5 messaging pair `send_message` and `read_my_messages`. Registered both project-locally (via `.mcp.json` using `tsx ./src/server.ts` for the dev loop) and globally (in `~/.claude.json` and `~/.codex/config.toml`, pointing at `dist/server.js`).
 
 The v0.4.0 change: peer `client_session_id` and `transcript_path` now resolve reliably for Claude Code and Codex peers, even though Claude Code strips its session-id env var from MCP children. Detection layers in `src/detect/` — env, then birth-time fingerprint matching of transcript files, with a `claim_session` escape hatch (`register_my_session` is kept for debugging) — see `README.md` for details.
 
 The follow-on additions (`claim_session`, `set_my_state`) introduce a peer-awareness layer: `list_project_sessions` now surfaces each peer's `state` card so an agent can learn what its peers are doing without paying for `read_session`. Raw transcripts become the deep-dive fallback, not the default mode of peer awareness.
 
-Current phase remains **dogfooding**: use the tools in real parallel-agent work, log friction in `NOTES.md`. Each version (v1 list_project_sessions → v0.2 read_session → v0.3 reliable peer identity → v0.4 peer-awareness state cards) shipped only after observed friction named the next addition; the same gating applies to whatever comes next.
+Current phase remains **dogfooding**: use the tools in real parallel-agent work, log friction in `NOTES.md`. Each version (v0.1 list_project_sessions → v0.2 read_session → v0.3 reliable peer identity → v0.4 peer-awareness state cards → v0.5 peer-to-peer messaging) shipped only after observed friction named the next addition; the same gating applies to whatever comes next.
+
+The v0.5 change: two new MCP tools (`send_message`, `read_my_messages`) plus an opt-in `PreToolUse` hook installable via `npx oxtail install-hook`. Friction observed while pairing on Terminator — two agents in the same project root can see each other's state cards and transcripts but couldn't say anything to each other. Now they can. Claude Code peers see messages mid-turn (via the hook); Codex peers (or unhooked Claude Code) see them next-turn (via polling `read_my_messages`).
 
 ## How to collaborate on this project
 
@@ -41,9 +43,16 @@ Current phase remains **dogfooding**: use the tools in real parallel-agent work,
 3. **Both Claude Code and Codex CLI must work** with whatever we build. MCP is the cross-tool protocol; Skills are Claude-specific syntactic sugar that wraps MCP tools, never primary functionality.
 4. **Minimum viable first.** One MCP tool that's actually used > five speculative ones.
 
+## Recently shipped
+
+- **Cross-session messaging (v0.5).** `send_message({ target, body })` + `read_my_messages()`. Mailbox lives at `~/.oxtail/mailboxes/<server_pid>.jsonl`, drained under an `mkdir`-based advisory lock. Opt-in PreToolUse hook (`npx oxtail install-hook`) for mid-turn delivery to Claude Code.
+
 ## Deliberately deferred
 
 - **Output capture** (vs. metadata only). Costs a wrapper layer (`script -F` or pty-mirror). Only worth doing if real friction shows metadata isn't enough.
-- **Cross-session messaging** (note from session A to session B). Probably useful eventually; not until real use names the shape.
+- **Codex mid-turn delivery.** Pending Codex CLI exposing a hook surface.
+- **Delivery receipts / read receipts.** Sender learns `{ ok: true, message_id }`; whether the recipient saw it is invisible. Add when real use names the shape.
+- **Broadcast / multi-recipient send_message.** 1:1 only in v0.5.
+- **Orphan mailbox cleanup.** Mailbox files for dead pids accumulate in `~/.oxtail/mailboxes/`. Tiny and harmless; revisit when real waste shows up in `du`.
 - **Skill set.** Decide after the first MCP tool exists and we know what it feels like to use raw.
 - **MCP tool naming.** Pick after observation tells us the verbs.

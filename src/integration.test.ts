@@ -6,6 +6,8 @@ import { test } from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { register, type RegistryEntry } from "./registry.js";
+import { drain } from "./mailbox.js";
 
 const SERVER_ENTRY = resolve(import.meta.dirname, "server.ts");
 const TSX_BIN = resolve(import.meta.dirname, "..", "node_modules", ".bin", "tsx");
@@ -342,6 +344,367 @@ test("integration: birth-time match resolves session_id via late re-detect", asy
       "session_id should be resolved by birth-time match after late re-detect",
     );
     assert.equal(resolved.detect_diagnosis.winning?.strategy, "birth-time");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// v0.5 messaging — send_message / read_my_messages
+// ────────────────────────────────────────────────────────────────────────────
+
+type SendOk = {
+  schema_version: 1;
+  ok: true;
+  message_id: string;
+  target_session_id: string | null;
+  target_server_pid: number;
+};
+
+type SendErr = {
+  schema_version: 1;
+  ok: false;
+  error: "target-not-found" | "ambiguous-target" | "cross-project" | "self-send";
+  candidates?: string[];
+};
+
+type ReadMyMessagesResponse = {
+  schema_version: 1;
+  ok: true;
+  drained: true;
+  count: number;
+  messages: Array<{
+    schema_version: 1;
+    id: string;
+    body: string;
+    enqueued_at: number;
+    from_session_id?: string;
+  }>;
+};
+
+// Seed a fake peer registry entry via register() — same writer as production.
+// The captain wants register() over hand-rolled writeFileSync to keep the test
+// faithful to whatever register() actually produces. Caller must temporarily
+// point HOME at the spawned server's HOME so registryDir() lazy-resolves into
+// the right place; the helper saves/restores HOME.
+function seedPeerEntry(home: string, partial: {
+  server_pid: number;
+  started_at?: number;
+  session_id?: string | null;
+  tmux_session?: string | null;
+  cwd?: string;
+  type?: "claude-code" | "codex";
+}): RegistryEntry {
+  const prev = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const entry: RegistryEntry = {
+      server_pid: partial.server_pid,
+      started_at: partial.started_at ?? Math.floor(Date.now() / 1000),
+      client: {
+        type: partial.type ?? "claude-code",
+        session_id: partial.session_id ?? null,
+        transcript_path: null,
+        session_id_source: "self-register",
+        cwd: partial.cwd ?? home,
+      },
+      tmux_pane: null,
+      tmux_session: partial.tmux_session ?? null,
+      state: null,
+    };
+    register(entry);
+    return entry;
+  } finally {
+    process.env.HOME = prev;
+  }
+}
+
+test("messaging: send_message by tmux name lands in peer mailbox; read_my_messages drains it", async () => {
+  const server = await spawnServer();
+  try {
+    // The peer here is the test runner's pid — that pid is alive (it's us),
+    // so isAlive() in resolveTarget keeps the entry. We then read the mailbox
+    // from the test runner side using drain(my_pid) with HOME swapped.
+    const peerPid = process.pid;
+    const peerSessionId = "11111111-2222-3333-4444-555555555555";
+    seedPeerEntry(server.home, {
+      server_pid: peerPid,
+      session_id: peerSessionId,
+      tmux_session: "peer-by-name",
+      cwd: server.home,
+    });
+
+    // The MCP server's cwd is server.home, same as the peer cwd → in-scope.
+    const sent = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: "peer-by-name",
+      body: "hi from sender",
+    });
+    assert.equal(sent.ok, true, `send must succeed: ${JSON.stringify(sent)}`);
+    assert.equal((sent as SendOk).target_server_pid, peerPid);
+
+    // Read the peer's mailbox directly from the test runner; HOME-swap so
+    // mailbox.drain() resolves to the spawned server's HOME.
+    const prev = process.env.HOME;
+    process.env.HOME = server.home;
+    try {
+      const drained = drain(peerPid);
+      assert.equal(drained.length, 1);
+      assert.equal(drained[0].body, "hi from sender");
+    } finally {
+      process.env.HOME = prev;
+    }
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("messaging: send_message by session_id (UUID) resolves to the same peer", async () => {
+  const server = await spawnServer();
+  try {
+    const peerPid = process.pid;
+    const peerSessionId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    seedPeerEntry(server.home, {
+      server_pid: peerPid,
+      session_id: peerSessionId,
+      tmux_session: "peer-by-uuid",
+      cwd: server.home,
+    });
+
+    const sent = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: peerSessionId,
+      body: "via uuid",
+    });
+    assert.equal(sent.ok, true, `send must succeed: ${JSON.stringify(sent)}`);
+    assert.equal((sent as SendOk).target_session_id, peerSessionId);
+
+    const prev = process.env.HOME;
+    process.env.HOME = server.home;
+    try {
+      const drained = drain(peerPid);
+      assert.equal(drained.length, 1);
+      assert.equal(drained[0].body, "via uuid");
+    } finally {
+      process.env.HOME = prev;
+    }
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("messaging: send_message cross-project rejected", async () => {
+  const server = await spawnServer();
+  try {
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: "12345678-1234-1234-1234-123456789012",
+      tmux_session: "cross-project-peer",
+      cwd: "/var/some/other/project",
+    });
+
+    const sent = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: "cross-project-peer",
+      body: "should be rejected",
+    });
+    assert.equal(sent.ok, false);
+    assert.equal((sent as SendErr).error, "cross-project");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("messaging: send_message to unknown target returns target-not-found", async () => {
+  const server = await spawnServer();
+  try {
+    const sent = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: "no-such-peer",
+      body: "into the void",
+    });
+    assert.equal(sent.ok, false);
+    assert.equal((sent as SendErr).error, "target-not-found");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("messaging: send_message to ambiguous tmux name returns candidates", async () => {
+  const server = await spawnServer();
+  try {
+    // Two peer entries sharing the same tmux_session name. Both alive,
+    // both in scope. resolveTarget must surface candidates and refuse to
+    // pick one.
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: "11111111-1111-1111-1111-111111111111",
+      tmux_session: "twin",
+      cwd: server.home,
+    });
+    // A second entry with a DIFFERENT pid. To make isAlive() accept it,
+    // point it at the parent of the test runner (a guaranteed-alive ancestor).
+    seedPeerEntry(server.home, {
+      server_pid: process.ppid,
+      session_id: "22222222-2222-2222-2222-222222222222",
+      tmux_session: "twin",
+      cwd: server.home,
+    });
+
+    const sent = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: "twin",
+      body: "to ambiguous twin",
+    });
+    assert.equal(sent.ok, false);
+    assert.equal((sent as SendErr).error, "ambiguous-target");
+    assert.ok(Array.isArray((sent as SendErr).candidates));
+    assert.equal((sent as SendErr).candidates!.length, 2);
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("messaging: send_message to self by pid returns self-send", async () => {
+  const server = await spawnServer();
+  try {
+    // Get the server's own pid via get_my_session, then send to self by UUID.
+    const me = await callTool<GetMySessionResponse>(server.client, "get_my_session");
+    // The server's session_id is unresolved until claim — pin it first.
+    const myUuid = "fefefefe-fefe-fefe-fefe-fefefefefefe";
+    await callTool(server.client, "claim_session", { session_id: myUuid });
+
+    const sent = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: myUuid,
+      body: "echo",
+    });
+    assert.equal(sent.ok, false);
+    assert.equal((sent as SendErr).error, "self-send");
+    // Sanity: the server pid we read above stayed in scope (cwd is the temp HOME).
+    assert.ok(me.entry.server_pid > 0);
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("messaging: send_message to stale registry entry (dead pid) returns target-not-found", async () => {
+  const server = await spawnServer();
+  try {
+    // Pick a pid extremely unlikely to be in use. process.kill(pid, 0) on a
+    // dead pid raises ESRCH which isAlive() interprets as "not alive."
+    const deadPid = 999_999_999;
+    seedPeerEntry(server.home, {
+      server_pid: deadPid,
+      session_id: "deaddead-dead-dead-dead-deaddeaddead",
+      tmux_session: "ghost-peer",
+      cwd: server.home,
+    });
+
+    const sent = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: "ghost-peer",
+      body: "anyone home?",
+    });
+    assert.equal(sent.ok, false);
+    assert.equal((sent as SendErr).error, "target-not-found");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("messaging: send_message body cap — 8192 bytes succeeds, 8193 fails at zod boundary", async () => {
+  const server = await spawnServer();
+  try {
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: "feedface-feed-face-feed-facefeedface",
+      tmux_session: "cap-peer",
+      cwd: server.home,
+    });
+
+    // 8192 ASCII bytes — boundary case, must succeed.
+    const okBody = "a".repeat(8192);
+    const ok = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: "cap-peer",
+      body: okBody,
+    });
+    assert.equal(ok.ok, true, `8192-byte body must succeed: ${JSON.stringify(ok)}`);
+
+    // Drain so the next test isn't affected.
+    const prev = process.env.HOME;
+    process.env.HOME = server.home;
+    try { drain(process.pid); } finally { process.env.HOME = prev; }
+
+    // 8193 — must fail at the zod refine boundary.
+    const tooBig = "a".repeat(8193);
+    const result = await server.client.callTool({
+      name: "send_message",
+      arguments: { target: "cap-peer", body: tooBig },
+    });
+    assert.equal(result.isError, true, "8193-byte body must error at zod boundary");
+    const content = result.content as Array<{ type: string; text: string }>;
+    const text = content.find((c) => c.type === "text")?.text ?? "";
+    assert.match(text, /8192|exceeds/, `error should mention the cap: ${text}`);
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("messaging: read_my_messages on empty mailbox returns count 0", async () => {
+  const server = await spawnServer();
+  try {
+    const r = await callTool<ReadMyMessagesResponse>(server.client, "read_my_messages");
+    assert.equal(r.ok, true);
+    assert.equal(r.drained, true);
+    assert.equal(r.count, 0);
+    assert.deepEqual(r.messages, []);
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("messaging: from_session_id present when sender has resolved id, absent when null", async () => {
+  // Sender claims a session_id first; recipient's mailbox carries it.
+  const server = await spawnServer();
+  try {
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: "cafecafe-cafe-cafe-cafe-cafecafecafe",
+      tmux_session: "fromsid-peer",
+      cwd: server.home,
+    });
+
+    // Without claim, the sender's client.session_id is null → from_session_id
+    // should be omitted from the enqueued line.
+    await callTool(server.client, "send_message", {
+      target: "fromsid-peer",
+      body: "unclaimed",
+    });
+
+    const prev = process.env.HOME;
+    process.env.HOME = server.home;
+    try {
+      const drainedBefore = drain(process.pid);
+      assert.equal(drainedBefore.length, 1);
+      assert.equal(
+        drainedBefore[0].from_session_id,
+        undefined,
+        "from_session_id must be omitted when sender's session_id is null",
+      );
+    } finally {
+      process.env.HOME = prev;
+    }
+
+    // Now claim and send again — from_session_id should be present.
+    const senderUuid = "abcd1234-abcd-1234-abcd-1234abcd1234";
+    await callTool(server.client, "claim_session", { session_id: senderUuid });
+    await callTool(server.client, "send_message", {
+      target: "fromsid-peer",
+      body: "claimed",
+    });
+
+    process.env.HOME = server.home;
+    try {
+      const drainedAfter = drain(process.pid);
+      assert.equal(drainedAfter.length, 1);
+      assert.equal(drainedAfter[0].from_session_id, senderUuid);
+    } finally {
+      process.env.HOME = prev;
+    }
   } finally {
     await server.cleanup();
   }
