@@ -313,6 +313,61 @@ test("integration: read_session accepts in-scope peer entry", async () => {
   }
 });
 
+test("integration: read_session ambiguous tmux name returns candidates", async () => {
+  const server = await spawnServer();
+  try {
+    const me = await callTool<GetMySessionResponse>(server.client, "get_my_session");
+    const projectRoot = me.entry.client.cwd;
+
+    // Two peers share the same tmux session name — Terminator-style.
+    // resolveSessionInScope must refuse to silently pick one.
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: "33333333-1111-1111-1111-111111111111",
+      tmux_session: "shared-tmux",
+      cwd: projectRoot,
+    });
+    seedPeerEntry(server.home, {
+      server_pid: process.ppid,
+      session_id: "44444444-2222-2222-2222-222222222222",
+      tmux_session: "shared-tmux",
+      cwd: projectRoot,
+    });
+
+    // Tmux-name form returns ambiguous-target.
+    const ambiguous = await callTool<ReadSessionResponse>(server.client, "read_session", {
+      name: "shared-tmux",
+      mode: "transcript",
+      project_root: projectRoot,
+    });
+    assert.equal(ambiguous.mode, "none");
+    assert.match(ambiguous.error ?? "", /ambiguous-target/);
+    assert.match(
+      ambiguous.error ?? "",
+      /33333333-1111-1111-1111-111111111111/,
+      "first candidate UUID listed in error",
+    );
+    assert.match(
+      ambiguous.error ?? "",
+      /44444444-2222-2222-2222-222222222222/,
+      "second candidate UUID listed in error",
+    );
+
+    // UUID form disambiguates: caller gets the specific agent's scope decision
+    // (here, mode: "none" but with a transcript-not-found error, not ambiguity).
+    const disambiguated = await callTool<ReadSessionResponse>(server.client, "read_session", {
+      name: "33333333-1111-1111-1111-111111111111",
+      mode: "transcript",
+      project_root: projectRoot,
+    });
+    assert.equal(disambiguated.mode, "none");
+    assert.doesNotMatch(disambiguated.error ?? "", /ambiguous-target/);
+    assert.doesNotMatch(disambiguated.error ?? "", /not in project scope/);
+  } finally {
+    await server.cleanup();
+  }
+});
+
 test("integration: birth-time match resolves session_id via late re-detect", async () => {
   const server = await spawnServer();
   try {
@@ -736,7 +791,7 @@ type AskPeerErr = {
 
 test("ask_peer: peer replies via mailbox before timeout — returns the reply", async () => {
   // Use a moderate timeout so we don't hit it if the test runner is slow.
-  const server = await spawnServer({ extraEnv: { MCP_ASK_PEER_TIMEOUT_MS: "10000" } });
+  const server = await spawnServer({ extraEnv: { OXTAIL_ASK_PEER_TIMEOUT_MS: "10000" } });
   try {
     const peerSessionId = "ffffffff-1111-2222-3333-444444444444";
     seedPeerEntry(server.home, {
@@ -794,7 +849,7 @@ test("ask_peer: peer replies via mailbox before timeout — returns the reply", 
 });
 
 test("ask_peer: no reply within timeout — returns timed_out: true, no error", async () => {
-  const server = await spawnServer({ extraEnv: { MCP_ASK_PEER_TIMEOUT_MS: "1500" } });
+  const server = await spawnServer({ extraEnv: { OXTAIL_ASK_PEER_TIMEOUT_MS: "1500" } });
   try {
     const peerSessionId = "deadbeef-1111-2222-3333-444444444444";
     seedPeerEntry(server.home, {
@@ -823,7 +878,7 @@ test("ask_peer: no reply within timeout — returns timed_out: true, no error", 
 });
 
 test("ask_peer: rejects target peer that has no client.session_id", async () => {
-  const server = await spawnServer({ extraEnv: { MCP_ASK_PEER_TIMEOUT_MS: "5000" } });
+  const server = await spawnServer({ extraEnv: { OXTAIL_ASK_PEER_TIMEOUT_MS: "5000" } });
   try {
     seedPeerEntry(server.home, {
       server_pid: process.pid,
@@ -845,7 +900,7 @@ test("ask_peer: rejects target peer that has no client.session_id", async () => 
 });
 
 test("ask_peer: unrelated peer messages stay in mailbox; only matching reply is consumed", async () => {
-  const server = await spawnServer({ extraEnv: { MCP_ASK_PEER_TIMEOUT_MS: "8000" } });
+  const server = await spawnServer({ extraEnv: { OXTAIL_ASK_PEER_TIMEOUT_MS: "8000" } });
   try {
     const targetSid = "aaaaaaaa-2222-3333-4444-555555555555";
     const intruderSid = "bbbbbbbb-2222-3333-4444-555555555555";
@@ -902,6 +957,75 @@ test("ask_peer: unrelated peer messages stay in mailbox; only matching reply is 
       assert.equal(remaining.length, 1);
       assert.equal(remaining[0].body, "noise from C");
       assert.equal(remaining[0].from_session_id, intruderSid);
+    } finally {
+      process.env.HOME = prev;
+    }
+  } finally {
+    await server.cleanup();
+  }
+});
+
+// v0.6 ask_peer stale-reply guard. A pre-existing message in A's mailbox from
+// the target (e.g. a chat message that arrived before A called ask_peer) used
+// to be claimed as "the reply" by the grace-window drain. Fixed by draining
+// matching messages before enqueueing the outbound.
+test("ask_peer: pre-existing stale message from target is evicted, fresh reply wins", async () => {
+  const server = await spawnServer({ extraEnv: { OXTAIL_ASK_PEER_TIMEOUT_MS: "8000" } });
+  try {
+    const targetSid = "cccccccc-2222-3333-4444-555555555555";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: targetSid,
+      tmux_session: "ask-peer-stale-target",
+      cwd: server.home,
+    });
+
+    await callTool(server.client, "claim_session", {
+      session_id: "dddddddd-2222-3333-4444-555555555555",
+    });
+    const me = await callTool<GetMySessionResponse>(server.client, "get_my_session");
+    const aPid = me.entry.server_pid;
+
+    // Pre-seed a stale message from the SAME target. Without the
+    // drain-before-enqueue fix, the grace-window matcher would claim this as
+    // the reply to a question we haven't even sent yet.
+    const prev = process.env.HOME;
+    process.env.HOME = server.home;
+    try {
+      enqueue(aPid, "old chatter from earlier", targetSid);
+    } finally {
+      process.env.HOME = prev;
+    }
+
+    // The actual reply lands after ask_peer has started.
+    setTimeout(() => {
+      const prev2 = process.env.HOME;
+      process.env.HOME = server.home;
+      try {
+        enqueue(aPid, "real answer to the question", targetSid);
+      } finally {
+        process.env.HOME = prev2;
+      }
+    }, 600);
+
+    const result = await callTool<AskPeerOk | AskPeerErr>(server.client, "ask_peer", {
+      target: "ask-peer-stale-target",
+      body: "the actual question",
+    });
+    assert.equal(result.ok, true);
+    const ok = result as AskPeerOk;
+    assert.equal(
+      ok.reply?.body,
+      "real answer to the question",
+      "fresh reply wins; the stale 'old chatter' must not be returned",
+    );
+
+    // Mailbox should be empty afterward (stale was drained pre-enqueue, fresh
+    // reply was drained as the reply).
+    process.env.HOME = server.home;
+    try {
+      const remaining = drain(aPid);
+      assert.equal(remaining.length, 0, "no messages should remain");
     } finally {
       process.env.HOME = prev;
     }

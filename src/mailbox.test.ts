@@ -302,6 +302,37 @@ test("drainMatchingSession: messages without from_session_id are never matched",
   });
 });
 
+// v0.6 ask_peer stale-reply guard: ask_peer calls drainMatchingSession in a
+// loop before enqueueing the outbound so any pre-existing messages from the
+// target are evicted (they can't be replies to a question we haven't asked).
+// This test exercises the loop-drain pattern.
+test("drainMatchingSession: loop drains all matching, leaves non-matching untouched", () => {
+  withHome(() => {
+    const pid = 100008;
+    mailbox.enqueue(pid, "stale-1", "peer-x");
+    mailbox.enqueue(pid, "from-other", "peer-y");
+    mailbox.enqueue(pid, "stale-2", "peer-x");
+    mailbox.enqueue(pid, "stale-3", "peer-x");
+
+    let drainedCount = 0;
+    const drainedBodies: string[] = [];
+    while (true) {
+      const m = mailbox.drainMatchingSession(pid, "peer-x");
+      if (!m) break;
+      drainedCount++;
+      drainedBodies.push(m.body);
+    }
+    assert.equal(drainedCount, 3, "three matching messages drained");
+    assert.deepEqual(drainedBodies, ["stale-1", "stale-2", "stale-3"], "drained in append order");
+
+    // peer-y's message survives byte-exact.
+    const remaining = mailbox.drain(pid);
+    assert.equal(remaining.length, 1);
+    assert.equal(remaining[0].body, "from-other");
+    assert.equal(remaining[0].from_session_id, "peer-y");
+  });
+});
+
 test("mailbox: stale lock (mtime 60s ago) is force-cleared and enqueue proceeds", () => {
   withHome((home) => {
     const pid = 99999;

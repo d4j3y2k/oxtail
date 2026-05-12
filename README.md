@@ -59,13 +59,13 @@ Contributing? `git clone https://github.com/d4j3y2k/oxtail && cd oxtail && npm i
 
 ## MCP tools
 
-- `list_project_sessions` — tmux sessions in or under a given project root, enriched with `client_type`, `client_session_id`, and the peer's `state` card for oxtail-aware peers.
-- `read_session` — the recent transcript of a peer session, as clean per-turn messages when the peer is oxtail-aware (Claude Code and Codex CLI), or as raw tmux pane text otherwise.
+- `list_project_sessions` — tmux sessions in or under a given project root, enriched with `client_type`, `client_session_id`, and the peer's `state` card. Returns **one row per registered agent** — rows may share `name` when peers share a tmux session (Terminator multi-window). Disambiguate via `client_session_id`.
+- `read_session` — the recent transcript of a peer session, as clean per-turn messages when the peer is oxtail-aware (Claude Code and Codex CLI), or as raw tmux pane text otherwise. Accepts a tmux session name OR a `client_session_id` UUID; an ambiguous tmux name returns `ambiguous-target` with the candidate UUIDs.
 - `claim_session` — single-shot session registration. The routine path: `Bash echo $CLAUDE_CODE_SESSION_ID` (or `$CODEX_THREAD_ID` for Codex) → `claim_session({ session_id })`. Returns `{ ok, session_id, transcript_path }`.
 - `set_my_state` — write a small "state card" onto this session's registry entry so peers can see what we're doing without reading our transcript. v1 surfaces a single field, `purpose` (≤200 chars).
-- `send_message` — send a short text message to a peer session in the same project root. Target is a tmux session name or a raw `client_session_id` UUID. Body ≤ 8KB. Delivery is async via the peer's mailbox file. (v0.5+)
+- `send_message` — **fire-and-forget** message to a peer. **Does NOT wake an idle peer** — use `ask_peer` for that. Target is a tmux session name or a raw `client_session_id` UUID. Body ≤ 8KB. Delivery is async via the peer's mailbox file. (v0.5+)
 - `read_my_messages` — drain this session's mailbox and return any queued messages. Codex peers (and unhooked Claude Code) poll this; Claude Code peers with the PreToolUse hook installed see messages mid-turn instead. (v0.5+)
-- `ask_peer` — send a message to a peer **and block until they reply** (or a fixed timeout elapses). Combines `send_message` with a server-side wait, plus a `tmux send-keys` wake to nudge idle peers. Returns the peer's reply body. Use this for synchronous delegate-and-wait dynamics; use `send_message` for fire-and-forget. (v0.6+)
+- `ask_peer` — **synchronous delegate-and-wait**. Wakes the peer via `tmux send-keys` and **blocks until they reply** (or the fixed timeout elapses, default 45s, tunable via `OXTAIL_ASK_PEER_TIMEOUT_MS`). Returns the peer's reply body. Use this for delegate-and-wait dynamics; use `send_message` for fire-and-forget. (v0.6+)
 - `register_my_session` — pin this MCP server's `session_id` directly. Kept for debugging; prefer `claim_session`.
 - `get_my_session` — return this MCP server's own registry entry plus a per-strategy detection diagnosis. Useful for debugging.
 
@@ -80,7 +80,9 @@ list_project_sessions({ project_root: "/path/to/project" })
 read_session({ name: "primary" })                    // auto: transcript if peer registered, else pane
 read_session({ name: "claude", mode: "transcript", limit: 50 })
 read_session({ name: "primary", mode: "pane", pane_lines: 500 })
+read_session({ name: "<peer-uuid>", mode: "transcript" })   // UUID form: needed when peers share a tmux session
 send_message({ target: "primary", body: "<system-reminder>checking in</system-reminder>" })
+send_message({ target: "<peer-uuid>", body: "..." })        // UUID form: same disambiguation
 read_my_messages()
 ask_peer({ target: "primary", body: "[Handoff] please audit X and tell me what you find" })
   // → blocks server-side until the peer replies via send_message, then returns their body
@@ -152,8 +154,18 @@ Mechanics:
 Constraints:
 
 - The target peer must have a registered `client.session_id`. Codex peers must call `claim_session` / `register_my_session` first; without that, `ask_peer` returns `error: "peer-has-no-session-id"` rather than guessing.
-- Timeout is fixed (single server-side constant pinned conservatively under typical MCP-client abort windows). For longer dialogues, the calling agent chains multiple `ask_peer` calls in one turn rather than configuring a longer single block.
-- The wake is best-effort. If `tmux send-keys` fails (no tmux server, no pane, copy-mode), the peer may still respond on its own via polling — the only loss is the immediacy of the nudge.
+- Timeout defaults to 45000ms (conservative under typical MCP-client tool-call abort windows). For longer dialogues, the calling agent chains multiple `ask_peer` calls in one turn rather than configuring a longer single block.
+- The wake is best-effort. If `tmux send-keys` fails against the cached pane id (Terminator-style window churn can leave the id stale), oxtail retries against the tmux session name (which targets the currently-active pane). If both fail, the peer may still respond on its own via polling — the only loss is the immediacy of the nudge.
+
+### Tuning the timeout
+
+If `ask_peer` returns an abort error before its built-in 45s timeout fires, your MCP client's tool-call ceiling is lower than 45s. Override the bound at server startup:
+
+```sh
+OXTAIL_ASK_PEER_TIMEOUT_MS=30000 npx -y oxtail@0.6.0
+```
+
+The server reads the env var once at boot and uses it as the fixed timeout for all `ask_peer` calls in that session. Values must be positive numbers; anything else falls back to the 45000ms default.
 
 ### Recommended permissions for autonomous agent-to-agent collaboration
 
