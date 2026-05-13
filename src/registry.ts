@@ -158,6 +158,13 @@ export function refreshTmuxBinding(entry: RegistryEntry): void {
 
 export function register(entry: RegistryEntry): void {
   ensureDir();
+  // Best-effort GC: drop stale entries from dead processes that share our
+  // session_id. Happens when oxtail is configured in multiple MCP scopes
+  // (user + project), so the same client session has spawned several MCP
+  // server children over its lifetime — survivors of crashed prior children
+  // accumulate otherwise. Leaves live siblings alone; readAll() collapses
+  // those by session_id.
+  gcDeadSiblings(entry);
   // Temp file + atomic rename. Concurrent peers running readAll() can otherwise
   // catch a torn write, fail JSON.parse, and silently drop the entry until the
   // next write completes.
@@ -173,6 +180,31 @@ export function register(entry: RegistryEntry): void {
       // already gone, fine
     }
     throw err;
+  }
+}
+
+function gcDeadSiblings(entry: RegistryEntry): void {
+  const sid = entry.client.session_id;
+  if (!sid) return;
+  const dir = registryDir();
+  if (!existsSync(dir)) return;
+  for (const file of readdirSync(dir)) {
+    if (!file.endsWith(".json")) continue;
+    const full = join(dir, file);
+    let other: RegistryEntry;
+    try {
+      other = JSON.parse(readFileSync(full, "utf8")) as RegistryEntry;
+    } catch {
+      continue;
+    }
+    if (other.server_pid === entry.server_pid) continue;
+    if (other.client.session_id !== sid) continue;
+    if (isAlive(other.server_pid)) continue;
+    try {
+      unlinkSync(full);
+    } catch {
+      // already gone, fine
+    }
   }
 }
 
@@ -197,7 +229,7 @@ function isAlive(pid: number): boolean {
 export function readAll(): RegistryEntry[] {
   const dir = registryDir();
   if (!existsSync(dir)) return [];
-  const out: RegistryEntry[] = [];
+  const live: RegistryEntry[] = [];
   for (const file of readdirSync(dir)) {
     if (!file.endsWith(".json")) continue;
     const full = join(dir, file);
@@ -215,9 +247,36 @@ export function readAll(): RegistryEntry[] {
       }
       continue;
     }
-    out.push(entry);
+    live.push(entry);
   }
-  return out;
+  return dedupeBySessionId(live);
+}
+
+// One Claude/Codex session can be backed by multiple MCP server children when
+// oxtail is declared in more than one MCP scope (e.g. user-level config +
+// project `.mcp.json`). Each child registers separately, so the registry ends
+// up with N entries that share the same client.session_id. session_id is the
+// unique agent identity downstream (resolver UUID lookup, peer messaging),
+// so collapse the duplicates here. Keep the freshest by started_at — that's
+// the most likely to have an up-to-date transcript path and tmux binding.
+// Entries with no session_id are left alone: they're either pre-claim
+// (haven't called claim_session yet) or unclaimed peers, and conflating
+// them would be wrong.
+export function dedupeBySessionId(entries: RegistryEntry[]): RegistryEntry[] {
+  const winnerBySession = new Map<string, RegistryEntry>();
+  const noSession: RegistryEntry[] = [];
+  for (const e of entries) {
+    const sid = e.client.session_id;
+    if (!sid) {
+      noSession.push(e);
+      continue;
+    }
+    const prior = winnerBySession.get(sid);
+    if (!prior || e.started_at > prior.started_at) {
+      winnerBySession.set(sid, e);
+    }
+  }
+  return [...winnerBySession.values(), ...noSession];
 }
 
 export function findByTmuxSession(name: string): RegistryEntry[] {

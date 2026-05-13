@@ -45,6 +45,10 @@ The v0.6 change: one new MCP tool (`ask_peer`) that turns v0.5's async pings int
 3. **Both Claude Code and Codex CLI must work** with whatever we build. MCP is the cross-tool protocol; Skills are Claude-specific syntactic sugar that wraps MCP tools, never primary functionality.
 4. **Minimum viable first.** One MCP tool that's actually used > five speculative ones.
 
+## Invariants worth defending
+
+- **`client.session_id` is the unique agent identity.** Not `server_pid`, not `tmux_session`. One Claude/Codex client can be backed by multiple MCP server children — the documented dual-scope setup (project `.mcp.json` + user `~/.claude.json`) intentionally spawns two oxtail processes per session, and Claude Code/Codex restarts during a long session can leak ghost children. The registry stores one file per `server_pid`, so duplicates per `session_id` are the norm; `readAll()` collapses them by `session_id` (freshest `started_at` wins). Any new code that reasons about peer identity must key on `client.session_id` — adding lookups keyed on `server_pid` or `tmux_session` will reintroduce the bug class where peer reads bail with misleading scope errors (see commit history for the v0.6-era dedupe fix).
+
 ## Recently shipped
 
 - **Delegate-and-wait (v0.6).** `ask_peer({ target, body })` blocks server-side until the peer replies (filtered by `from_session_id`) or a fixed timeout elapses, with a `tmux send-keys` wake fallback for idle peers. Late replies fall back to the v0.5 hook / poll delivery path. Target must have a registered `client.session_id`.
