@@ -14,7 +14,11 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # Node 22+ required for `node --test` glob support (added 22.6.0).
+          # The npm test script passes 'src/**/*.test.ts'; older Nodes
+          # interpret it as a literal file path and fail. End-users don't
+          # need 22 to run the published bin — engines stays at >=20.
+          node-version: "22"
           cache: "npm"
 
       - name: Install tmux
