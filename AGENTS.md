@@ -19,13 +19,13 @@ Scope is **project-root as the unit**. Sessions in one project root see each oth
 
 ## Status: v0.7.0 shipped, dogfooding
 
-Nine MCP tools live: `list_project_sessions`, `read_session`, `claim_session`, `set_my_state`, `register_my_session`, `get_my_session`, the v0.5 messaging pair `send_message` and `read_my_messages`, and the v0.6 delegate-and-wait primitive `ask_peer`. Registered both project-locally (via `.mcp.json` using `tsx ./src/server.ts` for the dev loop) and globally (in `~/.claude.json` and `~/.codex/config.toml`, pointing at `dist/server.js`).
+Nine MCP tools live: `list_project_sessions`, `read_session`, `claim_session`, `set_my_state`, `register_my_session`, `get_my_session`, the v0.5 messaging pair `send_message` and `read_my_messages`, and `ask_peer` (delegate-and-wait, introduced v0.6, per-client wake routing in v0.7). Registered both project-locally (via `.mcp.json` using `tsx ./src/server.ts` for the dev loop) and globally (in `~/.claude.json` and `~/.codex/config.toml`, pointing at `dist/server.js`).
 
 The v0.4.0 change: peer `client_session_id` and `transcript_path` now resolve reliably for Claude Code and Codex peers, even though Claude Code strips its session-id env var from MCP children. Detection layers in `src/detect/` — env, then birth-time fingerprint matching of transcript files, with a `claim_session` escape hatch (`register_my_session` is kept for debugging) — see `README.md` for details.
 
 The follow-on additions (`claim_session`, `set_my_state`) introduce a peer-awareness layer: `list_project_sessions` now surfaces each peer's `state` card so an agent can learn what its peers are doing without paying for `read_session`. Raw transcripts become the deep-dive fallback, not the default mode of peer awareness.
 
-Current phase remains **dogfooding**: use the tools in real parallel-agent work, log friction in `NOTES.md`. Each version (v0.1 list_project_sessions → v0.2 read_session → v0.3 reliable peer identity → v0.4 peer-awareness state cards → v0.5 peer-to-peer messaging → v0.6 delegate-and-wait) shipped only after observed friction named the next addition; the same gating applies to whatever comes next.
+Current phase remains **dogfooding**: use the tools in real parallel-agent work, log friction in `NOTES.md`. Each version (v0.1 list_project_sessions → v0.2 read_session → v0.3 reliable peer identity → v0.4 peer-awareness state cards → v0.5 peer-to-peer messaging → v0.6 delegate-and-wait → v0.7 per-client wake routing) shipped only after observed friction named the next addition; the same gating applies to whatever comes next.
 
 The v0.5 change: two new MCP tools (`send_message`, `read_my_messages`) plus an opt-in `PreToolUse` hook installable via `npx oxtail install-hook`. Friction observed while pairing on Terminator — two agents in the same project root can see each other's state cards and transcripts but couldn't say anything to each other. Now they can. Claude Code peers see messages mid-turn (via the hook); Codex peers (or unhooked Claude Code) see them next-turn (via polling `read_my_messages`).
 

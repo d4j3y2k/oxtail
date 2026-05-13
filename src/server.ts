@@ -882,7 +882,7 @@ server.registerTool(
       "Delivery is asynchronous: the message lands in the target's mailbox and is delivered mid-turn via the oxtail PreToolUse hook (Claude Code) or next-turn via read_my_messages (Codex, or any client without the hook installed). If the peer is idle (no in-flight turn, no polling), the message waits until they next call a tool or poll explicitly — there is no nudge.",
       "Sender-side wrapping: if you want the message to appear as a system-reminder, include the <system-reminder>...</system-reminder> tags in `body`. The mailbox is a dumb transport.",
       "Cross-project targets are rejected, never silently dropped.",
-      "For a blocking send-and-wait variant that pauses your turn until the peer replies, use ask_peer instead. (Note: ask_peer's idle-peer wake is best-effort in v0.6 and does not reliably rouse fully-idle TUI peers — see ask_peer's tool description.)",
+      "For a blocking send-and-wait variant that pauses your turn until the peer replies, use ask_peer instead. ask_peer routes the wake per client_type (v0.7+): Codex peers are woken via paste-burst-aware send-keys; Claude Code peers fail-fast since their hook surface has no idle event. See ask_peer's tool description for the full contract.",
     ].join(" "),
     inputSchema: {
       target: z
