@@ -29,7 +29,9 @@ Current phase remains **dogfooding**: use the tools in real parallel-agent work,
 
 The v0.5 change: two new MCP tools (`send_message`, `read_my_messages`) plus an opt-in `PreToolUse` hook installable via `npx oxtail install-hook`. Friction observed while pairing on Terminator — two agents in the same project root can see each other's state cards and transcripts but couldn't say anything to each other. Now they can. Claude Code peers see messages mid-turn (via the hook); Codex peers (or unhooked Claude Code) see them next-turn (via polling `read_my_messages`).
 
-The v0.6 change: one new MCP tool (`ask_peer`) that turns v0.5's async pings into synchronous delegate-and-wait. Friction observed while dogfooding v0.5 — `send_message` lets agents say things to each other, but the sender doesn't stay in-turn waiting for a reply, and an idle receiver doesn't get nudged. `ask_peer` blocks server-side until a reply with a matching `from_session_id` lands (or a fixed timeout elapses) and fires a `tmux send-keys` wake to rouse idle peers. The result: an agent talking to its user can delegate to a peer, exchange multiple rounds inside one of its own turns, and report back synthesized findings.
+The v0.6 change: one new MCP tool (`ask_peer`) that turns v0.5's async pings into a blocking delegate-and-wait. Friction observed while dogfooding v0.5 — `send_message` lets agents say things to each other, but the sender doesn't stay in-turn waiting for a reply. `ask_peer` blocks server-side until a reply with a matching `from_session_id` lands (or a fixed timeout elapses) and fires a `tmux send-keys` wake against the peer's pane.
+
+**v0.6 known limitation (tracked in issue #3, scoped for v0.7).** The wake does *not* reliably rouse fully-idle TUI peers. Codex composer pollution is verified (2026-05-13 in `terminal-orchestrator`): the wake's `tmux send-keys ... Enter` lands as typed-but-not-submitted text in Codex's `›` composer, leaving the wake notification visible to the user but never flushing it as a turn. Idle Claude Code peers are also unwoken in practice — the PreToolUse hook only fires inside an existing turn, so idle Claude at its prompt has no polling path — but the root cause is not yet captured the same way (could be the same `\r`-as-newline issue; could be different). For now, `ask_peer` is reliable only when the target is already in a turn (or enters one on its own via user input) inside the timeout window. Against a fully idle peer with no human at the keyboard, expect `timed_out: true`.
 
 ## How to collaborate on this project
 
@@ -51,7 +53,7 @@ The v0.6 change: one new MCP tool (`ask_peer`) that turns v0.5's async pings int
 
 ## Recently shipped
 
-- **Delegate-and-wait (v0.6).** `ask_peer({ target, body })` blocks server-side until the peer replies (filtered by `from_session_id`) or a fixed timeout elapses, with a `tmux send-keys` wake fallback for idle peers. Late replies fall back to the v0.5 hook / poll delivery path. Target must have a registered `client.session_id`.
+- **Delegate-and-wait (v0.6).** `ask_peer({ target, body })` blocks server-side until the peer replies (filtered by `from_session_id`) or a fixed timeout elapses, with a best-effort `tmux send-keys` wake attempted against the peer's pane. Late replies fall back to the v0.5 hook / poll delivery path. Target must have a registered `client.session_id`. **Idle-TUI wake is not reliable in v0.6** — see the limitation note above and issue #3.
 - **Cross-session messaging (v0.5).** `send_message({ target, body })` + `read_my_messages()`. Mailbox lives at `~/.oxtail/mailboxes/<server_pid>.jsonl`, drained under an `mkdir`-based advisory lock. Opt-in PreToolUse hook (`npx oxtail install-hook`) for mid-turn delivery to Claude Code.
 
 ## Deliberately deferred

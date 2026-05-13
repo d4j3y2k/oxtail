@@ -881,7 +881,7 @@ server.registerTool(
       "Delivery is asynchronous: the message lands in the target's mailbox and is delivered mid-turn via the oxtail PreToolUse hook (Claude Code) or next-turn via read_my_messages (Codex, or any client without the hook installed). If the peer is idle (no in-flight turn, no polling), the message waits until they next call a tool or poll explicitly — there is no nudge.",
       "Sender-side wrapping: if you want the message to appear as a system-reminder, include the <system-reminder>...</system-reminder> tags in `body`. The mailbox is a dumb transport.",
       "Cross-project targets are rejected, never silently dropped.",
-      "For a blocking send-and-wait variant that pauses your turn until the peer replies AND nudges an idle peer via tmux send-keys, use ask_peer instead.",
+      "For a blocking send-and-wait variant that pauses your turn until the peer replies, use ask_peer instead. (Note: ask_peer's idle-peer wake is best-effort in v0.6 and does not reliably rouse fully-idle TUI peers — see ask_peer's tool description.)",
     ].join(" "),
     inputSchema: {
       target: z
@@ -1004,10 +1004,18 @@ function askPeerDelay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-// Best-effort wake: two send-keys calls so the text is interpreted literally
-// (-l) and Enter is parsed as a key event. The -l flag neutralizes any tmux
-// keysequences a malicious peer could plant in its registry entry. Failure to
-// reach tmux is non-fatal — the peer may still poll or hook-deliver on its own.
+// KNOWN ISSUE (tracked in #3, planned for v0.7): this wake does not actually
+// rouse idle TUI peers. Verified 2026-05-13 against Codex CLI — the trailing
+// `tmux send-keys ... Enter` lands as composer-newline rather than submit,
+// leaving the wake text typed-but-not-flushed in Codex's `›` composer. Idle
+// Claude Code peers are also unwoken in practice; the PreToolUse hook only
+// fires inside an existing turn, so an idle Claude at its prompt sees nothing
+// until the user types. ask_peer is therefore effectively async-only against
+// idle peers: replies arrive once the peer enters a turn on its own.
+//
+// Two send-keys calls: the text is interpreted literally (-l) and Enter is
+// parsed as a key event. The -l flag neutralizes any tmux keysequences a
+// malicious peer could plant in its registry entry.
 //
 // Pane targeting can go stale: tmux_pane is cached at server startup (registry
 // resolveTmuxPane), but Terminator-style window churn can move or close the
@@ -1095,9 +1103,10 @@ server.registerTool(
   "ask_peer",
   {
     description: [
-      "Synchronous delegate-and-wait. Wakes the peer via tmux send-keys and blocks until they reply (or timeout).",
-      "Use this when you want a synchronous back-and-forth with another agent in the same project root, rather than fire-and-forget like send_message.",
-      "Behavior: enqueues the body to the target's mailbox, waits ~500ms for a hook-delivered reply, then fires a tmux send-keys wake to nudge the peer if idle, then polls this session's mailbox at 200ms for a reply from the target.",
+      "Enqueue a message to a peer and block until they reply (or timeout).",
+      "Use this when you want a back-and-forth with another agent in the same project root, rather than fire-and-forget like send_message.",
+      "KNOWN LIMITATION (v0.6, tracked in issue #3, planned v0.7): the tmux send-keys wake does NOT reliably rouse idle TUI peers. Codex composer pollution verified 2026-05-13 — wake text lands as typed-but-not-submitted input. Idle Claude Code peers are also unwoken in practice. ask_peer reliably returns a reply only if the target enters a turn on its own (user types into it, or another tool call fires its PreToolUse hook) within the timeout. Against a fully idle peer with no human at the keyboard, expect timeout.",
+      "Behavior: enqueues the body to the target's mailbox, waits ~500ms for a hook-delivered reply, fires a best-effort tmux send-keys wake (see limitation above), then polls this session's mailbox at 200ms for a reply from the target.",
       "Returns when the target sends a message back (via send_message) whose from_session_id matches them, or when the timeout elapses (returns reply: null, timed_out: true). Timeout defaults to 45000ms; user-tunable via OXTAIL_ASK_PEER_TIMEOUT_MS env var.",
       "Target must have a registered client.session_id (Codex peers must call register_my_session first).",
       "Late replies that arrive after timeout are delivered normally via read_my_messages / the PreToolUse hook.",
@@ -1278,6 +1287,16 @@ function maybeHookHint(): void {
   );
 }
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
-maybeHookHint();
+// Importing server.ts (e.g. from a test that needs an exported helper) used
+// to await server.connect(transport) at module load — which never resolves
+// without stdin EOF and hung `npm test` indefinitely. Gate the transport
+// behind a direct-invocation check, mirroring scripts/install-hook.mjs.
+const invokedDirectly =
+  typeof process.argv[1] === "string" &&
+  import.meta.url === new URL(process.argv[1], "file:").href;
+
+if (invokedDirectly) {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  maybeHookHint();
+}

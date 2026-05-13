@@ -1,0 +1,10 @@
+interface:
+  display_name: "Oxtail Join"
+  short_description: "Join this Codex session to the oxtail peer registry"
+  default_prompt: "Use $oxtail-join to register this Codex session with the oxtail peer registry."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "oxtail"
+      description: "Local oxtail MCP server exposing session registration tools"

@@ -1,11 +1,11 @@
 ---
-name: oxtail-register
-description: Register the current Codex agent session with the oxtail MCP peer registry. Use when the user asks to join oxtail, register with oxtail, run oxtail-register, fix oxtail client_session_id detection, or make this Codex session visible/readable to peer agents in the same project.
+name: oxtail-join
+description: Join this Codex session into the oxtail MCP peer registry. Use when the user asks to join oxtail, register with oxtail, run oxtail-join, fix oxtail client_session_id detection, or make this Codex session visible/readable to peer agents in the same project.
 ---
 
-# Oxtail Register
+# Oxtail Join
 
-Register this Codex session with oxtail quickly and verify the result.
+Join this Codex session into the oxtail peer registry quickly and verify the result.
 
 ## Communication Contract
 
