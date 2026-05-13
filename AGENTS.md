@@ -17,7 +17,7 @@ Scope is **project-root as the unit**. Sessions in one project root see each oth
 - **Registry (leaning):** `tmux list-sessions` filtered by project-derived names, rather than a custom JSON registry. Free dead-session detection, free naming, no daemon to maintain. Decision pending real-use signals.
 - **Project scoping:** project root inferred from session CWD at agent startup.
 
-## Status: v0.6.0 shipped, dogfooding
+## Status: v0.7.0 shipped, dogfooding
 
 Nine MCP tools live: `list_project_sessions`, `read_session`, `claim_session`, `set_my_state`, `register_my_session`, `get_my_session`, the v0.5 messaging pair `send_message` and `read_my_messages`, and the v0.6 delegate-and-wait primitive `ask_peer`. Registered both project-locally (via `.mcp.json` using `tsx ./src/server.ts` for the dev loop) and globally (in `~/.claude.json` and `~/.codex/config.toml`, pointing at `dist/server.js`).
 
@@ -31,7 +31,7 @@ The v0.5 change: two new MCP tools (`send_message`, `read_my_messages`) plus an 
 
 The v0.6 change: one new MCP tool (`ask_peer`) that turns v0.5's async pings into a blocking delegate-and-wait. Friction observed while dogfooding v0.5 — `send_message` lets agents say things to each other, but the sender doesn't stay in-turn waiting for a reply. `ask_peer` blocks server-side until a reply with a matching `from_session_id` lands (or a fixed timeout elapses) and fires a `tmux send-keys` wake against the peer's pane.
 
-**v0.6 known limitation (tracked in issue #3, scoped for v0.7).** The wake does *not* reliably rouse fully-idle TUI peers. Codex composer pollution is verified (2026-05-13 in `terminal-orchestrator`): the wake's `tmux send-keys ... Enter` lands as typed-but-not-submitted text in Codex's `›` composer, leaving the wake notification visible to the user but never flushing it as a turn. Idle Claude Code peers are also unwoken in practice — the PreToolUse hook only fires inside an existing turn, so idle Claude at its prompt has no polling path — but the root cause is not yet captured the same way (could be the same `\r`-as-newline issue; could be different). For now, `ask_peer` is reliable only when the target is already in a turn (or enters one on its own via user input) inside the timeout window. Against a fully idle peer with no human at the keyboard, expect `timed_out: true`.
+The v0.7 change: per-client wake routing after the v0.6 wake was found to be broken against idle TUI peers. Spike investigation (issue #3) revealed two distinct constraints, fixed differently. For **Codex**: the root cause was not `\r`-as-newline as initially suspected, but Codex's paste-burst heuristic (`codex-rs/tui/src/bottom_pane/paste_burst.rs`) suppressing Enter for ~120ms after a fast typed burst — `tmux send-keys -l text` + immediate `send-keys Enter` looked like a paste, so the trailing Enter was forcibly converted to newline. Fix: a 500ms gap between the text and the Enter. Verified live 2026-05-13 against the live `oxtail-codex` peer in this repo. For **Claude Code**: idle peers are architecturally unwakeable from outside the process — the documented Claude Code hook surface has no idle event, no polling, no external "start a turn" mechanism (`Notification` is outbound-only; `FileChanged` only fires inside an in-flight turn). v0.7 ask_peer fail-fasts for Claude Code targets with `wake_status: "skipped_unsupported"` rather than burning the 45s timeout. The outbound is still enqueued and delivered next time the peer enters a turn. Wake strategy is overridable via `OXTAIL_ASK_PEER_WAKE_STRATEGY=auto|legacy|off` as a rollback.
 
 ## How to collaborate on this project
 
@@ -53,7 +53,8 @@ The v0.6 change: one new MCP tool (`ask_peer`) that turns v0.5's async pings int
 
 ## Recently shipped
 
-- **Delegate-and-wait (v0.6).** `ask_peer({ target, body })` blocks server-side until the peer replies (filtered by `from_session_id`) or a fixed timeout elapses, with a best-effort `tmux send-keys` wake attempted against the peer's pane. Late replies fall back to the v0.5 hook / poll delivery path. Target must have a registered `client.session_id`. **Idle-TUI wake is not reliable in v0.6** — see the limitation note above and issue #3.
+- **Per-client wake routing (v0.7).** `ask_peer` now routes its wake mechanism per `client_type`. Codex: paste-burst-aware send-keys (500ms gap between text and Enter) — verified to actually submit. Claude Code: fail-fast with `wake_status: "skipped_unsupported"` since the hook surface has no idle event. Response gains a `wake_status` field for caller diagnostics. Pre-wake pane re-resolution closes the stale-pane-ID race from v0.6. `OXTAIL_ASK_PEER_WAKE_STRATEGY=auto|legacy|off` env override for rollback. Issue #3 has the spike findings.
+- **Delegate-and-wait (v0.6).** `ask_peer({ target, body })` blocks server-side until the peer replies (filtered by `from_session_id`) or a fixed timeout elapses. Late replies fall back to the v0.5 hook / poll delivery path. Target must have a registered `client.session_id`.
 - **Cross-session messaging (v0.5).** `send_message({ target, body })` + `read_my_messages()`. Mailbox lives at `~/.oxtail/mailboxes/<server_pid>.jsonl`, drained under an `mkdir`-based advisory lock. Opt-in PreToolUse hook (`npx oxtail install-hook`) for mid-turn delivery to Claude Code.
 
 ## Deliberately deferred

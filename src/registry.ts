@@ -138,6 +138,16 @@ export function resolveTmuxPane(env: NodeJS.ProcessEnv = process.env, pid = proc
   return findTmuxPaneByAncestry(pid, listTmuxPanePids(), listAllPpids());
 }
 
+// Resolve the tmux pane currently hosting a given server pid by walking the
+// process tree. Unlike resolveTmuxPane(), this does NOT trust env vars — it
+// queries live tmux + ps state. Used by the ask_peer wake path to detect a
+// stale cached tmux_pane: if a peer's pane was killed and its pane_id reused
+// by an unrelated pane, the cached id no longer points at our peer. Returns
+// null if the server pid is no longer in any tmux pane's process tree.
+export function currentPaneForServerPid(serverPid: number): string | null {
+  return findTmuxPaneByAncestry(serverPid, listTmuxPanePids(), listAllPpids());
+}
+
 export function buildEntry(client: ClientInfo, env = process.env): RegistryEntry {
   const tmux_pane = resolveTmuxPane(env);
   return {

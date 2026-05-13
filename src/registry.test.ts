@@ -175,57 +175,78 @@ test("joinSessionsWithRegistry: registry entries with tmux_session not in matche
 // wake silently no-ops and ask_peer falls back to 45s polling.
 import { askPeerWakeImpl } from "./server.js";
 
-test("askPeerWakeImpl: retries against sessionName when pane send-keys fails", () => {
+test("askPeerWakeImpl: retries against sessionName when pane send-keys fails", async () => {
   const calls: string[] = [];
   const fire = (target: string) => {
     calls.push(target);
     if (target === "%stale") throw new Error("can't find pane");
   };
-  const result = askPeerWakeImpl("%stale", "my-session", fire);
+  const result = await askPeerWakeImpl("%stale", "my-session", fire);
   assert.equal(result, true, "retry against sessionName succeeded");
   assert.deepEqual(calls, ["%stale", "my-session"]);
 });
 
-test("askPeerWakeImpl: returns false when both pane and sessionName fail", () => {
+test("askPeerWakeImpl: returns false when both pane and sessionName fail", async () => {
   const calls: string[] = [];
   const fire = (target: string) => {
     calls.push(target);
     throw new Error("tmux dead");
   };
-  const result = askPeerWakeImpl("%stale", "my-session", fire);
+  const result = await askPeerWakeImpl("%stale", "my-session", fire);
   assert.equal(result, false);
   assert.deepEqual(calls, ["%stale", "my-session"], "both attempted");
 });
 
-test("askPeerWakeImpl: no retry when pane succeeds first try", () => {
+test("askPeerWakeImpl: no retry when pane succeeds first try", async () => {
   const calls: string[] = [];
   const fire = (target: string) => {
     calls.push(target);
   };
-  const result = askPeerWakeImpl("%good", "my-session", fire);
+  const result = await askPeerWakeImpl("%good", "my-session", fire);
   assert.equal(result, true);
   assert.deepEqual(calls, ["%good"], "only the primary target");
 });
 
-test("askPeerWakeImpl: no retry when pane is null (sessionName was primary)", () => {
+test("askPeerWakeImpl: no retry when pane is null (sessionName was primary)", async () => {
   const calls: string[] = [];
   const fire = (target: string) => {
     calls.push(target);
     throw new Error("tmux dead");
   };
-  const result = askPeerWakeImpl(null, "my-session", fire);
+  const result = await askPeerWakeImpl(null, "my-session", fire);
   assert.equal(result, false);
   assert.deepEqual(calls, ["my-session"], "no retry — sessionName was the only target");
 });
 
-test("askPeerWakeImpl: skips entirely when both pane and sessionName are null", () => {
+test("askPeerWakeImpl: skips entirely when both pane and sessionName are null", async () => {
   const calls: string[] = [];
   const fire = (target: string) => {
     calls.push(target);
   };
-  const result = askPeerWakeImpl(null, null, fire);
+  const result = await askPeerWakeImpl(null, null, fire);
   assert.equal(result, false);
   assert.deepEqual(calls, [], "nothing fired");
+});
+
+// v0.7: async fire callback (paste-burst-aware wake awaits between keystrokes).
+test("askPeerWakeImpl: awaits async fire callback", async () => {
+  const calls: string[] = [];
+  let resolveSecond: (() => void) | null = null;
+  const fire = async (target: string) => {
+    calls.push(`${target}:start`);
+    await new Promise<void>((r) => {
+      resolveSecond = r;
+    });
+    calls.push(`${target}:end`);
+  };
+  const promise = askPeerWakeImpl("%good", null, fire);
+  // Let fire enter; it'll be stuck waiting on resolveSecond.
+  await new Promise((r) => setTimeout(r, 5));
+  assert.deepEqual(calls, ["%good:start"], "fire entered but not yet resolved");
+  resolveSecond!();
+  const result = await promise;
+  assert.equal(result, true);
+  assert.deepEqual(calls, ["%good:start", "%good:end"], "fire fully awaited before return");
 });
 
 // Registry dedupe by session_id. One Claude/Codex session can spawn multiple

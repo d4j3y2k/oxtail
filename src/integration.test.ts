@@ -773,6 +773,7 @@ type AskPeerOk = {
   schema_version: 1;
   ok: true;
   message_id: string;
+  wake_status: "fired" | "skipped_unsupported" | "skipped_no_target" | "disabled";
   reply: {
     id: string;
     body: string;
@@ -799,6 +800,9 @@ test("ask_peer: peer replies via mailbox before timeout — returns the reply", 
       session_id: peerSessionId,
       tmux_session: "ask-peer-replier",
       cwd: server.home,
+      // v0.7: claude-code targets fail-fast (no poll); use codex so this test
+      // still exercises the wake + poll path.
+      type: "codex",
     });
 
     // Sender (A) must have a session_id for from_session_id to be set on the
@@ -857,6 +861,7 @@ test("ask_peer: no reply within timeout — returns timed_out: true, no error", 
       session_id: peerSessionId,
       tmux_session: "ask-peer-silent",
       cwd: server.home,
+      type: "codex",
     });
 
     const t0 = Date.now();
@@ -909,6 +914,7 @@ test("ask_peer: unrelated peer messages stay in mailbox; only matching reply is 
       session_id: targetSid,
       tmux_session: "ask-peer-target",
       cwd: server.home,
+      type: "codex",
     });
     // The intruder doesn't need a registry entry — we just enqueue a stray
     // message into A's mailbox with an arbitrary from_session_id below. ask_peer
@@ -978,6 +984,7 @@ test("ask_peer: pre-existing stale message from target is evicted, fresh reply w
       session_id: targetSid,
       tmux_session: "ask-peer-stale-target",
       cwd: server.home,
+      type: "codex",
     });
 
     await callTool(server.client, "claim_session", {
@@ -1029,6 +1036,83 @@ test("ask_peer: pre-existing stale message from target is evicted, fresh reply w
     } finally {
       process.env.HOME = prev;
     }
+  } finally {
+    await server.cleanup();
+  }
+});
+
+// v0.7: Claude Code idle peers cannot be woken externally — the Claude Code
+// hook surface has no idle event (verified via Claude Code's documented hook
+// catalog). ask_peer must fail-fast for claude-code targets instead of
+// burning the timeout polling for a reply that can't arrive without the
+// peer's user typing something. The outbound is still enqueued (delivered
+// next time the peer enters a turn).
+test("ask_peer: claude-code target fails fast with wake_status: skipped_unsupported", async () => {
+  const server = await spawnServer({ extraEnv: { OXTAIL_ASK_PEER_TIMEOUT_MS: "10000" } });
+  try {
+    const peerSid = "12345678-aaaa-bbbb-cccc-111111111111";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: peerSid,
+      tmux_session: "ask-peer-claude",
+      cwd: server.home,
+      type: "claude-code",
+    });
+
+    const t0 = Date.now();
+    const result = await callTool<AskPeerOk | AskPeerErr>(server.client, "ask_peer", {
+      target: "ask-peer-claude",
+      body: "you can't be woken but the message is still enqueued",
+    });
+    const elapsed = Date.now() - t0;
+
+    assert.equal(result.ok, true);
+    const ok = result as AskPeerOk;
+    assert.equal(ok.wake_status, "skipped_unsupported");
+    assert.equal(ok.reply, null);
+    // timed_out must be FALSE — we didn't actually poll, we returned fast.
+    // Distinguishing this from a real timeout is the whole point of the field.
+    assert.equal(ok.timed_out, false, "fail-fast is not a timeout");
+    // Fail-fast still pays the 500ms grace window, but nothing more.
+    assert.ok(elapsed < 2000, `should not have polled, took ${elapsed}ms`);
+  } finally {
+    await server.cleanup();
+  }
+});
+
+// v0.7: OXTAIL_ASK_PEER_WAKE_STRATEGY=off disables wake entirely; ask_peer
+// becomes a pure blocking poll. wake_status surfaces as "disabled" so the
+// caller knows no wake fired.
+test("ask_peer: strategy=off surfaces wake_status: disabled and still polls", async () => {
+  const server = await spawnServer({
+    extraEnv: {
+      OXTAIL_ASK_PEER_TIMEOUT_MS: "1500",
+      OXTAIL_ASK_PEER_WAKE_STRATEGY: "off",
+    },
+  });
+  try {
+    const peerSid = "deadcafe-aaaa-bbbb-cccc-111111111111";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: peerSid,
+      tmux_session: "ask-peer-off",
+      cwd: server.home,
+      type: "claude-code",
+    });
+
+    const t0 = Date.now();
+    const result = await callTool<AskPeerOk | AskPeerErr>(server.client, "ask_peer", {
+      target: "ask-peer-off",
+      body: "no wake should fire",
+    });
+    const elapsed = Date.now() - t0;
+
+    assert.equal(result.ok, true);
+    const ok = result as AskPeerOk;
+    assert.equal(ok.wake_status, "disabled");
+    assert.equal(ok.reply, null);
+    assert.equal(ok.timed_out, true, "we did poll, and timed out");
+    assert.ok(elapsed >= 1400, `should have waited the full timeout, took ${elapsed}ms`);
   } finally {
     await server.cleanup();
   }

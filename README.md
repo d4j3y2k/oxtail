@@ -65,9 +65,9 @@ Contributing? `git clone https://github.com/d4j3y2k/oxtail && cd oxtail && npm i
 - `read_session` — the recent transcript of a peer session, as clean per-turn messages when the peer is oxtail-aware (Claude Code and Codex CLI), or as raw tmux pane text otherwise. Accepts a tmux session name OR a `client_session_id` UUID; an ambiguous tmux name returns `ambiguous-target` with the candidate UUIDs.
 - `claim_session` — single-shot session registration. The routine path: `Bash echo $CLAUDE_CODE_SESSION_ID` (or `$CODEX_THREAD_ID` for Codex) → `claim_session({ session_id })`. Returns `{ ok, session_id, transcript_path }`.
 - `set_my_state` — write a small "state card" onto this session's registry entry so peers can see what we're doing without reading our transcript. v1 surfaces a single field, `purpose` (≤200 chars).
-- `send_message` — **fire-and-forget** message to a peer. **Does NOT wake an idle peer.** Target is a tmux session name or a raw `client_session_id` UUID. Body ≤ 8KB. Delivery is async via the peer's mailbox file. (v0.5+) (`ask_peer` attempts a wake but the v0.6 implementation does not reliably rouse idle TUI peers — see its description.)
+- `send_message` — **fire-and-forget** message to a peer. **Does NOT wake an idle peer.** Target is a tmux session name or a raw `client_session_id` UUID. Body ≤ 8KB. Delivery is async via the peer's mailbox file. (v0.5+)
 - `read_my_messages` — drain this session's mailbox and return any queued messages. Codex peers (and unhooked Claude Code) poll this; Claude Code peers with the PreToolUse hook installed see messages mid-turn instead. (v0.5+)
-- `ask_peer` — **delegate-and-wait**. Enqueues a message and blocks server-side until the peer replies (or the fixed timeout elapses, default 45s, tunable via `OXTAIL_ASK_PEER_TIMEOUT_MS`). Fires a best-effort `tmux send-keys` wake. **Known limitation (issue #3, planned v0.7):** the wake does not reliably rouse fully-idle TUI peers — see "Delegate-and-wait (v0.6)" below. Reliable when the target is already in a turn; against a fully idle peer expect timeout. Use `send_message` when you don't need a synchronous reply. (v0.6+)
+- `ask_peer` — **delegate-and-wait**. Enqueues a message and blocks server-side until the peer replies (or the fixed timeout elapses, default 45s, tunable via `OXTAIL_ASK_PEER_TIMEOUT_MS`). v0.7 routes the wake per `client_type`: Codex gets a paste-burst-aware `tmux send-keys` wake that actually submits; Claude Code targets fail-fast (no wake surface for idle Claude — see "Delegate-and-wait" below). Response includes `wake_status` so the caller can distinguish "we polled and got nothing" from "this peer can't be woken." Use `send_message` for fire-and-forget. (v0.7+; v0.6 caveats below)
 - `register_my_session` — pin this MCP server's `session_id` directly. Kept for debugging; prefer `claim_session`.
 - `get_my_session` — return this MCP server's own registry entry plus a per-strategy detection diagnosis. Useful for debugging.
 
@@ -136,30 +136,59 @@ If you have a PreToolUse hook installed that isn't from Terminator and isn't oxt
 
 oxtail trusts any process running as the **same local user** to enqueue messages. The mailbox directory is mode `0o700` (private), so other users on the host cannot read or write. **On a shared-tenancy box (containers, multi-user dev hosts, etc.), do not run oxtail-aware agents:** any local process under your user can inject `<system-reminder>` content directly into a Claude session. The threat boundary is the same as `~/.ssh/` — what your user processes do, you trust.
 
-## Delegate-and-wait (v0.6)
+## Delegate-and-wait (v0.7)
 
 `ask_peer` extends v0.5's mailbox transport into a blocking primitive:
 
 ```
 ask_peer({ target, body })
-  → { ok: true, message_id, reply: { id, body, enqueued_at, from_session_id } | null, timed_out }
+  → {
+      ok: true,
+      message_id,
+      wake_status: "fired" | "skipped_unsupported" | "skipped_no_target" | "disabled",
+      reply: { id, body, enqueued_at, from_session_id } | null,
+      timed_out,
+    }
 ```
 
-> **Known limitation in v0.6 — read this before relying on `ask_peer`.** The wake mechanism does not reliably rouse a fully-idle TUI peer. Verified 2026-05-13 against Codex CLI: the `tmux send-keys ... Enter` lands in Codex's `›` composer as typed-but-not-submitted text, leaving the wake notification visible to the user but never flushing it as a turn. Idle Claude Code peers are also unwoken in practice (no polling at the prompt), though the exact mechanism is not yet root-caused the same way. `ask_peer` is therefore reliable only when the target is already in a turn (or enters one on its own via user input or another tool call's PreToolUse hook) inside the timeout window. Against a fully idle peer with no human at the keyboard, expect `timed_out: true`. Tracked in [issue #3](https://github.com/d4j3y2k/oxtail/issues/3); per-client wake strategy is scoped for v0.7.
+`wake_status` distinguishes the four outcomes a caller may need to handle differently. `fired` means the wake was attempted (or the reply arrived during the grace window, so no wake was needed). `skipped_unsupported` means the target's `client_type` cannot be woken externally — currently Claude Code, see "Per-client wake routing" below. `skipped_no_target` means no tmux pane/session resolved for the target. `disabled` means `OXTAIL_ASK_PEER_WAKE_STRATEGY=off` is in effect.
 
-Mechanics:
+`timed_out` is `true` only when the poll loop ran to its deadline without a reply. Fail-fast for `skipped_unsupported` returns `timed_out: false` because no polling was attempted — the message is still enqueued and will be delivered when the peer next enters a turn.
+
+### Per-client wake routing
+
+v0.7 routes the wake mechanism per `client_type`. Verified 2026-05-13 via spike investigation and falsifying experiment:
+
+- **Codex** — `tmux send-keys -l <text>` followed by `send-keys Enter` is the wake. The keystrokes are split by 500ms because Codex's TUI has a paste-burst heuristic in `codex-rs/tui/src/bottom_pane/paste_burst.rs` (`PASTE_BURST_MIN_CHARS=3`, `PASTE_ENTER_SUPPRESS_WINDOW=120ms`) that converts Enter→newline for ~120ms after a fast typed burst. Without the gap, the wake text accumulates in the composer and Enter is suppressed. With the gap, Codex submits and enters a turn. 500ms is a deliberately generous multiple of the documented window for upstream-drift safety.
+
+- **Claude Code** — fail-fast. Claude Code's hook surface (per [docs](https://code.claude.com/docs/en/hooks)) has no event that fires while the agent is idle: no polling hook, no external "start a turn" mechanism, `Notification` is outbound-only, `FileChanged` only fires inside an in-flight turn. An external process cannot rouse an idle Claude Code peer. ask_peer returns immediately with `wake_status: "skipped_unsupported"` rather than burning the timeout. The message is enqueued and delivered to the peer's PreToolUse hook on their next tool call (or via explicit `read_my_messages`).
+
+- **Unknown** — legacy v0.6 wake (text + Enter, no gap). No implied promise; if a new TUI lands, treat it as unknown until verified.
+
+### Wake strategy override
+
+`OXTAIL_ASK_PEER_WAKE_STRATEGY=auto|legacy|off` (default `auto`):
+
+- `auto` — per-client routing above.
+- `legacy` — v0.6 behavior for every client (no paste-burst gap, no per-client routing). Escape hatch if auto mode misfires.
+- `off` — wake disabled entirely; ask_peer becomes a pure blocking poll. Response surfaces `wake_status: "disabled"`. Useful as a rollback if a Codex update changes the paste-burst constants and the auto-mode delay no longer covers the window.
+
+### Mechanics
 
 1. Enqueue `body` into the target's mailbox (same as `send_message`).
 2. Wait ~500ms for a hook-delivered reply (rare path — handles the case where the peer was already mid-tool-call and replied immediately).
-3. Fire a best-effort `tmux send-keys` wake against the peer's pane (see known limitation above): a single literal line `[oxtail] new peer message — run mcp__oxtail__read_my_messages and respond via mcp__oxtail__send_message` followed by `Enter`. In a shell prompt this would flush as a command; in a TUI composer it currently lands as composer text.
+3. Route the wake via `wake_status` resolution (see above). For Claude Code, return immediately. Otherwise fire the wake.
 4. Poll the caller's mailbox at 200ms for a reply with `from_session_id == target.session_id`. Other peers' messages stay in the mailbox untouched.
-5. Return the reply on match, or `{ reply: null, timed_out: true }` after the fixed timeout. Late replies fall back to the normal v0.5 hook / `read_my_messages` path — never lost, just delivered out of band.
+5. Return the reply on match, or `{ reply: null, timed_out: true, wake_status }` after the fixed timeout. Late replies fall back to the normal v0.5 hook / `read_my_messages` path — never lost, just delivered out of band.
 
-Constraints:
+### Pane staleness
+
+Pane targeting can go stale: `tmux_pane` is cached at server startup, but tmux can reuse pane ids after a pane is killed. v0.7 re-resolves the pane from the peer's `server_pid` at wake-time (via process-tree ancestry), preferring the live pane id over the cached one. If the peer is no longer in any tmux pane (orphaned), oxtail falls back to the registered tmux session name. If both targeting attempts fail, `wake_status` returns `skipped_no_target`.
+
+### Constraints
 
 - The target peer must have a registered `client.session_id`. Codex peers must call `claim_session` / `register_my_session` first; without that, `ask_peer` returns `error: "peer-has-no-session-id"` rather than guessing.
 - Timeout defaults to 45000ms (conservative under typical MCP-client tool-call abort windows). For longer dialogues, the calling agent chains multiple `ask_peer` calls in one turn rather than configuring a longer single block.
-- Pane targeting can go stale: if `tmux send-keys` fails against the cached pane id (Terminator-style window churn can leave the id stale), oxtail retries against the tmux session name (which targets the currently-active pane). Reaching the right pane is a separate concern from the pane-actually-submitting-the-wake limitation above.
 
 ### Tuning the timeout
 
@@ -213,4 +242,4 @@ If `MCP_TRACE_FILE` is set in the environment, every detection run appends an ND
 
 ## Status
 
-v0.6.0. Adds `ask_peer` on top of v0.5's mailbox transport: an agent can send a message and block server-side until the peer replies. The implementation attempts a `tmux send-keys` wake against the peer's pane — but in practice that wake does not reliably rouse fully-idle TUI peers; `ask_peer` is reliable only when the peer is already in a turn (or enters one on its own inside the timeout). When both sides are mid-turn, the existing PreToolUse hook handles mid-turn delivery cleanly. Codex peers are supported as targets once they've claimed a session. Per-client wake strategy is scoped for v0.7 (issue #3).
+v0.7.0. Replaces v0.6's wake mechanism with per-client routing after a spike investigation found the root cause was Codex's paste-burst heuristic suppressing Enter, not `\r`-as-newline. Codex idle peers now wake reliably via a 500ms-gap send-keys sequence (verified live 2026-05-13). Claude Code idle peers fail-fast with `wake_status: "skipped_unsupported"` — Claude Code's hook surface has no idle event so they're architecturally unwakeable from outside; the message is still enqueued and delivered next turn. ask_peer's response gains a `wake_status` field for caller diagnostics. Wake strategy is overridable via `OXTAIL_ASK_PEER_WAKE_STRATEGY=auto|legacy|off` as a rollback. See [issue #3](https://github.com/d4j3y2k/oxtail/issues/3) for the spike findings.

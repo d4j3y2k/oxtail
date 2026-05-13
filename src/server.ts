@@ -18,6 +18,7 @@ import { diagnoseDetect, isAbstain, type DetectDiagnosis } from "./detect/index.
 import { trace } from "./trace.js";
 import {
   buildEntry,
+  currentPaneForServerPid,
   findByTmuxSession,
   readAll,
   refreshTmuxBinding,
@@ -985,6 +986,39 @@ const ASK_PEER_POLL_MS = 200;
 const ASK_PEER_WAKE_TEXT =
   "[oxtail] new peer message — run mcp__oxtail__read_my_messages and respond via mcp__oxtail__send_message";
 
+// Codex's TUI has a paste-burst heuristic at codex-rs/tui/src/bottom_pane/
+// paste_burst.rs (PASTE_BURST_MIN_CHARS=3, PASTE_BURST_CHAR_INTERVAL=8ms,
+// PASTE_ENTER_SUPPRESS_WINDOW=120ms). When `tmux send-keys` blasts the
+// literal-text payload followed immediately by Enter, Codex detects the
+// pattern as a paste and forcibly converts Enter→newline for ~120ms,
+// suppressing the submit. Inserting a delay between the text and the Enter
+// keystrokes lets the suppression window expire so Enter is treated as a
+// real keypress. 500ms is a generous multiple of the documented window for
+// upstream-drift safety — Codex point releases may bump the constant.
+// Verified empirically 2026-05-13 against Codex (gpt-5.5 xhigh).
+const ASK_PEER_CODEX_SUBMIT_DELAY_MS = 500;
+
+export type WakeStatus =
+  | "fired"             // wake keystrokes were sent (peer should enter a turn)
+  | "skipped_unsupported" // client_type cannot be woken externally (Claude Code idle)
+  | "skipped_no_target" // no tmux pane/session resolved, or send-keys failed everywhere
+  | "disabled";         // OXTAIL_ASK_PEER_WAKE_STRATEGY=off — caller turned wake off
+
+// OXTAIL_ASK_PEER_WAKE_STRATEGY = "auto" | "legacy" | "off"
+//   auto    — per-client routing: Codex gets paste-burst-aware wake (500ms gap
+//             between text and Enter); Claude Code is skipped (no idle hook
+//             surface — verified via Claude Code hook docs); unknown clients
+//             get legacy v0.6 behavior.
+//   legacy  — v0.6 behavior for every client (text + Enter, no gap, no
+//             per-client routing). Escape hatch if auto mode misfires.
+//   off     — wake disabled entirely; ask_peer becomes a blocking poll.
+//             Caller can rely solely on the peer's natural turn cadence.
+const ASK_PEER_WAKE_STRATEGY: "auto" | "legacy" | "off" = (() => {
+  const v = (process.env.OXTAIL_ASK_PEER_WAKE_STRATEGY ?? "auto").toLowerCase();
+  if (v === "auto" || v === "legacy" || v === "off") return v;
+  return "auto";
+})();
+
 function askPeerDelay(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal.aborted) {
@@ -1004,47 +1038,66 @@ function askPeerDelay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-// KNOWN ISSUE (tracked in #3, planned for v0.7): this wake does not actually
-// rouse idle TUI peers. Verified 2026-05-13 against Codex CLI — the trailing
-// `tmux send-keys ... Enter` lands as composer-newline rather than submit,
-// leaving the wake text typed-but-not-flushed in Codex's `›` composer. Idle
-// Claude Code peers are also unwoken in practice; the PreToolUse hook only
-// fires inside an existing turn, so an idle Claude at its prompt sees nothing
-// until the user types. ask_peer is therefore effectively async-only against
-// idle peers: replies arrive once the peer enters a turn on its own.
+// Wake routing (v0.7). The wake's job is to nudge an idle peer into a turn so
+// it drains its mailbox. Mechanics differ per client:
+//
+//   Codex — `tmux send-keys -l <text>` followed by `send-keys Enter` would
+//   work, EXCEPT Codex's paste-burst heuristic suppresses Enter for 120ms
+//   after a fast typing burst (codex-rs/tui/src/bottom_pane/paste_burst.rs).
+//   We insert ASK_PEER_CODEX_SUBMIT_DELAY_MS between the text and the Enter
+//   so the suppression window expires. Verified live 2026-05-13.
+//
+//   Claude Code — has no hook event that fires while idle (verified via
+//   Claude Code's documented hook catalog at code.claude.com/docs/en/hooks;
+//   Notification is outbound-only; FileChanged cannot start a turn).
+//   No external surface can rouse an idle Claude Code peer. wakePeer()
+//   short-circuits with skipped_unsupported for this client_type.
+//
+//   Unknown — legacy v0.6 behavior (text + Enter, no gap). No implied
+//   promise; if a new TUI lands and breaks, we treat it as unknown until
+//   verified.
 //
 // Two send-keys calls: the text is interpreted literally (-l) and Enter is
 // parsed as a key event. The -l flag neutralizes any tmux keysequences a
 // malicious peer could plant in its registry entry.
 //
-// Pane targeting can go stale: tmux_pane is cached at server startup (registry
-// resolveTmuxPane), but Terminator-style window churn can move or close the
-// pane after registration. send-keys against a dead pane id errors; if pane
-// targeting fails and a sessionName is also available, retry against it
-// (targets the session's currently-active pane).
-function defaultFireWakeKeystrokes(target: string): void {
+// Pane targeting can go stale: tmux_pane is cached at server startup
+// (registry resolveTmuxPane), but Terminator-style window churn can move or
+// close the pane after registration. send-keys against a dead pane id
+// errors; if pane targeting fails and a sessionName is also available,
+// retry against it (targets the session's currently-active pane).
+async function defaultFireWakeKeystrokes(
+  target: string,
+  clientType: ClientType,
+): Promise<void> {
   execFileSync("tmux", ["send-keys", "-t", target, "-l", ASK_PEER_WAKE_TEXT], {
     stdio: ["ignore", "pipe", "pipe"],
   });
+  if (clientType === "codex") {
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, ASK_PEER_CODEX_SUBMIT_DELAY_MS);
+      timer.unref?.();
+    });
+  }
   execFileSync("tmux", ["send-keys", "-t", target, "Enter"], {
     stdio: ["ignore", "pipe", "pipe"],
   });
 }
 
-// Exported for unit testing the retry path; production callers use askPeerWake
-// which wires defaultFireWakeKeystrokes.
-export function askPeerWakeImpl(
+// Exported for unit testing the retry path; production callers use wakePeer
+// which wires defaultFireWakeKeystrokes via routing.
+export async function askPeerWakeImpl(
   pane: string | null,
   sessionName: string | null,
-  fire: (target: string) => void,
-): boolean {
+  fire: (target: string) => void | Promise<void>,
+): Promise<boolean> {
   if (!pane && !sessionName) {
     trace("ask_peer_wake_skipped", { reason: "no-pane-or-session" });
     return false;
   }
   const primary = pane ?? sessionName!;
   try {
-    fire(primary);
+    await fire(primary);
     trace("ask_peer_wake_fired", { target: primary });
     return true;
   } catch (e) {
@@ -1052,7 +1105,7 @@ export function askPeerWakeImpl(
   }
   if (pane && sessionName && pane !== sessionName) {
     try {
-      fire(sessionName);
+      await fire(sessionName);
       trace("ask_peer_wake_fired_retry", { target: sessionName });
       return true;
     } catch (e) {
@@ -1062,8 +1115,54 @@ export function askPeerWakeImpl(
   return false;
 }
 
-function askPeerWake(pane: string | null, sessionName: string | null): boolean {
-  return askPeerWakeImpl(pane, sessionName, defaultFireWakeKeystrokes);
+// Route a wake to a peer based on OXTAIL_ASK_PEER_WAKE_STRATEGY and the
+// peer's client_type. Returns the wake_status that should surface in the
+// ask_peer response so callers can distinguish "we tried, no answer" from
+// "we didn't try because the client can't be woken."
+async function wakePeer(peer: RegistryEntry): Promise<WakeStatus> {
+  if (ASK_PEER_WAKE_STRATEGY === "off") {
+    trace("ask_peer_wake_skipped", { reason: "strategy-off" });
+    return "disabled";
+  }
+  const clientType: ClientType = peer.client.type;
+  if (ASK_PEER_WAKE_STRATEGY === "auto" && clientType === "claude-code") {
+    trace("ask_peer_wake_skipped", { reason: "client-unsupported", client_type: clientType });
+    return "skipped_unsupported";
+  }
+  if (!peer.tmux_pane && !peer.tmux_session) {
+    return "skipped_no_target";
+  }
+  // Race-fix: tmux_pane is cached at registration but pane ids can be reused
+  // by tmux after a pane is killed. If we send-keys against a reused id we
+  // wake the wrong shell. When the peer registered WITH a cached pane,
+  // re-resolve from its server_pid at wake-time and prefer the live value.
+  // If the peer registered without a pane (no TMUX_PANE in env, no ancestry
+  // match), skip the re-resolution entirely — fishing for a pane based on
+  // server_pid alone is unsafe (server_pid may not even still be alive, and
+  // in tests it can coincide with the test runner's process tree).
+  const livePane = peer.tmux_pane
+    ? currentPaneForServerPid(peer.server_pid)
+    : null;
+  if (peer.tmux_pane && livePane && livePane !== peer.tmux_pane) {
+    trace("ask_peer_wake_pane_refreshed", {
+      cached: peer.tmux_pane,
+      live: livePane,
+      server_pid: peer.server_pid,
+    });
+  } else if (peer.tmux_pane && !livePane) {
+    trace("ask_peer_wake_pane_orphaned", {
+      cached: peer.tmux_pane,
+      server_pid: peer.server_pid,
+    });
+  }
+  const effectivePane = livePane ?? peer.tmux_pane;
+  // Legacy mode bypasses per-client routing: every wake is the v0.6 sequence
+  // (no inter-keystroke delay). Cast to "unknown" so defaultFireWakeKeystrokes
+  // skips the Codex delay branch.
+  const fireType: ClientType = ASK_PEER_WAKE_STRATEGY === "legacy" ? "unknown" : clientType;
+  const fire = (target: string) => defaultFireWakeKeystrokes(target, fireType);
+  const ok = await askPeerWakeImpl(effectivePane, peer.tmux_session, fire);
+  return ok ? "fired" : "skipped_no_target";
 }
 
 // Poll my mailbox at ASK_PEER_POLL_MS until a matching reply lands or the
@@ -1105,9 +1204,11 @@ server.registerTool(
     description: [
       "Enqueue a message to a peer and block until they reply (or timeout).",
       "Use this when you want a back-and-forth with another agent in the same project root, rather than fire-and-forget like send_message.",
-      "KNOWN LIMITATION (v0.6, tracked in issue #3, planned v0.7): the tmux send-keys wake does NOT reliably rouse idle TUI peers. Codex composer pollution verified 2026-05-13 — wake text lands as typed-but-not-submitted input. Idle Claude Code peers are also unwoken in practice. ask_peer reliably returns a reply only if the target enters a turn on its own (user types into it, or another tool call fires its PreToolUse hook) within the timeout. Against a fully idle peer with no human at the keyboard, expect timeout.",
-      "Behavior: enqueues the body to the target's mailbox, waits ~500ms for a hook-delivered reply, fires a best-effort tmux send-keys wake (see limitation above), then polls this session's mailbox at 200ms for a reply from the target.",
-      "Returns when the target sends a message back (via send_message) whose from_session_id matches them, or when the timeout elapses (returns reply: null, timed_out: true). Timeout defaults to 45000ms; user-tunable via OXTAIL_ASK_PEER_TIMEOUT_MS env var.",
+      "Wake behavior (v0.7) varies per client_type. Codex peers are woken via paste-burst-aware tmux send-keys (literal text + 500ms gap + Enter) so the composer submits. Claude Code peers cannot be woken externally — Claude Code's hook surface has no idle event (verified against the documented hook catalog), so ask_peer fails fast for Claude Code targets and returns wake_status: \"skipped_unsupported\" rather than burning the timeout. Unknown clients use legacy send-keys wake.",
+      "Response includes a wake_status field: \"fired\" (wake attempted or reply received during grace window), \"skipped_unsupported\" (target client cannot be woken — fail-fast, no poll), \"skipped_no_target\" (no tmux pane or session resolved for target), \"disabled\" (OXTAIL_ASK_PEER_WAKE_STRATEGY=off).",
+      "Behavior: enqueues the body to the target's mailbox, waits ~500ms for a hook-delivered reply (rare: peer was mid-turn, hook delivered as additionalContext), fires the per-client wake, then polls this session's mailbox at 200ms for a reply from the target. Fail-fast for skipped_unsupported skips polling entirely; the message is still enqueued and will be delivered the next time the peer enters a turn.",
+      "Returns when the target sends a message back (via send_message) whose from_session_id matches them, or when the timeout elapses (returns reply: null, timed_out: true). timed_out is false on fail-fast (we didn't actually poll). Timeout defaults to 45000ms; user-tunable via OXTAIL_ASK_PEER_TIMEOUT_MS env var.",
+      "Wake strategy can be overridden via OXTAIL_ASK_PEER_WAKE_STRATEGY=auto|legacy|off (default auto). legacy = v0.6 behavior for every client (no gap, no per-client routing). off = no wake fired; ask_peer becomes a pure blocking poll until the peer naturally enters a turn or timeout.",
       "Target must have a registered client.session_id (Codex peers must call register_my_session first).",
       "Late replies that arrive after timeout are delivered normally via read_my_messages / the PreToolUse hook.",
       "Body framing: peers see the body verbatim. Include a short assignment-style framing (objective, what you want them to do) so they treat it as a delegation, not chat.",
@@ -1193,6 +1294,7 @@ server.registerTool(
 
     let reply: mailbox.Mailbox | null = null;
     let aborted = false;
+    let wakeStatus: WakeStatus = "skipped_no_target";
     try {
       // Grace window: rare hook-delivery path. If peer was mid-tool-call when
       // our outbound arrived, their hook delivered it as additionalContext and
@@ -1201,14 +1303,27 @@ server.registerTool(
       reply = mailbox.drainMatchingSession(entry.server_pid, expectedSessionId);
 
       if (!reply) {
-        // Common path: peer was idle; fire wake + poll.
-        askPeerWake(peer.tmux_pane, peer.tmux_session);
-        reply = await askPeerPoll(
-          entry.server_pid,
-          expectedSessionId,
-          deadlineMs,
-          extra.signal,
-        );
+        // Common path: peer was idle. Route the wake per client_type.
+        wakeStatus = await wakePeer(peer);
+        if (wakeStatus === "skipped_unsupported") {
+          // Claude Code idle has no external wake surface — polling would just
+          // burn the caller's wall-clock budget for no reason. Return fast so
+          // the caller can fall back to send_message + read_my_messages, or
+          // wait until the peer is observed mid-turn via list_project_sessions.
+          // The outbound has been enqueued; it'll be delivered next time the
+          // peer enters a turn (via PreToolUse hook or explicit read_my_messages).
+        } else {
+          reply = await askPeerPoll(
+            entry.server_pid,
+            expectedSessionId,
+            deadlineMs,
+            extra.signal,
+          );
+        }
+      } else {
+        // Reply arrived during grace window — peer was already mid-turn and
+        // the hook delivered the outbound to it as additionalContext.
+        wakeStatus = "fired";
       }
     } catch (e) {
       if ((e as Error).message === "aborted") {
@@ -1235,11 +1350,18 @@ server.registerTool(
       throw new Error("ask_peer aborted by client");
     }
 
+    // timed_out is reserved for "we waited and got nothing" — i.e. we actually
+    // polled to the deadline. A fail-fast for an unwakeable client (no poll
+    // attempted) is NOT a timeout; the message has been enqueued and will be
+    // delivered when the peer next enters a turn.
+    const polled = wakeStatus !== "skipped_unsupported";
+    const timedOut = polled && reply === null;
     trace("ask_peer_end", {
       target_session_id: expectedSessionId,
       message_id: msg.id,
       duration_ms: Date.now() - startedAt,
-      timed_out: reply === null,
+      wake_status: wakeStatus,
+      timed_out: timedOut,
     });
 
     return {
@@ -1251,6 +1373,7 @@ server.registerTool(
               schema_version: 1,
               ok: true,
               message_id: msg.id,
+              wake_status: wakeStatus,
               reply: reply
                 ? {
                     id: reply.id,
@@ -1259,7 +1382,7 @@ server.registerTool(
                     from_session_id: reply.from_session_id ?? null,
                   }
                 : null,
-              timed_out: reply === null,
+              timed_out: timedOut,
             },
             null,
             2,
