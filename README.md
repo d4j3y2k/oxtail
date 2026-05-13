@@ -21,7 +21,7 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 **Claude Code** — add to `~/.claude.json` (global) or any project's `.mcp.json`:
 
 ```jsonc
-{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.7.1"] } } }
+{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.8.0"] } } }
 ```
 
 **Codex CLI** — add to `~/.codex/config.toml`:
@@ -29,14 +29,14 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 ```toml
 [mcp_servers.oxtail]
 command = "npx"
-args = ["-y", "oxtail@0.7.1"]
+args = ["-y", "oxtail@0.8.0"]
 ```
 
 **Claude slash command** (`/oxtail-join`):
 
 ```sh
 mkdir -p ~/.claude/commands
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.7.1/.claude/commands/oxtail-join.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.8.0/.claude/commands/oxtail-join.md \
   -o ~/.claude/commands/oxtail-join.md
 ```
 
@@ -44,9 +44,9 @@ curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.7.1/.claude/commands
 
 ```sh
 mkdir -p ~/.codex/skills/oxtail-join/agents
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.7.1/integrations/codex/oxtail-join/SKILL.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.8.0/integrations/codex/oxtail-join/SKILL.md \
   -o ~/.codex/skills/oxtail-join/SKILL.md
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.7.1/integrations/codex/oxtail-join/agents/openai.yaml \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.8.0/integrations/codex/oxtail-join/agents/openai.yaml \
   -o ~/.codex/skills/oxtail-join/agents/openai.yaml
 ```
 
@@ -67,7 +67,7 @@ Contributing? `git clone https://github.com/d4j3y2k/oxtail && cd oxtail && npm i
 - `set_my_state` — write a small "state card" onto this session's registry entry so peers can see what we're doing without reading our transcript. v1 surfaces a single field, `purpose` (≤200 chars).
 - `send_message` — **fire-and-forget** message to a peer. **Does NOT wake an idle peer.** Target is a tmux session name or a raw `client_session_id` UUID. Body ≤ 8KB. Delivery is async via the peer's mailbox file. (v0.5+)
 - `read_my_messages` — drain this session's mailbox and return any queued messages. Codex peers (and unhooked Claude Code) poll this; Claude Code peers with the PreToolUse hook installed see messages mid-turn instead. (v0.5+)
-- `ask_peer` — **delegate-and-wait**. Enqueues a message and blocks server-side until the peer replies (or the fixed timeout elapses, default 45s, tunable via `OXTAIL_ASK_PEER_TIMEOUT_MS`). v0.7 routes the wake per `client_type`: Codex gets a paste-burst-aware `tmux send-keys` wake that actually submits; Claude Code targets fail-fast (no wake surface for idle Claude — see "Delegate-and-wait" below). Response includes `wake_status` so the caller can distinguish "we polled and got nothing" from "this peer can't be woken." Use `send_message` for fire-and-forget. (v0.7+; v0.6 caveats below)
+- `ask_peer` — **delegate-and-wait**. Enqueues a message and blocks server-side until the peer replies (or the fixed timeout elapses, default 45s, tunable via `OXTAIL_ASK_PEER_TIMEOUT_MS`). Routes the wake per `client_type`: Codex gets a paste-burst-aware `tmux send-keys` wake (500ms gap before Enter to defeat the paste-burst heuristic); Claude Code gets the same send-keys mechanism without the gap (its TUI has no paste-burst). Response includes `wake_status` so the caller can distinguish "we polled and got nothing" from "no tmux pane resolved." Use `send_message` for fire-and-forget. (v0.7+)
 - `register_my_session` — pin this MCP server's `session_id` directly. Kept for debugging; prefer `claim_session`.
 - `get_my_session` — return this MCP server's own registry entry plus a per-strategy detection diagnosis. Useful for debugging.
 
@@ -151,17 +151,17 @@ ask_peer({ target, body })
     }
 ```
 
-`wake_status` distinguishes the four outcomes a caller may need to handle differently. `fired` means the wake was attempted (or the reply arrived during the grace window, so no wake was needed). `skipped_unsupported` means the target's `client_type` cannot be woken externally — currently Claude Code, see "Per-client wake routing" below. `skipped_no_target` means no tmux pane/session resolved for the target. `disabled` means `OXTAIL_ASK_PEER_WAKE_STRATEGY=off` is in effect.
+`wake_status` distinguishes the four outcomes a caller may need to handle differently. `fired` means the wake was attempted (or the reply arrived during the grace window, so no wake was needed). `skipped_unsupported` is reserved — no client currently returns this in auto mode (both Codex and Claude Code wake via send-keys). `skipped_no_target` means no tmux pane/session resolved for the target. `disabled` means `OXTAIL_ASK_PEER_WAKE_STRATEGY=off` is in effect.
 
-`timed_out` is `true` only when the poll loop ran to its deadline without a reply. Fail-fast for `skipped_unsupported` returns `timed_out: false` because no polling was attempted — the message is still enqueued and will be delivered when the peer next enters a turn.
+`timed_out` is `true` only when the poll loop ran to its deadline without a reply.
 
 ### Per-client wake routing
 
-v0.7 routes the wake mechanism per `client_type`. Verified 2026-05-13 via spike investigation and falsifying experiment:
+`ask_peer` routes the wake mechanism per `client_type`. Verified 2026-05-13 via spike investigations and end-to-end falsifying experiments against the live `oxtail-codex` and `oxtail-claudejr` peers in this repo:
 
 - **Codex** — `tmux send-keys -l <text>` followed by `send-keys Enter` is the wake. The keystrokes are split by 500ms because Codex's TUI has a paste-burst heuristic in `codex-rs/tui/src/bottom_pane/paste_burst.rs` (`PASTE_BURST_MIN_CHARS=3`, `PASTE_ENTER_SUPPRESS_WINDOW=120ms`) that converts Enter→newline for ~120ms after a fast typed burst. Without the gap, the wake text accumulates in the composer and Enter is suppressed. With the gap, Codex submits and enters a turn. 500ms is a deliberately generous multiple of the documented window for upstream-drift safety.
 
-- **Claude Code** — fail-fast. Claude Code's hook surface (per [docs](https://code.claude.com/docs/en/hooks)) has no event that fires while the agent is idle: no polling hook, no external "start a turn" mechanism, `Notification` is outbound-only, `FileChanged` only fires inside an in-flight turn. An external process cannot rouse an idle Claude Code peer. ask_peer returns immediately with `wake_status: "skipped_unsupported"` rather than burning the timeout. The message is enqueued and delivered to the peer's PreToolUse hook on their next tool call (or via explicit `read_my_messages`).
+- **Claude Code** — `tmux send-keys -l <text>` + immediate `send-keys Enter`, no inter-keystroke gap. The Claude Code TUI has no paste-burst suppression, so back-to-back text+Enter submits cleanly. Once the peer is in a turn, the oxtail PreToolUse hook drains queued messages as `additionalContext` on the peer's first tool call (or the peer reads them explicitly via `read_my_messages`). v0.7 originally shipped a fail-fast here, reasoning from the [hook catalog](https://code.claude.com/docs/en/hooks) that "no idle hook" meant "unwakeable" — but send-keys is a TUI-input mechanism, not a hook event, and it submits the same way a human keypress would. The fail-fast was a self-inflicted gap against oxtail's symmetric-matrix vision (Claude↔Claude, Claude↔Codex, both directions); restored to symmetric wake in the v0.7 follow-up after an end-to-end falsifying experiment confirmed the full round-trip works.
 
 - **Unknown** — legacy v0.6 wake (text + Enter, no gap). No implied promise; if a new TUI lands, treat it as unknown until verified.
 
@@ -195,7 +195,7 @@ Pane targeting can go stale: `tmux_pane` is cached at server startup, but tmux c
 If `ask_peer` returns an abort error before its built-in 45s timeout fires, your MCP client's tool-call ceiling is lower than 45s. Override the bound at server startup:
 
 ```sh
-OXTAIL_ASK_PEER_TIMEOUT_MS=30000 npx -y oxtail@0.7.1
+OXTAIL_ASK_PEER_TIMEOUT_MS=30000 npx -y oxtail@0.8.0
 ```
 
 The server reads the env var once at boot and uses it as the fixed timeout for all `ask_peer` calls in that session. Values must be positive numbers; anything else falls back to the 45000ms default.
@@ -242,4 +242,4 @@ If `MCP_TRACE_FILE` is set in the environment, every detection run appends an ND
 
 ## Status
 
-v0.7.0. Replaces v0.6's wake mechanism with per-client routing after a spike investigation found the root cause was Codex's paste-burst heuristic suppressing Enter, not `\r`-as-newline. Codex idle peers now wake reliably via a 500ms-gap send-keys sequence (verified live 2026-05-13). Claude Code idle peers fail-fast with `wake_status: "skipped_unsupported"` — Claude Code's hook surface has no idle event so they're architecturally unwakeable from outside; the message is still enqueued and delivered next turn. ask_peer's response gains a `wake_status` field for caller diagnostics. Wake strategy is overridable via `OXTAIL_ASK_PEER_WAKE_STRATEGY=auto|legacy|off` as a rollback. See [issue #3](https://github.com/d4j3y2k/oxtail/issues/3) for the spike findings.
+v0.8.0. Builds on v0.7's per-client wake routing — Codex peers wake via a 500ms-gap send-keys sequence that defeats their TUI's paste-burst heuristic (verified live 2026-05-13). Claude Code peers, originally fail-fasted under a misread of the Claude Code hook catalog, now wake via the same send-keys mechanism without the gap (no paste-burst in Claude Code's TUI). An end-to-end falsifying experiment 2026-05-13 against the live `oxtail-claudejr` peer in this repo confirmed the full round-trip works: ask_peer enqueue → send-keys → peer entered a turn → PreToolUse hook drained mailbox → peer replied via send_message. The symmetric-matrix vision (Claude↔Claude, Claude↔Codex, both directions, no human relay) is intact. ask_peer's response gains a `wake_status` field for caller diagnostics; `skipped_unsupported` is now reserved for forward compat with hypothetical future unwakeable client_types rather than firing on any current client. Wake strategy is overridable via `OXTAIL_ASK_PEER_WAKE_STRATEGY=auto|legacy|off` as a rollback. See [issue #3](https://github.com/d4j3y2k/oxtail/issues/3) for the v0.7 spike findings.

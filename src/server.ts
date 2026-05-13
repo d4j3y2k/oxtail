@@ -1000,7 +1000,7 @@ const ASK_PEER_CODEX_SUBMIT_DELAY_MS = 500;
 
 export type WakeStatus =
   | "fired"             // wake keystrokes were sent (peer should enter a turn)
-  | "skipped_unsupported" // client_type cannot be woken externally (Claude Code idle)
+  | "skipped_unsupported" // client_type cannot be woken externally (reserved — no client currently returns this in auto mode)
   | "skipped_no_target" // no tmux pane/session resolved, or send-keys failed everywhere
   | "disabled";         // OXTAIL_ASK_PEER_WAKE_STRATEGY=off — caller turned wake off
 
@@ -1038,8 +1038,8 @@ function askPeerDelay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-// Wake routing (v0.7). The wake's job is to nudge an idle peer into a turn so
-// it drains its mailbox. Mechanics differ per client:
+// Wake routing. The wake's job is to nudge an idle peer into a turn so it
+// drains its mailbox. Mechanics differ per client:
 //
 //   Codex — `tmux send-keys -l <text>` followed by `send-keys Enter` would
 //   work, EXCEPT Codex's paste-burst heuristic suppresses Enter for 120ms
@@ -1047,11 +1047,17 @@ function askPeerDelay(ms: number, signal: AbortSignal): Promise<void> {
 //   We insert ASK_PEER_CODEX_SUBMIT_DELAY_MS between the text and the Enter
 //   so the suppression window expires. Verified live 2026-05-13.
 //
-//   Claude Code — has no hook event that fires while idle (verified via
-//   Claude Code's documented hook catalog at code.claude.com/docs/en/hooks;
-//   Notification is outbound-only; FileChanged cannot start a turn).
-//   No external surface can rouse an idle Claude Code peer. wakePeer()
-//   short-circuits with skipped_unsupported for this client_type.
+//   Claude Code — `tmux send-keys -l <text>` + immediate `send-keys Enter`,
+//   no inter-keystroke gap. The Claude Code TUI has no paste-burst heuristic
+//   that suppresses Enter, so the legacy v0.6 sequence works as-is. v0.7
+//   originally shipped a fail-fast here, reasoning from the hook catalog
+//   ("no idle hook" → "unwakeable") — but send-keys is a TUI-input
+//   mechanism, not a hook, and it submits to the prompt the same way a
+//   human keypress would. Restored to symmetric wake 2026-05-13 after an
+//   end-to-end falsifying experiment against the live `oxtail-claudejr`
+//   peer in this repo (ask_peer enqueue → manual send-keys → claudejr
+//   entered a turn, drained mailbox via PreToolUse hook, replied via
+//   send_message; round-trip confirmed).
 //
 //   Unknown — legacy v0.6 behavior (text + Enter, no gap). No implied
 //   promise; if a new TUI lands and breaks, we treat it as unknown until
@@ -1125,10 +1131,6 @@ async function wakePeer(peer: RegistryEntry): Promise<WakeStatus> {
     return "disabled";
   }
   const clientType: ClientType = peer.client.type;
-  if (ASK_PEER_WAKE_STRATEGY === "auto" && clientType === "claude-code") {
-    trace("ask_peer_wake_skipped", { reason: "client-unsupported", client_type: clientType });
-    return "skipped_unsupported";
-  }
   if (!peer.tmux_pane && !peer.tmux_session) {
     return "skipped_no_target";
   }
@@ -1204,10 +1206,10 @@ server.registerTool(
     description: [
       "Enqueue a message to a peer and block until they reply (or timeout).",
       "Use this when you want a back-and-forth with another agent in the same project root, rather than fire-and-forget like send_message.",
-      "Wake behavior (v0.7) varies per client_type. Codex peers are woken via paste-burst-aware tmux send-keys (literal text + 500ms gap + Enter) so the composer submits. Claude Code peers cannot be woken externally — Claude Code's hook surface has no idle event (verified against the documented hook catalog), so ask_peer fails fast for Claude Code targets and returns wake_status: \"skipped_unsupported\" rather than burning the timeout. Unknown clients use legacy send-keys wake.",
-      "Response includes a wake_status field: \"fired\" (wake attempted or reply received during grace window), \"skipped_unsupported\" (target client cannot be woken — fail-fast, no poll), \"skipped_no_target\" (no tmux pane or session resolved for target), \"disabled\" (OXTAIL_ASK_PEER_WAKE_STRATEGY=off).",
-      "Behavior: enqueues the body to the target's mailbox, waits ~500ms for a hook-delivered reply (rare: peer was mid-turn, hook delivered as additionalContext), fires the per-client wake, then polls this session's mailbox at 200ms for a reply from the target. Fail-fast for skipped_unsupported skips polling entirely; the message is still enqueued and will be delivered the next time the peer enters a turn.",
-      "Returns when the target sends a message back (via send_message) whose from_session_id matches them, or when the timeout elapses (returns reply: null, timed_out: true). timed_out is false on fail-fast (we didn't actually poll). Timeout defaults to 45000ms; user-tunable via OXTAIL_ASK_PEER_TIMEOUT_MS env var.",
+      "Wake behavior varies per client_type. Codex peers are woken via paste-burst-aware tmux send-keys (literal text + 500ms gap + Enter) — the gap defeats Codex's paste-burst heuristic which would otherwise suppress Enter. Claude Code peers are woken via the same send-keys mechanism without the gap (Claude Code's TUI has no paste-burst, so back-to-back text+Enter submits immediately). Unknown clients use legacy send-keys wake.",
+      "Response includes a wake_status field: \"fired\" (wake attempted or reply received during grace window), \"skipped_unsupported\" (reserved — no client currently returns this in auto mode), \"skipped_no_target\" (no tmux pane or session resolved for target), \"disabled\" (OXTAIL_ASK_PEER_WAKE_STRATEGY=off).",
+      "Behavior: enqueues the body to the target's mailbox, waits ~500ms for a hook-delivered reply (rare: peer was mid-turn, hook delivered as additionalContext), fires the per-client wake, then polls this session's mailbox at 200ms for a reply from the target.",
+      "Returns when the target sends a message back (via send_message) whose from_session_id matches them, or when the timeout elapses (returns reply: null, timed_out: true). Timeout defaults to 45000ms; user-tunable via OXTAIL_ASK_PEER_TIMEOUT_MS env var.",
       "Wake strategy can be overridden via OXTAIL_ASK_PEER_WAKE_STRATEGY=auto|legacy|off (default auto). legacy = v0.6 behavior for every client (no gap, no per-client routing). off = no wake fired; ask_peer becomes a pure blocking poll until the peer naturally enters a turn or timeout.",
       "Target must have a registered client.session_id (Codex peers must call register_my_session first).",
       "Late replies that arrive after timeout are delivered normally via read_my_messages / the PreToolUse hook.",
@@ -1306,12 +1308,11 @@ server.registerTool(
         // Common path: peer was idle. Route the wake per client_type.
         wakeStatus = await wakePeer(peer);
         if (wakeStatus === "skipped_unsupported") {
-          // Claude Code idle has no external wake surface — polling would just
-          // burn the caller's wall-clock budget for no reason. Return fast so
-          // the caller can fall back to send_message + read_my_messages, or
-          // wait until the peer is observed mid-turn via list_project_sessions.
-          // The outbound has been enqueued; it'll be delivered next time the
-          // peer enters a turn (via PreToolUse hook or explicit read_my_messages).
+          // Reserved branch. No client currently returns skipped_unsupported
+          // in auto mode (Codex and Claude Code both wake via send-keys).
+          // Kept in the type for forward compat: if a future client_type
+          // lands that genuinely cannot be woken externally, wakePeer() can
+          // return this and the caller fail-fasts instead of polling.
         } else {
           reply = await askPeerPoll(
             entry.server_pid,

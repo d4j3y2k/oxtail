@@ -800,8 +800,6 @@ test("ask_peer: peer replies via mailbox before timeout — returns the reply", 
       session_id: peerSessionId,
       tmux_session: "ask-peer-replier",
       cwd: server.home,
-      // v0.7: claude-code targets fail-fast (no poll); use codex so this test
-      // still exercises the wake + poll path.
       type: "codex",
     });
 
@@ -1041,14 +1039,20 @@ test("ask_peer: pre-existing stale message from target is evicted, fresh reply w
   }
 });
 
-// v0.7: Claude Code idle peers cannot be woken externally — the Claude Code
-// hook surface has no idle event (verified via Claude Code's documented hook
-// catalog). ask_peer must fail-fast for claude-code targets instead of
-// burning the timeout polling for a reply that can't arrive without the
-// peer's user typing something. The outbound is still enqueued (delivered
-// next time the peer enters a turn).
-test("ask_peer: claude-code target fails fast with wake_status: skipped_unsupported", async () => {
-  const server = await spawnServer({ extraEnv: { OXTAIL_ASK_PEER_TIMEOUT_MS: "10000" } });
+// Claude Code peers wake via the same send-keys mechanism as Codex (no
+// paste-burst gap needed). Verified end-to-end 2026-05-13 against the live
+// `oxtail-claudejr` peer in this repo: ask_peer enqueue → tmux send-keys →
+// peer entered a turn → PreToolUse hook drained the mailbox → peer replied
+// via send_message → round-trip confirmed.
+//
+// In this test the seeded peer has no real tmux pane (the session name is
+// fabricated), so send-keys fails and wakePeer returns skipped_no_target.
+// The point is that ask_peer for a claude-code target now enters the poll
+// loop just like any other client — it does NOT fail-fast with
+// skipped_unsupported (the v0.7 regression that contradicted oxtail's
+// symmetric-matrix vision).
+test("ask_peer: claude-code target enters the poll loop like any other client", async () => {
+  const server = await spawnServer({ extraEnv: { OXTAIL_ASK_PEER_TIMEOUT_MS: "1500" } });
   try {
     const peerSid = "12345678-aaaa-bbbb-cccc-111111111111";
     seedPeerEntry(server.home, {
@@ -1062,19 +1066,21 @@ test("ask_peer: claude-code target fails fast with wake_status: skipped_unsuppor
     const t0 = Date.now();
     const result = await callTool<AskPeerOk | AskPeerErr>(server.client, "ask_peer", {
       target: "ask-peer-claude",
-      body: "you can't be woken but the message is still enqueued",
+      body: "claude-code peers are now wakeable via send-keys",
     });
     const elapsed = Date.now() - t0;
 
     assert.equal(result.ok, true);
     const ok = result as AskPeerOk;
-    assert.equal(ok.wake_status, "skipped_unsupported");
+    // Fake tmux session can't actually receive send-keys, so wake reports
+    // skipped_no_target. The critical assertion is that this is NOT
+    // skipped_unsupported — claude-code is no longer special-cased.
+    assert.equal(ok.wake_status, "skipped_no_target");
+    assert.notEqual(ok.wake_status, "skipped_unsupported");
     assert.equal(ok.reply, null);
-    // timed_out must be FALSE — we didn't actually poll, we returned fast.
-    // Distinguishing this from a real timeout is the whole point of the field.
-    assert.equal(ok.timed_out, false, "fail-fast is not a timeout");
-    // Fail-fast still pays the 500ms grace window, but nothing more.
-    assert.ok(elapsed < 2000, `should not have polled, took ${elapsed}ms`);
+    // We DID poll (no fail-fast) — timed_out: true is the correct signal.
+    assert.equal(ok.timed_out, true, "claude-code now polls like any other client");
+    assert.ok(elapsed >= 1400, `should have waited the full timeout, took ${elapsed}ms`);
   } finally {
     await server.cleanup();
   }
