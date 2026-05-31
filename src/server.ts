@@ -28,6 +28,7 @@ import {
   type StateCard,
 } from "./registry.js";
 import * as mailbox from "./mailbox.js";
+import { recoverClaim, resolveAncestors, writeClaim } from "./claims.js";
 
 // CLI subcommand dispatch must run before any MCP setup so that
 // `npx oxtail install-hook` doesn't open an MCP transport or register a
@@ -502,6 +503,7 @@ const entry = buildEntry(client);
   emitDetectTrace("startup", diagnosis);
   entry.client = enriched;
 }
+maybeRecoverStickyClaim();
 register(entry);
 
 const cleanup = (): void => {
@@ -573,10 +575,24 @@ server.server.oninitialized = (): void => {
     entry.started_at,
   );
   emitDetectTrace("oninitialized", diagnosis);
-  if (refined.type !== entry.client.type || refined.session_id !== entry.client.session_id) {
-    entry.client = refined;
+  // Refine from the handshake, but never let a re-detect that resolved nothing
+  // wipe an already-resolved session_id (e.g. one recovered via sticky-claim at
+  // startup). Keep our id/source/transcript unless the handshake resolved an id.
+  const merged = refined.session_id
+    ? refined
+    : {
+        ...refined,
+        session_id: entry.client.session_id,
+        session_id_source: entry.client.session_id_source,
+        transcript_path: entry.client.transcript_path,
+      };
+  if (merged.type !== entry.client.type || merged.session_id !== entry.client.session_id) {
+    entry.client = merged;
     register(entry);
   }
+  // The handshake may have just revealed the client type (e.g. unknown→codex);
+  // sticky recovery can apply now even if it couldn't at startup.
+  maybeRecoverStickyClaim();
   // After type is known via handshake, schedule retries to catch transcript files
   // that don't exist yet at handshake time. No-op if session_id is already set.
   if (!entry.client.session_id && entry.client.type !== "unknown") {
@@ -663,6 +679,63 @@ function pinSessionId(sessionId: string): void {
   };
   refreshTmuxBinding(entry);
   register(entry);
+  persistStickyClaim();
+}
+
+// Persist (or refresh) a sticky-claim record for the current entry, keyed by
+// client_type + cwd + the MCP server's parent-host identity. Lets a restarted
+// MCP child recover this session_id without the agent re-running claim_session.
+// Best-effort: never let claim-store I/O block or fail a claim.
+function persistStickyClaim(): void {
+  const sid = entry.client.session_id;
+  if (!sid || entry.client.type === "unknown") return;
+  try {
+    writeClaim({
+      client_type: entry.client.type,
+      cwd: entry.client.cwd,
+      ancestors: resolveAncestors(),
+      session_id: sid,
+      transcript_path: entry.client.transcript_path,
+      server_pid: entry.server_pid,
+      claimed_at: Math.floor(Date.now() / 1000),
+    });
+  } catch {
+    // best-effort
+  }
+}
+
+// Startup recovery: when env- and birth-time detection both abstain (the
+// common case for a restarted Codex MCP child — its session-id env var is
+// stripped and its transcript predates this child's started_at), try to adopt
+// the previously-claimed session_id for this exact (client_type, cwd, live
+// parent). Conservative: recoverClaim only returns a record when it's
+// unambiguously safe (transcript still exists, no live process already owns the
+// id); otherwise we leave session_id null and the caller's next_step points at
+// explicit claim_session.
+function maybeRecoverStickyClaim(): void {
+  if (entry.client.session_id || entry.client.type === "unknown") return;
+  let rec: ReturnType<typeof recoverClaim> = null;
+  try {
+    rec = recoverClaim(entry.client.type, entry.client.cwd, resolveAncestors(), {
+      conflictingLiveOwner: (sid) =>
+        readAll().some((e) => e.client.session_id === sid && e.server_pid !== entry.server_pid),
+    });
+  } catch {
+    return;
+  }
+  if (!rec) return;
+  entry.client = {
+    ...entry.client,
+    session_id: rec.session_id,
+    session_id_source: "sticky-claim",
+    transcript_path: rec.transcript_path,
+  };
+  trace("sticky_claim_recovered", {
+    session_id: rec.session_id,
+    cwd: entry.client.cwd,
+  });
+  // Refresh the record so it carries our new server_pid going forward.
+  persistStickyClaim();
 }
 
 server.registerTool(

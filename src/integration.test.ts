@@ -6,7 +6,7 @@ import { test } from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { register, type RegistryEntry } from "./registry.js";
+import { readAll, register, type RegistryEntry } from "./registry.js";
 import { drain, enqueue } from "./mailbox.js";
 
 const SERVER_ENTRY = resolve(import.meta.dirname, "server.ts");
@@ -1189,5 +1189,73 @@ test("ask_peer: strategy=off surfaces wake_status: disabled and still polls", as
     assert.ok(elapsed >= 1400, `should have waited the full timeout, took ${elapsed}ms`);
   } finally {
     await server.cleanup();
+  }
+});
+
+test("integration: a restarted Codex MCP child recovers its session via sticky claim", async () => {
+  // s1 and s2 are both spawned by THIS test process, so they share a parent
+  // identity (ppid + signature) — the durable handle a sticky claim keys on.
+  // A shared HOME lets the claim record + transcript persist across the
+  // "restart". This is the real Codex case: the MCP child cycles under the same
+  // host while its session-id env var stays stripped.
+  const sharedHome = mkdtempSync(join(tmpdir(), "oxtail-sticky-int-"));
+  const codexEnv = { HOME: sharedHome, CODEX_HOME: join(sharedHome, ".codex") };
+  const sessionId = "019e7d25-bdb4-7f90-a422-795f18cbd07e";
+
+  // Place a Codex rollout so the claim resolves a non-null transcript_path
+  // (findCodexTranscriptPath scans ~/.codex/sessions/<recent>). Write into both
+  // UTC and local "today" dirs to stay clear of a date-boundary flake.
+  const d = new Date();
+  const dayDirs = [
+    [d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate()],
+    [d.getFullYear(), d.getMonth() + 1, d.getDate()],
+  ];
+  for (const [y, m, day] of dayDirs) {
+    const dir = join(
+      sharedHome, ".codex", "sessions",
+      String(y), String(m).padStart(2, "0"), String(day).padStart(2, "0"),
+    );
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `rollout-${sessionId}.jsonl`), JSON.stringify({ payload: { cwd: sharedHome } }) + "\n");
+  }
+
+  let s1: Awaited<ReturnType<typeof spawnServer>> | undefined;
+  let s2: Awaited<ReturnType<typeof spawnServer>> | undefined;
+  try {
+    // First run: claim. The server persists a sticky claim keyed by its parent
+    // (this test process) + cwd + client_type.
+    s1 = await spawnServer({ cwd: sharedHome, clientName: "codex", extraEnv: codexEnv });
+    const claim = await callTool<{ ok: boolean; session_id: string; transcript_path: string | null }>(
+      s1.client, "claim_session", { session_id: sessionId },
+    );
+    assert.equal(claim.session_id, sessionId);
+    assert.ok(claim.transcript_path, "claim must resolve a transcript so recovery's guard can pass");
+    await s1.cleanup();
+    s1 = undefined;
+
+    // Wait until s1's registry entry is gone (its pid dead) so it can't count as
+    // a conflicting live owner of the session_id during s2's recovery.
+    const prevHome = process.env.HOME;
+    process.env.HOME = sharedHome;
+    try {
+      for (let i = 0; i < 100; i++) {
+        if (!readAll().some((e) => e.client.session_id === sessionId)) break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    } finally {
+      process.env.HOME = prevHome;
+    }
+
+    // Restart: a fresh Codex child, same parent + cwd + home. env detection has
+    // no session id and birth-time abstains (the transcript predates this
+    // child's started_at), so startup recovery must adopt the sticky claim.
+    s2 = await spawnServer({ cwd: sharedHome, clientName: "codex", extraEnv: codexEnv });
+    const me = await callTool<GetMySessionResponse>(s2.client, "get_my_session");
+    assert.equal(me.entry.client.session_id, sessionId, "restarted child should recover the claimed session id");
+    assert.equal(me.entry.client.session_id_source, "sticky-claim");
+  } finally {
+    if (s1) await s1.cleanup();
+    if (s2) await s2.cleanup();
+    rmSync(sharedHome, { recursive: true, force: true });
   }
 });

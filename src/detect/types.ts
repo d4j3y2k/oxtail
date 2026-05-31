@@ -1,6 +1,6 @@
 import type { ClientType } from "../clients.js";
 
-export type DetectSource = "env" | "birth-time" | "self-register";
+export type DetectSource = "env" | "birth-time" | "self-register" | "sticky-claim";
 export type Confidence = "high" | "medium";
 
 export type SessionIdResult = {
