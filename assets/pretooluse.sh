@@ -80,11 +80,11 @@ done
 #    after the awk completes; if awk's output never reaches Claude Code we'd
 #    rather have the messages still in the box than lost.
 output=$(awk '
-  BEGIN { count = 0 }
-  {
-    p = index($0, "\"body\":\"")
-    if (p == 0) next
-    rest = substr($0, p + 8)
+  function json_string_field(line, key,   needle, p, rest, out, i, n, c) {
+    needle = "\"" key "\":\""
+    p = index(line, needle)
+    if (p == 0) return ""
+    rest = substr(line, p + length(needle))
     out = ""
     i = 1; n = length(rest)
     while (i <= n) {
@@ -98,15 +98,32 @@ output=$(awk '
         i += 1
       }
     }
-    bodies[count++] = out
+    return out
+  }
+  BEGIN { count = 0 }
+  {
+    body = json_string_field($0, "body")
+    if (body == "") next
+    bodies[count] = body
+    ids[count] = json_string_field($0, "id")
+    froms[count] = json_string_field($0, "from_session_id")
+    count++
   }
   END {
     if (count == 0) exit 0
-    ctx = ""
+    ctx = "<system-reminder>\\n[oxtail] You have " count " new peer message(s)."
+    ctx = ctx "\\nIf a message asks for a response and from_session_id is present, reply with mcp__oxtail__send_message using that UUID as target."
     for (j = 0; j < count; j++) {
-      if (j > 0) ctx = ctx "\\n\\n"
-      ctx = ctx bodies[j]
+      ctx = ctx "\\n\\n--- message " (j + 1) " ---"
+      if (ids[j] != "") ctx = ctx "\\nmessage_id: " ids[j]
+      if (froms[j] != "") {
+        ctx = ctx "\\nfrom_session_id: " froms[j]
+      } else {
+        ctx = ctx "\\nfrom_session_id: unknown"
+      }
+      ctx = ctx "\\nbody:\\n" bodies[j]
     }
+    ctx = ctx "\\n</system-reminder>"
     printf("{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"%s\"}}\n", ctx)
   }
 ' < "$mbox")

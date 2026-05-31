@@ -313,6 +313,74 @@ test("integration: read_session accepts in-scope peer entry", async () => {
   }
 });
 
+test("integration: read_session reads a transcript-capable peer with no tmux session (Codex)", async () => {
+  const server = await spawnServer();
+  try {
+    const me = await callTool<GetMySessionResponse>(server.client, "get_my_session");
+    const projectRoot = me.entry.client.cwd;
+
+    // A Codex-style peer: in scope, has a transcript_path, but NO tmux binding
+    // (it runs outside tmux, so tmux_session is null). Before the fix this was
+    // wrongly rejected as "not in project scope" because canonicalName was null
+    // even though the transcript is perfectly readable without a tmux pane.
+    const transcriptPath = join(server.home, "codex-rollout.jsonl");
+    const rollout = [
+      {
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "hello from codex peer" }],
+        },
+      },
+    ];
+    writeFileSync(transcriptPath, rollout.map((l) => JSON.stringify(l)).join("\n") + "\n");
+
+    const codexUuid = "019e7d25-bdb4-7f90-a422-795f18cbd07e";
+    const peer = {
+      server_pid: process.pid,
+      started_at: Math.floor(Date.now() / 1000),
+      client: {
+        type: "codex",
+        session_id: codexUuid,
+        transcript_path: transcriptPath,
+        session_id_source: "self-register",
+        cwd: projectRoot,
+      },
+      tmux_pane: null,
+      tmux_session: null,
+    };
+    const sessionsDir = join(server.home, ".oxtail", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(
+      join(sessionsDir, `${process.pid}.json`),
+      JSON.stringify(peer, null, 2),
+    );
+
+    const result = await callTool<
+      ReadSessionResponse & { messages: Array<{ role: string; text: string }> | null }
+    >(server.client, "read_session", {
+      name: codexUuid,
+      project_root: projectRoot,
+    });
+
+    assert.equal(
+      result.mode,
+      "transcript",
+      `expected transcript read, got mode=${result.mode} error=${result.error}`,
+    );
+    assert.equal(result.client_type, "codex");
+    assert.equal(result.error, null);
+    assert.doesNotMatch(result.error ?? "", /not in project scope/);
+    assert.ok(
+      result.messages && result.messages.some((m) => m.text.includes("hello from codex peer")),
+      "transcript messages should include the peer's user turn",
+    );
+  } finally {
+    await server.cleanup();
+  }
+});
+
 test("integration: read_session ambiguous tmux name returns candidates", async () => {
   const server = await spawnServer();
   try {

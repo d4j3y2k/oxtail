@@ -361,7 +361,7 @@ function readSession(input: {
       error: `ambiguous-target: multiple agents share tmux session '${input.name}'; pass a client_session_id (UUID) instead. candidates: ${scope.ambiguousCandidates.join(", ")}`,
     };
   }
-  if (!scope.inScope || !scope.canonicalName) {
+  if (!scope.inScope) {
     return {
       schema_version: 1,
       session: input.name,
@@ -382,13 +382,36 @@ function readSession(input: {
   const clientType = reg?.client.type ?? null;
   const transcriptPath = reg?.client.transcript_path ?? null;
 
+  // A tmux session name (canonical) is only needed to capture pane text.
+  // Transcript reads work from the registry entry's transcript_path alone, so a
+  // transcript-capable peer with no tmux binding (e.g. Codex running outside
+  // tmux) is still readable. Bail only when there's neither a transcript to
+  // read nor a tmux session to capture — previously a null canonicalName alone
+  // (an in-scope, transcript-capable, tmux-less peer) was wrongly rejected as
+  // "not in project scope".
+  if (!canonical && !transcriptPath) {
+    return {
+      schema_version: 1,
+      session: input.name,
+      mode: "none",
+      client_type: clientType,
+      messages: null,
+      pane_text: null,
+      truncated: false,
+      total_messages: null,
+      project_root: resolvedRoot,
+      inferred: !explicit,
+      error: `session '${input.name}' is in scope but has no transcript and no tmux session to read`,
+    };
+  }
+
   const wantTranscript = mode === "transcript" || (mode === "auto" && transcriptPath);
   if (wantTranscript) {
     if (!transcriptPath) {
       if (mode === "transcript") {
         return {
           schema_version: 1,
-          session: canonical,
+          session: canonical ?? input.name,
           mode: "none",
           client_type: clientType,
           messages: null,
@@ -406,7 +429,7 @@ function readSession(input: {
       const result = reader(transcriptPath, limit);
       return {
         schema_version: 1,
-        session: canonical,
+        session: canonical ?? input.name,
         mode: "transcript",
         client_type: clientType,
         messages: result.messages,
@@ -418,6 +441,24 @@ function readSession(input: {
         error: null,
       };
     }
+  }
+
+  // Pane fallback needs a tmux session to capture from. Reachable only when a
+  // caller forces mode:"pane" on a transcript-only peer (no tmux binding).
+  if (!canonical) {
+    return {
+      schema_version: 1,
+      session: input.name,
+      mode: "none",
+      client_type: clientType,
+      messages: null,
+      pane_text: null,
+      truncated: false,
+      total_messages: null,
+      project_root: resolvedRoot,
+      inferred: !explicit,
+      error: `session '${input.name}' has no tmux pane to capture (transcript-only peer)`,
+    };
   }
 
   try {
@@ -882,7 +923,7 @@ server.registerTool(
       "Delivery is asynchronous: the message lands in the target's mailbox and is delivered mid-turn via the oxtail PreToolUse hook (Claude Code) or next-turn via read_my_messages (Codex, or any client without the hook installed). If the peer is idle (no in-flight turn, no polling), the message waits until they next call a tool or poll explicitly — there is no nudge.",
       "Sender-side wrapping: if you want the message to appear as a system-reminder, include the <system-reminder>...</system-reminder> tags in `body`. The mailbox is a dumb transport.",
       "Cross-project targets are rejected, never silently dropped.",
-      "For a blocking send-and-wait variant that pauses your turn until the peer replies, use ask_peer instead. ask_peer routes the wake per client_type (v0.7+): Codex peers are woken via paste-burst-aware send-keys; Claude Code peers fail-fast since their hook surface has no idle event. See ask_peer's tool description for the full contract.",
+      "For a blocking send-and-wait variant that pauses your turn until the peer replies, use ask_peer instead. ask_peer routes the wake per client_type (v0.7+): Codex peers are woken via paste-burst-aware send-keys; Claude Code peers are woken via send-keys without the Codex gap. See ask_peer's tool description for the full contract.",
     ].join(" "),
     inputSchema: {
       target: z
@@ -1006,9 +1047,8 @@ export type WakeStatus =
 
 // OXTAIL_ASK_PEER_WAKE_STRATEGY = "auto" | "legacy" | "off"
 //   auto    — per-client routing: Codex gets paste-burst-aware wake (500ms gap
-//             between text and Enter); Claude Code is skipped (no idle hook
-//             surface — verified via Claude Code hook docs); unknown clients
-//             get legacy v0.6 behavior.
+//             between text and Enter); Claude Code gets legacy send-keys with
+//             no gap; unknown clients get legacy v0.6 behavior.
 //   legacy  — v0.6 behavior for every client (text + Enter, no gap, no
 //             per-client routing). Escape hatch if auto mode misfires.
 //   off     — wake disabled entirely; ask_peer becomes a blocking poll.

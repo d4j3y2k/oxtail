@@ -66,7 +66,7 @@ Contributing? `git clone https://github.com/d4j3y2k/oxtail && cd oxtail && npm i
 - `claim_session` — single-shot session registration. The routine path: `Bash echo $CLAUDE_CODE_SESSION_ID` (or `$CODEX_THREAD_ID` for Codex) → `claim_session({ session_id })`. Returns `{ ok, session_id, transcript_path }`.
 - `set_my_state` — write a small "state card" onto this session's registry entry so peers can see what we're doing without reading our transcript. v1 surfaces a single field, `purpose` (≤200 chars).
 - `send_message` — **fire-and-forget** message to a peer. **Does NOT wake an idle peer.** Target is a tmux session name or a raw `client_session_id` UUID. Body ≤ 8KB. Delivery is async via the peer's mailbox file. (v0.5+)
-- `read_my_messages` — drain this session's mailbox and return any queued messages. Codex peers (and unhooked Claude Code) poll this; Claude Code peers with the PreToolUse hook installed see messages mid-turn instead. (v0.5+)
+- `read_my_messages` — drain this session's mailbox and return any queued messages. Codex peers (and unhooked Claude Code) poll this; Claude Code peers with the hooks installed see messages mid-turn (PreToolUse) or at turn end (Stop) instead. (v0.5+)
 - `ask_peer` — **delegate-and-wait**. Enqueues a message and blocks server-side until the peer replies (or the fixed timeout elapses, default 45s, tunable via `OXTAIL_ASK_PEER_TIMEOUT_MS`). Routes the wake per `client_type`: Codex gets a paste-burst-aware `tmux send-keys` wake (500ms gap before Enter to defeat the paste-burst heuristic); Claude Code gets the same send-keys mechanism without the gap (its TUI has no paste-burst). Response includes `wake_status` so the caller can distinguish "we polled and got nothing" from "no tmux pane resolved." Use `send_message` for fire-and-forget. (v0.7+)
 - `register_my_session` — pin this MCP server's `session_id` directly. Kept for debugging; prefer `claim_session`.
 - `get_my_session` — return this MCP server's own registry entry plus a per-strategy detection diagnosis. Useful for debugging.
@@ -114,23 +114,28 @@ Cross-project sends are rejected, never silently dropped. Sending to a peer with
 
 ### Mid-turn vs next-turn delivery (the asymmetry)
 
-Claude Code peers can receive messages **mid-turn** via an opt-in PreToolUse hook:
+Claude Code peers can receive messages **autonomously** via two opt-in hooks:
 
 ```sh
 npx oxtail install-hook
 ```
 
-This drops a small bash script at `~/.oxtail/hooks/pretooluse.sh` and adds a `hooks.PreToolUse` entry in `~/.claude/settings.json`. The hook reads each `PreToolUse` event's `session_id` from stdin, locates the matching mailbox, and emits `additionalContext` into the next tool-call boundary. Reverse with `npx oxtail uninstall-hook`.
+This installs two small bash scripts under `~/.oxtail/hooks/` and adds matching entries to `~/.claude/settings.json` (tracked by a `_oxtailHook` marker). Reverse with `npx oxtail uninstall-hook`:
 
-Codex CLI peers and any Claude Code session without the hook installed receive messages **next-turn** by calling `read_my_messages` explicitly. Both clients send messages identically. The asymmetry exists because Claude Code exposes a PreToolUse hook surface that injects `additionalContext`; Codex CLI does not currently expose an equivalent.
+- **`hooks.PreToolUse`** → `pretooluse.sh` — delivers **mid-turn**. It reads each `PreToolUse` event's `session_id` from stdin, locates the matching mailbox, and emits the queued messages as `additionalContext` on the next tool-call boundary.
+- **`hooks.Stop`** → `stop.sh` — delivers **at turn end** (deliver-on-complete). When the agent finishes a turn with messages still waiting, it emits a `decision: "block"` envelope so the agent continues and reads + responds before going idle, instead of leaving the messages until the next turn.
 
-**Caveat for Claude Code receivers:** PreToolUse fires only before a tool call. A turn that produces only text — no tool calls — never triggers the hook; messages enqueued during that turn surface on the next tool call (or via an explicit `read_my_messages`). For pair-debugging UX, senders should not assume mid-turn delivery is universal.
+Both hooks include the message body plus `message_id` and `from_session_id` metadata when the sender is registered, so a receiver can reply with `send_message({ target: "<from_session_id>", body: "..." })` even when the sender is not visible in `list_project_sessions`.
+
+Codex CLI peers and any Claude Code session without the hooks installed receive messages **next-turn** by calling `read_my_messages` explicitly. Both clients send messages identically. The asymmetry exists because Claude Code exposes PreToolUse/Stop hook surfaces that inject context; Codex CLI does not currently expose an equivalent.
+
+**Coverage and its edges.** PreToolUse fires only before a tool call, so a turn that produces only text — no tool calls — never triggers it; the Stop hook closes that gap by delivering at turn end. One deliberate edge remains: the Stop hook honors the `stop_hook_active` flag and exits without blocking on a re-entry, so `decision: "block"` can never loop — which means a message that arrives *during* a Stop-blocked continuation waits for the next turn rather than extending the current one. A truly idle peer (no turn in flight) is still only reachable via an external wake (see below) or an explicit `read_my_messages`.
 
 ### Hook coexistence
 
-The oxtail hook coexists with other `hooks.PreToolUse` entries. **Verified against Terminator's `_terminatorHook` v1 in Claude Code 2.1.139:** both hooks' `additionalContext` envelopes reached the model. Install order: Terminator first, oxtail second — `install-hook.mjs` appends to a non-empty array, which matches the verified configuration. If you reinstall hooks in a different order, you may need to re-test.
+`install-hook` manages two events (`PreToolUse` and `Stop`); on each it replaces any prior oxtail entry in place and otherwise appends, so existing third-party entries are preserved. **The PreToolUse path is verified against Terminator's `_terminatorHook` v1 in Claude Code 2.1.139:** both hooks' `additionalContext` envelopes reached the model (install order: Terminator first, oxtail second — which is what `install-hook.mjs` produces by appending). Coexistence of the Stop hook with a third-party `hooks.Stop` entry uses the same append logic but is not separately verified.
 
-If you have a PreToolUse hook installed that isn't from Terminator and isn't oxtail, `install-hook` prints a one-line note and proceeds — coexistence behavior with arbitrary third-party hooks is not pre-verified.
+If you have a hook installed on a managed event that isn't from Terminator and isn't oxtail, `install-hook` prints a one-line note and proceeds — coexistence behavior with arbitrary third-party hooks is not pre-verified.
 
 ### Trust model
 
@@ -177,7 +182,7 @@ ask_peer({ target, body })
 
 1. Enqueue `body` into the target's mailbox (same as `send_message`).
 2. Wait ~500ms for a hook-delivered reply (rare path — handles the case where the peer was already mid-tool-call and replied immediately).
-3. Route the wake via `wake_status` resolution (see above). For Claude Code, return immediately. Otherwise fire the wake.
+3. Route and fire the wake via `wake_status` resolution (see above).
 4. Poll the caller's mailbox at 200ms for a reply with `from_session_id == target.session_id`. Other peers' messages stay in the mailbox untouched.
 5. Return the reply on match, or `{ reply: null, timed_out: true, wake_status }` after the fixed timeout. Late replies fall back to the normal v0.5 hook / `read_my_messages` path — never lost, just delivered out of band.
 
