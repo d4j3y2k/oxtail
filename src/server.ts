@@ -716,10 +716,7 @@ function maybeRecoverStickyClaim(): void {
   if (entry.client.session_id || entry.client.type === "unknown") return;
   let rec: ReturnType<typeof recoverClaim> = null;
   try {
-    rec = recoverClaim(entry.client.type, entry.client.cwd, resolveAncestors(), {
-      conflictingLiveOwner: (sid) =>
-        readAll().some((e) => e.client.session_id === sid && e.server_pid !== entry.server_pid),
-    });
+    rec = recoverClaim(entry.client.type, entry.client.cwd, resolveAncestors());
   } catch {
     return;
   }
@@ -1292,14 +1289,22 @@ async function wakePeer(peer: RegistryEntry): Promise<WakeStatus> {
 
 // --- send_message wake:auto gating -------------------------------------------
 // A peer marks itself "busy" (UserPromptSubmit hook) / "idle" (Stop hook) in
-// ~/.oxtail/activity/<server_pid>. send_message wake:auto reads that so it never
+// ~/.oxtail/activity/<session_id>. send_message wake:auto reads that so it never
 // types into a peer that's mid-turn — the peer's PreToolUse/Stop hooks deliver
 // during the turn, so a send-keys wake is only useful when the peer is idle.
+// Keyed by session_id (the agent identity), NOT server_pid: a dual-scope agent
+// has several MCP children sharing one session_id, and the hooks/sender must
+// agree on the key (see AGENTS.md). Must match the sanitization in the hooks.
 const ACTIVITY_BUSY_TTL_MS = 10 * 60 * 1000;
 
-function readActivity(serverPid: number): { status: string; ageMs: number } | null {
+function activitySessionKey(sessionId: string): string {
+  return sessionId.replace(/[^A-Za-z0-9_-]/g, "_");
+}
+
+function readActivity(sessionId: string | null): { status: string; ageMs: number } | null {
+  if (!sessionId) return null;
   try {
-    const p = join(homedir(), ".oxtail", "activity", String(serverPid));
+    const p = join(homedir(), ".oxtail", "activity", activitySessionKey(sessionId));
     const status = readFileSync(p, "utf8").trim();
     return { status, ageMs: Date.now() - statSync(p).mtimeMs };
   } catch {
@@ -1315,8 +1320,8 @@ function shouldWakeForSend(act: { status: string; ageMs: number } | null): boole
 }
 
 async function wakeForSend(peer: RegistryEntry): Promise<WakeStatus> {
-  if (!shouldWakeForSend(readActivity(peer.server_pid))) {
-    trace("send_wake_skipped_busy", { target_server_pid: peer.server_pid });
+  if (!shouldWakeForSend(readActivity(peer.client.session_id))) {
+    trace("send_wake_skipped_busy", { target_session_id: peer.client.session_id });
     return "skipped_busy";
   }
   return wakePeer(peer);

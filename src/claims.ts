@@ -23,11 +23,15 @@
 // restarted child's started_at, so the positive-delta birth-time rule abstains.
 //
 // Recovery is conservative: it adopts ONLY when exactly one record matches the
-// live ancestry, the recorded transcript still exists, and no other live
-// process already owns that session_id. Any ambiguity (zero or multiple
-// matches) → null → the caller falls back to the explicit claim_session
-// next_step rather than guessing. Two sessions under the same host therefore
-// abstain (both match) — by design.
+// live ancestry and the recorded transcript still exists. Any ambiguity (zero
+// or multiple matching claims) → null → the caller falls back to the explicit
+// claim_session next_step rather than guessing.
+//
+// A live registry entry that already holds the recovered session_id is NOT a
+// conflict: per the AGENTS.md invariant, session_id IS the agent identity, so a
+// same-session_id sibling is the same agent's other MCP child (the documented
+// dual-scope setup), not an impostor. Recovery proceeds alongside it;
+// readAll()/dedupeBySessionId collapses the duplicates downstream.
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -184,11 +188,6 @@ export function writeClaim(input: WriteClaimInput): void {
 }
 
 export type RecoverDeps = {
-  // True if a LIVE process other than us already owns this session_id — in
-  // which case adopting it would double-bind the identity. Backed by the
-  // registry; injected to keep this module free of a registry import (and the
-  // clients → detect → registry → clients import cycle that would create).
-  conflictingLiveOwner: (sessionId: string) => boolean;
   // Defaults to existsSync; injectable for tests.
   transcriptExists?: (path: string) => boolean;
 };
@@ -201,7 +200,7 @@ export function recoverClaim(
   clientType: ClientType,
   cwd: string,
   ancestors: Ancestor[],
-  deps: RecoverDeps,
+  deps: RecoverDeps = {},
 ): ClaimRecord | null {
   const exists = deps.transcriptExists ?? existsSync;
   const dir = claimsDir();
@@ -226,7 +225,6 @@ export function recoverClaim(
     if (!rec.session_id || !rec.transcript_path) continue;
     if (!Array.isArray(rec.ancestors) || !chainsOverlap(rec.ancestors, ancestors)) continue;
     if (!exists(rec.transcript_path)) continue;
-    if (deps.conflictingLiveOwner(rec.session_id)) continue;
     matches.push(rec);
   }
 

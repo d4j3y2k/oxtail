@@ -302,3 +302,30 @@ test("hook coexistence: a second PreToolUse script's stdout is independent of ou
     );
   });
 });
+
+test("hook: dual-scope — drains ALL sibling mailboxes, not just the first pid", async () => {
+  await withHome(async (home) => {
+    // One agent, two MCP children sharing a session_id (the documented
+    // project-.mcp.json + user-~/.claude.json dual scope). The message is
+    // enqueued to the HIGHER pid; the old `grep | head -1` resolved the lower
+    // pid and missed it. Draining all siblings must still deliver it.
+    const sid = "5ce5ce5c-e5ce-5ce5-ce5c-e5ce5ce5ce5c";
+    const lowPid = 71500;
+    const highPid = 71501;
+    // Write both sibling registry files directly — register() would GC the
+    // dead-pid sibling, but we need both present to prove drain-all.
+    const sessionsDir = join(home, ".oxtail", "sessions");
+    mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(sessionsDir, `${lowPid}.json`), JSON.stringify(fakeEntry(home, lowPid, sid), null, 2));
+    writeFileSync(join(sessionsDir, `${highPid}.json`), JSON.stringify(fakeEntry(home, highPid, sid), null, 2));
+    mkdirSync(join(home, ".oxtail", "mailboxes"), { recursive: true, mode: 0o700 });
+    enqueue(highPid, "from the second child", "5e5e5e5e-5e5e-5e5e-5e5e-5e5e5e5e5e5e");
+
+    const r = await runHook({ HOME: home }, JSON.stringify({ session_id: sid }));
+    assert.equal(r.code, 0, `stderr: ${r.stderr}`);
+    const ctx = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
+    assert.ok(ctx.includes("body:\nfrom the second child"), "must deliver from the non-first sibling mailbox");
+    // The mailbox it lived in is drained.
+    assert.equal(readFileSync(mailboxFilePath(highPid), "utf8"), "");
+  });
+});

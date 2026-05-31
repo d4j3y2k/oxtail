@@ -1260,10 +1260,10 @@ test("integration: a restarted Codex MCP child recovers its session via sticky c
   }
 });
 
-function writeActivity(home: string, pid: number, status: string): void {
+function writeActivity(home: string, sessionId: string, status: string): void {
   const dir = join(home, ".oxtail", "activity");
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, String(pid)), status);
+  writeFileSync(join(dir, sessionId), status);
 }
 
 test("messaging: send_message wake:auto skips a busy peer (skipped_busy)", async () => {
@@ -1276,7 +1276,7 @@ test("messaging: send_message wake:auto skips a busy peer (skipped_busy)", async
       tmux_session: "busy-peer",
       cwd: server.home,
     });
-    writeActivity(server.home, process.pid, "busy");
+    writeActivity(server.home, peerSid, "busy");
 
     const res = await callTool<SendOk & { wake_status?: string }>(server.client, "send_message", {
       target: peerSid,
@@ -1302,7 +1302,7 @@ test("messaging: send_message wake:auto with no tmux target returns skipped_no_t
       cwd: server.home,
       type: "codex",
     });
-    writeActivity(server.home, process.pid, "idle");
+    writeActivity(server.home, peerSid, "idle");
 
     const res = await callTool<SendOk & { wake_status?: string }>(server.client, "send_message", {
       target: peerSid,

@@ -40,7 +40,6 @@ function withHome<T>(fn: (home: string) => T): T {
 const host: Ancestor = { pid: 4242, sig: "Sun May 31 04:33:05 2026" };
 const launcherA: Ancestor = { pid: 111, sig: "launcher-a" };
 const launcherB: Ancestor = { pid: 222, sig: "launcher-b" };
-const noConflict = { conflictingLiveOwner: () => false };
 const now = () => Math.floor(Date.now() / 1000);
 
 function makeTranscript(home: string, name = "rollout.jsonl"): string {
@@ -62,7 +61,7 @@ test("claims: recovers through a different launcher when the host ancestor is sh
       claimed_at: now(),
     });
     // Restart under a *different* launcher but the same host.
-    const rec = recoverClaim("codex", "/repo", [launcherB, host], noConflict);
+    const rec = recoverClaim("codex", "/repo", [launcherB, host]);
     assert.ok(rec, "should recover via the shared host ancestor");
     assert.equal(rec!.session_id, "sess-1");
     assert.equal(rec!.transcript_path, t);
@@ -81,7 +80,7 @@ test("claims: no shared ancestor does not recover", () => {
       server_pid: 111,
       claimed_at: now(),
     });
-    const rec = recoverClaim("codex", "/repo", [{ pid: 9999, sig: "x" }, { pid: 8888, sig: "y" }], noConflict);
+    const rec = recoverClaim("codex", "/repo", [{ pid: 9999, sig: "x" }, { pid: 8888, sig: "y" }]);
     assert.equal(rec, null);
   });
 });
@@ -98,7 +97,7 @@ test("claims: shared pid with a different signature (pid reuse) does not recover
       server_pid: 111,
       claimed_at: now(),
     });
-    const rec = recoverClaim("codex", "/repo", [{ pid: host.pid, sig: "Mon Jun 01 09:00:00 2026" }], noConflict);
+    const rec = recoverClaim("codex", "/repo", [{ pid: host.pid, sig: "Mon Jun 01 09:00:00 2026" }]);
     assert.equal(rec, null);
   });
 });
@@ -115,32 +114,13 @@ test("claims: a missing transcript aborts recovery", () => {
       server_pid: 111,
       claimed_at: now(),
     });
-    assert.equal(recoverClaim("codex", "/repo", [host], noConflict), null);
-  });
-});
-
-test("claims: a conflicting live owner aborts recovery", () => {
-  withHome((home) => {
-    const t = makeTranscript(home);
-    writeClaim({
-      client_type: "codex",
-      cwd: "/repo",
-      ancestors: [host],
-      session_id: "sess-1",
-      transcript_path: t,
-      server_pid: 111,
-      claimed_at: now(),
-    });
-    const rec = recoverClaim("codex", "/repo", [host], {
-      conflictingLiveOwner: (sid) => sid === "sess-1",
-    });
-    assert.equal(rec, null);
+    assert.equal(recoverClaim("codex", "/repo", [host]), null);
   });
 });
 
 test("claims: no record returns null", () => {
   withHome(() => {
-    assert.equal(recoverClaim("codex", "/repo", [host], noConflict), null);
+    assert.equal(recoverClaim("codex", "/repo", [host]), null);
   });
 });
 
@@ -157,7 +137,7 @@ test("claims: two sessions sharing one host abstain (ambiguous → require expli
       session_id: "sess-B", transcript_path: t2, server_pid: 2, claimed_at: now(),
     });
     // Both share `host` → ambiguous → abstain.
-    assert.equal(recoverClaim("codex", "/repo", [host], noConflict), null);
+    assert.equal(recoverClaim("codex", "/repo", [host]), null);
   });
 });
 
@@ -175,8 +155,8 @@ test("claims: two sessions under different hosts each recover their own", () => 
       client_type: "codex", cwd: "/repo", ancestors: [hostB],
       session_id: "sess-B", transcript_path: t2, server_pid: 2, claimed_at: now(),
     });
-    assert.equal(recoverClaim("codex", "/repo", [hostA], noConflict)!.session_id, "sess-A");
-    assert.equal(recoverClaim("codex", "/repo", [hostB], noConflict)!.session_id, "sess-B");
+    assert.equal(recoverClaim("codex", "/repo", [hostA])!.session_id, "sess-A");
+    assert.equal(recoverClaim("codex", "/repo", [hostB])!.session_id, "sess-B");
   });
 });
 
@@ -195,7 +175,7 @@ test("claims: re-claim of the same session overwrites in place (one record per s
     writeClaim({ ...base, session_id: "sess-1", server_pid: 222 }); // re-claim, new server_pid
     const files = readdirSync(claimsDir()).filter((f) => f.endsWith(".json"));
     assert.equal(files.length, 1, "same session must overwrite, not accumulate");
-    assert.equal(recoverClaim("codex", "/repo", [host], noConflict)!.server_pid, 222);
+    assert.equal(recoverClaim("codex", "/repo", [host])!.server_pid, 222);
   });
 });
 
@@ -220,8 +200,8 @@ test("claims: gc removes transcript-gone and too-old records, keeps live ones", 
     unlinkSync(tGone);
     gcStaleClaims();
 
-    assert.ok(recoverClaim("codex", "/live", [{ pid: 1, sig: "a" }], noConflict), "live survives");
-    assert.equal(recoverClaim("codex", "/doomed", [{ pid: 2, sig: "b" }], noConflict), null, "transcript-gone gc'd");
-    assert.equal(recoverClaim("codex", "/old", [{ pid: 3, sig: "c" }], noConflict), null, "too-old gc'd");
+    assert.ok(recoverClaim("codex", "/live", [{ pid: 1, sig: "a" }]), "live survives");
+    assert.equal(recoverClaim("codex", "/doomed", [{ pid: 2, sig: "b" }]), null, "transcript-gone gc'd");
+    assert.equal(recoverClaim("codex", "/old", [{ pid: 3, sig: "c" }]), null, "too-old gc'd");
   });
 });

@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # oxtail PreToolUse hook — delivers peer messages mid-turn to Claude Code.
 #
-# Reads ~/.oxtail/mailboxes/<my-server-pid>.jsonl, emits a hookSpecificOutput
-# envelope, and truncates the mailbox under lock. Pure bash + awk; no jq,
-# python, or node. Exits 0 on every error path so it never blocks a tool call.
+# Reads this session's mailbox(es), emits a hookSpecificOutput envelope, and
+# truncates under lock. Pure bash + awk (bash 3.2-compatible — no mapfile); no
+# jq, python, or node. Exits 0 on every error path so it never blocks a tool call.
+#
+# Identity is keyed by session_id, never server_pid (see AGENTS.md). A dual-scope
+# agent runs several MCP children sharing one session_id; the session's inbox is
+# the UNION of those children's mailboxes, so this drains ALL of them rather than
+# guessing one (the send side enqueues to readAll()'s freshest sibling).
 #
 # Step 0a verified that Claude Code strips CLAUDE_CODE_SESSION_ID from hook
-# subprocesses but delivers it via stdin JSON. Stdin is the only path; env
-# is dead code and not consulted here.
+# subprocesses but delivers it via stdin JSON. Stdin is the only path.
 
 set -u
 
-# 1. Read session_id from stdin JSON. Claude Code's PreToolUse contract
-#    delivers a single JSON line on stdin: {"session_id":"...", ...}. If
-#    stdin is a tty (interactive run), exit silently.
+# 1. Read session_id from stdin JSON. If stdin is a tty (interactive run), exit.
 sid=""
 if [ ! -t 0 ]; then
   payload=$(cat 2>/dev/null || true)
@@ -45,40 +47,39 @@ mailboxes_dir="$HOME/.oxtail/mailboxes"
 [ -d "$sessions_dir" ] || exit 0
 [ -d "$mailboxes_dir" ] || exit 0
 
-# 2. Find this session's MCP-server pid. Registry files are pretty-printed
-#    JSON (key/value separated by ": " with a space), so use grep -E with
-#    [[:space:]]* to tolerate either form. -F (fixed-string) is unsafe.
-entry_file=$(grep -lE "\"session_id\"[[:space:]]*:[[:space:]]*\"$sid\"" "$sessions_dir"/*.json 2>/dev/null | head -n 1) || true
-[ -z "$entry_file" ] && exit 0
+# 2. Collect every non-empty sibling mailbox for this session_id. Registry files
+#    are pretty-printed JSON, so grep -E with [[:space:]]* tolerates the form.
+mboxes=()
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  pid=$(basename "$f" .json)
+  case "$pid" in *[!0-9]*) continue ;; esac
+  m="$mailboxes_dir/$pid.jsonl"
+  if [ -f "$m" ] && [ -s "$m" ]; then mboxes+=("$m"); fi
+done < <(grep -lE "\"session_id\"[[:space:]]*:[[:space:]]*\"$sid\"" "$sessions_dir"/*.json 2>/dev/null)
 
-pid=$(basename "$entry_file" .json)
-case "$pid" in *[!0-9]*) exit 0 ;; esac
+[ "${#mboxes[@]}" -eq 0 ] && exit 0
 
-mbox="$mailboxes_dir/$pid.jsonl"
-[ -f "$mbox" ] || exit 0
-[ -s "$mbox" ] || exit 0
-
-# 3. Acquire mkdir-based lock. Staleness window is 30s; matches
-#    src/mailbox.ts:LOCK_STALE_MS. We can't use `find -mmin +0.5` portably —
-#    BSD find and `bfs` reject fractional -mmin — so we read mtime via stat.
-#    GNU and BSD stat formats differ, so try both.
-LOCK_STALE_SECS=30
-acquired=0
-for i in $(seq 1 50); do
-  if mkdir "$mbox.lock" 2>/dev/null; then acquired=1; break; fi
-  now=$(date +%s 2>/dev/null || echo 0)
-  mtime=$(stat -c %Y "$mbox.lock" 2>/dev/null || stat -f %m "$mbox.lock" 2>/dev/null || echo 0)
-  if [ "$mtime" -gt 0 ] && [ $((now - mtime)) -gt "$LOCK_STALE_SECS" ]; then
-    rmdir "$mbox.lock" 2>/dev/null
-  fi
-  sleep 0.01
+# 3. Acquire each mailbox's mkdir-based lock (best-effort; 30s staleness window,
+#    matching src/mailbox.ts:LOCK_STALE_MS). GNU and BSD stat formats differ.
+locked=()
+for m in "${mboxes[@]}"; do
+  for i in $(seq 1 50); do
+    if mkdir "$m.lock" 2>/dev/null; then locked+=("$m"); break; fi
+    now=$(date +%s 2>/dev/null || echo 0)
+    mtime=$(stat -c %Y "$m.lock" 2>/dev/null || stat -f %m "$m.lock" 2>/dev/null || echo 0)
+    if [ "$mtime" -gt 0 ] && [ $((now - mtime)) -gt 30 ]; then
+      rmdir "$m.lock" 2>/dev/null
+    fi
+    sleep 0.01
+  done
 done
-[ "$acquired" -eq 1 ] || exit 0
+[ "${#locked[@]}" -eq 0 ] && exit 0
 
-# 4. Extract every line's body field (still JSON-encoded), join with literal
-#    \n\n separators, emit hookSpecificOutput envelope. Truncating happens
-#    after the awk completes; if awk's output never reaches Claude Code we'd
-#    rather have the messages still in the box than lost.
+# 4. Extract every line's body + reply metadata across all locked mailboxes,
+#    join into one system-reminder envelope. Truncation happens only after awk
+#    produces a valid payload — if the output never reaches Claude Code we'd
+#    rather leave the messages in the box than lose them.
 output=$(awk '
   function json_string_field(line, key,   needle, p, rest, out, i, n, c) {
     needle = "\"" key "\":\""
@@ -126,12 +127,12 @@ output=$(awk '
     ctx = ctx "\\n</system-reminder>"
     printf("{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"%s\"}}\n", ctx)
   }
-' < "$mbox")
+' "${locked[@]}")
 
 if [ -n "$output" ]; then
   printf '%s' "$output"
-  : > "$mbox"
+  for m in "${locked[@]}"; do : > "$m"; done
 fi
 
-rmdir "$mbox.lock" 2>/dev/null || true
+for m in "${locked[@]}"; do rmdir "$m.lock" 2>/dev/null || true; done
 exit 0
