@@ -1,42 +1,32 @@
 #!/usr/bin/env bash
-# oxtail Stop hook — delivers peer messages that landed as Claude Code finished
-# a turn, forcing it to read + respond before going idle.
+# oxtail Stop hook — two jobs at turn end:
+#   1. Wake-routing: mark this session "idle" in ~/.oxtail/activity/<pid> on a
+#      real stop (no pending messages). When it instead BLOCKS to deliver
+#      messages the turn continues, so it leaves the "busy" mark (set by the
+#      UserPromptSubmit hook) in place.
+#   2. Delivery: if peer messages landed as the turn finished, emit a
+#      {"decision":"block","reason":...} envelope so Claude reads + responds
+#      before going idle, and truncate the mailbox under lock.
 #
-# Reads ~/.oxtail/mailboxes/<my-server-pid>.jsonl. If non-empty, emits a
-# {"decision":"block","reason":...} envelope (so Claude continues instead of
-# stopping) and truncates the mailbox under lock. Pure bash + awk; no jq,
-# python, or node. Exits 0 on every error path so it never wedges the agent.
+# Pure bash + awk; no jq, python, or node. Exits 0 on every error path so it
+# never wedges the agent. Mirrors assets/pretooluse.sh's mailbox-read/lock/awk
+# logic deliberately (duplicated, not shared) so changes here never touch the
+# PreToolUse hook.
 #
-# Mirrors assets/pretooluse.sh's mailbox-read/lock/awk logic deliberately
-# (duplicated, not shared) so changes here never touch the PreToolUse hook.
-#
-# Differences from pretooluse.sh:
-#   - honors stop_hook_active: on a re-entry (Claude already continuing because
-#     a prior Stop hook blocked) we exit 0 so decision:block can never loop.
-#     Claude Code also force-overrides a Stop hook after 8 consecutive blocks,
-#     but draining the mailbox below means the next Stop sees an empty box and
-#     stops cleanly long before that cap.
-#   - emits the Stop decision envelope ({"decision":"block","reason":...})
-#     rather than PreToolUse's hookSpecificOutput/additionalContext.
+# stop_hook_active: on a re-entry (Claude already continuing because a prior
+# Stop hook blocked) this is a real stop — mark idle and exit so decision:block
+# can never loop.
 
 set -u
 
-# 1. Read the full stdin payload once (Claude Code delivers a single JSON line:
-#    {"session_id":"...","stop_hook_active":false,...}). If stdin is a tty
-#    (interactive run), there's nothing to deliver — exit silently.
+# 1. Read the full stdin payload once. tty / empty → nothing to do.
 payload=""
 if [ ! -t 0 ]; then
   payload=$(cat 2>/dev/null || true)
 fi
 [ -z "$payload" ] && exit 0
 
-# 2. Loop guard: if we already blocked once this stop sequence, allow the stop.
-#    Tolerate either "key":true or "key": true spacing. Pure grep -E, no jq.
-if printf '%s' "$payload" | grep -Eq '"stop_hook_active"[[:space:]]*:[[:space:]]*true'; then
-  exit 0
-fi
-
-# 3. Extract session_id from the payload (same scanner as pretooluse.sh).
+# 2. Extract session_id (same scanner as pretooluse.sh).
 sid=$(printf '%s' "$payload" | awk '
   {
     p = index($0, "\"session_id\":\"")
@@ -61,21 +51,34 @@ sid=$(printf '%s' "$payload" | awk '
 
 sessions_dir="$HOME/.oxtail/sessions"
 mailboxes_dir="$HOME/.oxtail/mailboxes"
+activity_dir="$HOME/.oxtail/activity"
 [ -d "$sessions_dir" ] || exit 0
-[ -d "$mailboxes_dir" ] || exit 0
 
-# 4. Find this session's MCP-server pid via its registry entry.
+# 3. Resolve this session's MCP-server pid from its registry entry.
 entry_file=$(grep -lE "\"session_id\"[[:space:]]*:[[:space:]]*\"$sid\"" "$sessions_dir"/*.json 2>/dev/null | head -n 1) || true
 [ -z "$entry_file" ] && exit 0
-
 pid=$(basename "$entry_file" .json)
 case "$pid" in *[!0-9]*) exit 0 ;; esac
 
-mbox="$mailboxes_dir/$pid.jsonl"
-[ -f "$mbox" ] || exit 0
-[ -s "$mbox" ] || exit 0
+mark_idle() {
+  mkdir -p "$activity_dir" 2>/dev/null || true
+  printf 'idle' > "$activity_dir/$pid" 2>/dev/null || true
+}
 
-# 5. Acquire mkdir-based lock (30s staleness window; matches mailbox.ts).
+# 4. Loop guard: a re-entry is a real stop → mark idle, allow the stop.
+if printf '%s' "$payload" | grep -Eq '"stop_hook_active"[[:space:]]*:[[:space:]]*true'; then
+  mark_idle
+  exit 0
+fi
+
+# 5. No deliverable mailbox → real stop. Mark idle and allow the stop.
+mbox="$mailboxes_dir/$pid.jsonl"
+if [ ! -d "$mailboxes_dir" ] || [ ! -f "$mbox" ] || [ ! -s "$mbox" ]; then
+  mark_idle
+  exit 0
+fi
+
+# 6. Acquire mkdir-based lock (30s staleness window; matches mailbox.ts).
 LOCK_STALE_SECS=30
 acquired=0
 for i in $(seq 1 50); do
@@ -89,10 +92,8 @@ for i in $(seq 1 50); do
 done
 [ "$acquired" -eq 1 ] || exit 0
 
-# 6. Build the decision:block reason from every line's body + reply metadata.
-#    Truncation happens only AFTER awk produces a valid payload — if the output
-#    never reaches Claude Code we'd rather leave the messages in the box than
-#    drop them (same philosophy as pretooluse.sh).
+# 7. Build the decision:block reason from every line's body + reply metadata.
+#    Truncation happens only AFTER awk produces a valid payload.
 output=$(awk '
   function json_string_field(line, key,   needle, p, rest, out, i, n, c) {
     needle = "\"" key "\":\""
@@ -142,8 +143,12 @@ output=$(awk '
 ' < "$mbox")
 
 if [ -n "$output" ]; then
+  # Blocking: the turn continues, so leave the "busy" mark in place.
   printf '%s' "$output"
   : > "$mbox"
+else
+  # Nothing deliverable → real stop.
+  mark_idle
 fi
 
 rmdir "$mbox.lock" 2>/dev/null || true

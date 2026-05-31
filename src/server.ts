@@ -991,9 +991,10 @@ server.registerTool(
   "send_message",
   {
     description: [
-      "Fire-and-forget message to a peer. Does NOT wake an idle peer.",
+      "Fire-and-forget message to a peer. By default does NOT wake an idle peer.",
       "Sends a short text message to a peer session in the same project root. Target may be a tmux session name (as shown by list_project_sessions) or a raw client_session_id (UUID).",
-      "Delivery is asynchronous: the message lands in the target's mailbox and is delivered mid-turn via the oxtail PreToolUse hook (Claude Code) or next-turn via read_my_messages (Codex, or any client without the hook installed). If the peer is idle (no in-flight turn, no polling), the message waits until they next call a tool or poll explicitly — there is no nudge.",
+      "Delivery is asynchronous: the message lands in the target's mailbox and is delivered mid-turn via the oxtail PreToolUse hook (Claude Code) or next-turn via read_my_messages (Codex, or any client without the hook installed). If the peer is idle (no in-flight turn, no polling), the message waits until they next call a tool or poll explicitly — unless you opt into a wake (see below).",
+      "Optional wake: pass wake:\"auto\" to nudge an idle peer via per-client send-keys (Codex gets the paste-burst-aware gap; Claude Code does not). It is state-gated — if the peer is mid-turn the wake is skipped, since the peer's PreToolUse/Stop hooks deliver during the turn. The response then carries wake_status: \"fired\" | \"skipped_busy\" | \"skipped_no_target\" (no tmux pane/session resolved — e.g. a Codex peer running outside tmux) | \"disabled\" (OXTAIL_ASK_PEER_WAKE_STRATEGY=off). Default wake:\"off\" keeps the pure fire-and-forget contract.",
       "Sender-side wrapping: if you want the message to appear as a system-reminder, include the <system-reminder>...</system-reminder> tags in `body`. The mailbox is a dumb transport.",
       "Cross-project targets are rejected, never silently dropped.",
       "For a blocking send-and-wait variant that pauses your turn until the peer replies, use ask_peer instead. ask_peer routes the wake per client_type (v0.7+): Codex peers are woken via paste-burst-aware send-keys; Claude Code peers are woken via send-keys without the Codex gap. See ask_peer's tool description for the full contract.",
@@ -1010,9 +1011,15 @@ server.registerTool(
           message: "body exceeds 8192 UTF-8 bytes",
         })
         .describe("Message body, ≤8KB UTF-8. The sender chooses the framing."),
+      wake: z
+        .enum(["off", "auto"])
+        .optional()
+        .describe(
+          'Wake strategy. "off" (default): pure fire-and-forget, no nudge. "auto": nudge an idle peer via per-client send-keys, state-gated (skipped if the peer is mid-turn). Response carries wake_status when set.',
+        ),
     },
   },
-  async ({ target, body }) => {
+  async ({ target, body, wake }) => {
     const resolved = resolveTarget(target, entry);
     if (!resolved.ok) {
       return {
@@ -1031,6 +1038,7 @@ server.registerTool(
     const peer = resolved.entry;
     const fromSessionId = entry.client.session_id ?? undefined;
     const msg = mailbox.enqueue(peer.server_pid, body, fromSessionId);
+    const wake_status = wake === "auto" ? await wakeForSend(peer) : undefined;
     return {
       content: [
         {
@@ -1042,6 +1050,7 @@ server.registerTool(
               message_id: msg.id,
               target_session_id: peer.client.session_id,
               target_server_pid: peer.server_pid,
+              ...(wake_status ? { wake_status } : {}),
             },
             null,
             2,
@@ -1116,6 +1125,7 @@ export type WakeStatus =
   | "fired"             // wake keystrokes were sent (peer should enter a turn)
   | "skipped_unsupported" // client_type cannot be woken externally (reserved — no client currently returns this in auto mode)
   | "skipped_no_target" // no tmux pane/session resolved, or send-keys failed everywhere
+  | "skipped_busy"      // peer is mid-turn (send_message wake:auto) — its hooks will deliver
   | "disabled";         // OXTAIL_ASK_PEER_WAKE_STRATEGY=off — caller turned wake off
 
 // OXTAIL_ASK_PEER_WAKE_STRATEGY = "auto" | "legacy" | "off"
@@ -1278,6 +1288,38 @@ async function wakePeer(peer: RegistryEntry): Promise<WakeStatus> {
   const fire = (target: string) => defaultFireWakeKeystrokes(target, fireType);
   const ok = await askPeerWakeImpl(effectivePane, peer.tmux_session, fire);
   return ok ? "fired" : "skipped_no_target";
+}
+
+// --- send_message wake:auto gating -------------------------------------------
+// A peer marks itself "busy" (UserPromptSubmit hook) / "idle" (Stop hook) in
+// ~/.oxtail/activity/<server_pid>. send_message wake:auto reads that so it never
+// types into a peer that's mid-turn — the peer's PreToolUse/Stop hooks deliver
+// during the turn, so a send-keys wake is only useful when the peer is idle.
+const ACTIVITY_BUSY_TTL_MS = 10 * 60 * 1000;
+
+function readActivity(serverPid: number): { status: string; ageMs: number } | null {
+  try {
+    const p = join(homedir(), ".oxtail", "activity", String(serverPid));
+    const status = readFileSync(p, "utf8").trim();
+    return { status, ageMs: Date.now() - statSync(p).mtimeMs };
+  } catch {
+    return null;
+  }
+}
+
+// Skip the wake only when the peer is FRESHLY busy. Idle, unknown (no activity
+// file — hooks not installed), or stale-busy (a turn that outran the TTL, or a
+// peer that exited without a clean Stop) all fall through to a wake.
+function shouldWakeForSend(act: { status: string; ageMs: number } | null): boolean {
+  return !(act && act.status === "busy" && act.ageMs < ACTIVITY_BUSY_TTL_MS);
+}
+
+async function wakeForSend(peer: RegistryEntry): Promise<WakeStatus> {
+  if (!shouldWakeForSend(readActivity(peer.server_pid))) {
+    trace("send_wake_skipped_busy", { target_server_pid: peer.server_pid });
+    return "skipped_busy";
+  }
+  return wakePeer(peer);
 }
 
 // Poll my mailbox at ASK_PEER_POLL_MS until a matching reply lands or the

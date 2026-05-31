@@ -7,10 +7,11 @@ import path from "node:path";
 
 export const SETTINGS_PATH = path.join(os.homedir(), ".claude", "settings.json");
 export const HOOK_MARKER_KEY = "_oxtailHook";
-// v2: adds the Stop hook alongside PreToolUse. Bumping the version forces
-// existing v1 installs to upgrade (install the new Stop hook) on the next
-// `npx oxtail install-hook`.
-export const HOOK_MARKER_VERSION = 2;
+// Bumping the version forces existing installs to upgrade (install any newly
+// managed hooks) on the next `npx oxtail install-hook`.
+//   v2: added the Stop hook alongside PreToolUse.
+//   v3: added the UserPromptSubmit hook (busy/idle activity for wake-routing).
+export const HOOK_MARKER_VERSION = 3;
 
 const HOOKS_DIR = path.join(os.homedir(), ".oxtail", "hooks");
 
@@ -36,6 +37,13 @@ export const MANAGED_HOOKS = [
     asset: "stop.sh",
     scriptPath: path.join(HOOKS_DIR, "stop.sh"),
     command: `"$HOME/.oxtail/hooks/stop.sh"`,
+  },
+  {
+    id: "userpromptsubmit",
+    event: "UserPromptSubmit",
+    asset: "userpromptsubmit.sh",
+    scriptPath: path.join(HOOKS_DIR, "userpromptsubmit.sh"),
+    command: `"$HOME/.oxtail/hooks/userpromptsubmit.sh"`,
   },
 ];
 

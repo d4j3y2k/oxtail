@@ -1259,3 +1259,80 @@ test("integration: a restarted Codex MCP child recovers its session via sticky c
     rmSync(sharedHome, { recursive: true, force: true });
   }
 });
+
+function writeActivity(home: string, pid: number, status: string): void {
+  const dir = join(home, ".oxtail", "activity");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, String(pid)), status);
+}
+
+test("messaging: send_message wake:auto skips a busy peer (skipped_busy)", async () => {
+  const server = await spawnServer();
+  try {
+    const peerSid = "0a0a0a0a-0b0b-0c0c-0d0d-0e0e0e0e0e0e";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: peerSid,
+      tmux_session: "busy-peer",
+      cwd: server.home,
+    });
+    writeActivity(server.home, process.pid, "busy");
+
+    const res = await callTool<SendOk & { wake_status?: string }>(server.client, "send_message", {
+      target: peerSid,
+      body: "yo",
+      wake: "auto",
+    });
+    assert.equal(res.ok, true);
+    assert.equal(res.wake_status, "skipped_busy", "fresh busy peer must not be woken");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("messaging: send_message wake:auto with no tmux target returns skipped_no_target", async () => {
+  const server = await spawnServer();
+  try {
+    const peerSid = "1b1b1b1b-2c2c-3d3d-4e4e-5f5f5f5f5f5f";
+    // Codex-style peer: idle, but no tmux pane/session to send-keys into.
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: peerSid,
+      tmux_session: null,
+      cwd: server.home,
+      type: "codex",
+    });
+    writeActivity(server.home, process.pid, "idle");
+
+    const res = await callTool<SendOk & { wake_status?: string }>(server.client, "send_message", {
+      target: peerSid,
+      body: "yo",
+      wake: "auto",
+    });
+    assert.equal(res.ok, true);
+    assert.equal(res.wake_status, "skipped_no_target", "idle peer with no pane cannot be send-keys-woken");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("messaging: send_message without wake carries no wake_status (contract preserved)", async () => {
+  const server = await spawnServer();
+  try {
+    const peerSid = "2c2c2c2c-3d3d-4e4e-5f5f-606060606060";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: peerSid,
+      tmux_session: "quiet-peer",
+      cwd: server.home,
+    });
+    const res = await callTool<SendOk & { wake_status?: string }>(server.client, "send_message", {
+      target: peerSid,
+      body: "no wake",
+    });
+    assert.equal(res.ok, true);
+    assert.equal(res.wake_status, undefined, "default send_message must not wake");
+  } finally {
+    await server.cleanup();
+  }
+});

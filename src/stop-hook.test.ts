@@ -319,3 +319,57 @@ test("stop: stdout is exactly one JSON line, no sentinel leakage", async () => {
     );
   });
 });
+
+function activityStatus(home: string, pid: number): string | null {
+  try {
+    return readFileSync(join(home, ".oxtail", "activity", String(pid)), "utf8").trim();
+  } catch {
+    return null;
+  }
+}
+
+test("stop: marks the session idle on a real stop (empty mailbox)", async () => {
+  await withHome(async (home) => {
+    const peerPid = 72020;
+    const sid = "20202020-2020-2020-2020-202020202020";
+    register(fakeEntry(home, peerPid, sid));
+    const dir = join(home, ".oxtail", "mailboxes");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(dir, `${peerPid}.jsonl`), "");
+
+    const r = await runHook({ HOME: home }, JSON.stringify({ session_id: sid, stop_hook_active: false }));
+    assert.equal(r.code, 0);
+    assert.equal(r.stdout, "");
+    assert.equal(activityStatus(home, peerPid), "idle");
+  });
+});
+
+test("stop: does NOT mark idle when delivering (the blocked turn continues)", async () => {
+  await withHome(async (home) => {
+    const peerPid = 72021;
+    const sid = "21212121-2121-2121-2121-212121212121";
+    register(fakeEntry(home, peerPid, sid));
+    enqueue(peerPid, "deliver me", "33333333-3333-3333-3333-333333333333");
+
+    const r = await runHook({ HOME: home }, JSON.stringify({ session_id: sid, stop_hook_active: false }));
+    assert.equal(r.code, 0);
+    assert.equal(JSON.parse(r.stdout).decision, "block");
+    assert.equal(activityStatus(home, peerPid), null, "must not mark idle while blocking to deliver");
+  });
+});
+
+test("stop: marks idle on a re-entry (stop_hook_active=true) even with messages waiting", async () => {
+  await withHome(async (home) => {
+    const peerPid = 72022;
+    const sid = "22222222-aaaa-bbbb-cccc-222222222222";
+    register(fakeEntry(home, peerPid, sid));
+    enqueue(peerPid, "still queued");
+
+    const r = await runHook({ HOME: home }, JSON.stringify({ session_id: sid, stop_hook_active: true }));
+    assert.equal(r.code, 0);
+    assert.equal(r.stdout, "");
+    assert.equal(activityStatus(home, peerPid), "idle");
+    // Loop guard preserved the mailbox (we did not deliver on the re-entry).
+    assert.ok(readFileSync(mailboxFilePath(peerPid), "utf8").includes("still queued"));
+  });
+});
