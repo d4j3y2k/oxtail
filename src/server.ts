@@ -709,9 +709,10 @@ function persistStickyClaim(): void {
 // stripped and its transcript predates this child's started_at), try to adopt
 // the previously-claimed session_id for this exact (client_type, cwd, live
 // parent). Conservative: recoverClaim only returns a record when it's
-// unambiguously safe (transcript still exists, no live process already owns the
-// id); otherwise we leave session_id null and the caller's next_step points at
-// explicit claim_session.
+// unambiguously safe — exactly one matching claim whose transcript still exists.
+// A live same-session_id sibling is NOT a conflict (it's the same agent's other
+// MCP child), so recovery proceeds alongside it; otherwise we leave session_id
+// null and the caller's next_step points at explicit claim_session.
 function maybeRecoverStickyClaim(): void {
   if (entry.client.session_id || entry.client.type === "unknown") return;
   let rec: ReturnType<typeof recoverClaim> = null;

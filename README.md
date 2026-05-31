@@ -124,7 +124,7 @@ This installs three small bash scripts under `~/.oxtail/hooks/` and adds matchin
 
 - **`hooks.PreToolUse`** → `pretooluse.sh` — delivers **mid-turn**. It reads each `PreToolUse` event's `session_id` from stdin, locates the matching mailbox, and emits the queued messages as `additionalContext` on the next tool-call boundary.
 - **`hooks.Stop`** → `stop.sh` — delivers **at turn end** (deliver-on-complete). When the agent finishes a turn with messages still waiting, it emits a `decision: "block"` envelope so the agent continues and reads + responds before going idle, instead of leaving the messages until the next turn.
-- **`hooks.UserPromptSubmit`** → `userpromptsubmit.sh` — no delivery; it maintains a **busy/idle activity flag** in `~/.oxtail/activity/<server_pid>` (busy on a turn start, idle on a real Stop). A sender consults this so `send_message({ wake: "auto" })` only fires a send-keys wake when the peer is actually idle (see [Waking an idle peer](#waking-an-idle-peer)).
+- **`hooks.UserPromptSubmit`** → `userpromptsubmit.sh` — no delivery; it maintains a **busy/idle activity flag** in `~/.oxtail/activity/<session_id>` (busy on a turn start, idle on a real Stop). A sender consults this so `send_message({ wake: "auto" })` only fires a send-keys wake when the peer is actually idle (see [Waking an idle peer](#waking-an-idle-peer)).
 
 The PreToolUse and Stop hooks include the message body plus `message_id` and `from_session_id` metadata when the sender is registered, so a receiver can reply with `send_message({ target: "<from_session_id>", body: "..." })` even when the sender is not visible in `list_project_sessions`.
 

@@ -1233,8 +1233,9 @@ test("integration: a restarted Codex MCP child recovers its session via sticky c
     await s1.cleanup();
     s1 = undefined;
 
-    // Wait until s1's registry entry is gone (its pid dead) so it can't count as
-    // a conflicting live owner of the session_id during s2's recovery.
+    // Let s1 fully exit before the "restart" so s2 starts against a clean
+    // registry — a faithful single-child restart. (Recovery no longer depends on
+    // the prior owner being gone; this just keeps the scenario unambiguous.)
     const prevHome = process.env.HOME;
     process.env.HOME = sharedHome;
     try {
