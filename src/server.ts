@@ -1311,6 +1311,18 @@ const ASK_PEER_TIMEOUT_MS = (() => {
 })();
 const ASK_PEER_GRACE_MS = 500;
 const ASK_PEER_POLL_MS = 200;
+// Ceiling for the per-call `timeout_ms` override. A server-side wait longer
+// than the CLIENT's own tool-call abort window makes the client kill the
+// tools/call (a hard error: "tool call failed after Ns") instead of letting
+// ask_peer return its graceful {reply:null, timed_out:true}. Observed: Codex
+// aborts around 120s. 100s stays safely under common client limits. Raise via
+// OXTAIL_ASK_PEER_MAX_TIMEOUT_MS only if your client tolerates longer waits.
+const ASK_PEER_MAX_TIMEOUT_MS = (() => {
+  const env = process.env.OXTAIL_ASK_PEER_MAX_TIMEOUT_MS;
+  if (!env) return 100_000;
+  const n = Number(env);
+  return Number.isFinite(n) && n > 0 ? n : 100_000;
+})();
 // Typed into the peer's TUI as a synthetic prompt, so it lands in their context
 // once per wake — kept terse. For HOOKED Claude Code the delivered envelope
 // carries the full reply instruction, but Codex and hookless Claude peers only
@@ -1593,7 +1605,7 @@ server.registerTool(
   {
     description: [
       "Delegate-and-wait: enqueue a message to a peer in the same project root, wake them, and block until they reply (via send_message) or the timeout elapses. Use this for back-and-forth; use send_message for fire-and-forget.",
-      "Wakes the peer via per-client tmux send-keys (Codex gets a paste-burst-aware gap, Claude Code doesn't), then polls for a reply. For reply_to-capable peers, only from_session_id + reply_to == request_id satisfies the wait; legacy peers fall back to best-effort from_session_id matching and the response reports correlation:\"uncorrelated\". Response carries wake_status: \"fired\" | \"skipped_no_target\" | \"disabled\" (skipped_unsupported is reserved). Returns reply: null, timed_out: true on timeout (default 45000ms, override per call with timeout_ms, or set OXTAIL_ASK_PEER_TIMEOUT_MS at startup). Late replies still arrive via read_my_messages / the hook.",
+      "Wakes the peer via per-client tmux send-keys (Codex gets a paste-burst-aware gap, Claude Code doesn't), then polls for a reply. For reply_to-capable peers, only from_session_id + reply_to == request_id satisfies the wait; legacy peers fall back to best-effort from_session_id matching and the response reports correlation:\"uncorrelated\". Response carries wake_status: \"fired\" | \"skipped_no_target\" | \"disabled\" (skipped_unsupported is reserved). Returns reply: null, timed_out: true on timeout (default 45000ms, override per call with timeout_ms, or set OXTAIL_ASK_PEER_TIMEOUT_MS at startup). timeout_ms is clamped to a safe ceiling (default 100000ms, env OXTAIL_ASK_PEER_MAX_TIMEOUT_MS) so the wait can't outlast the client's tool-call abort window — exceeding it makes the client hard-fail the call instead of returning graceful timed_out; the response reports timeout_clamped_from_ms when clamped. Late replies still arrive via read_my_messages / the hook.",
       "Target must have a registered client.session_id (Codex peers call claim_session first). Body is verbatim — frame it as an assignment (objective + requested action) so it reads as delegation, not chat. Wake overridable via OXTAIL_ASK_PEER_WAKE_STRATEGY=auto|legacy|off.",
     ].join(" "),
     inputSchema: {
@@ -1614,7 +1626,12 @@ server.registerTool(
         .positive()
         .max(300_000)
         .optional()
-        .describe("Optional per-call timeout in milliseconds."),
+        .describe(
+          "Optional per-call timeout in milliseconds. Clamped to a safe ceiling " +
+            "(default 100000ms, env OXTAIL_ASK_PEER_MAX_TIMEOUT_MS) so the wait can't " +
+            "outlast the client's tool-call abort window; the response reports " +
+            "timeout_clamped_from_ms when clamped.",
+        ),
     },
   },
   async ({ target, body, timeout_ms }, extra) => {
@@ -1646,7 +1663,12 @@ server.registerTool(
       request_id: requestId,
     });
     const startedAt = Date.now();
-    const effectiveTimeoutMs = timeout_ms ?? ASK_PEER_TIMEOUT_MS;
+    const requestedTimeoutMs = timeout_ms ?? ASK_PEER_TIMEOUT_MS;
+    // Clamp below the client tool-call abort window: a longer wait would make
+    // the client hard-fail the tools/call instead of receiving our graceful
+    // timed_out response. Surface the clamp so the caller isn't surprised.
+    const effectiveTimeoutMs = Math.min(requestedTimeoutMs, ASK_PEER_MAX_TIMEOUT_MS);
+    const timeoutClamped = effectiveTimeoutMs < requestedTimeoutMs;
     const deadlineMs = startedAt + effectiveTimeoutMs;
     trace("ask_peer_start", {
       target_session_id: expectedSessionId,
@@ -1757,26 +1779,48 @@ server.registerTool(
         : null,
       correlation: reply ? (requireReplyTo ? "correlated" : "uncorrelated") : "none",
       timeout_ms: effectiveTimeoutMs,
+      ...(timeoutClamped ? { timeout_clamped_from_ms: requestedTimeoutMs } : {}),
       timed_out: timedOut,
     });
   },
 );
 
-// Hook-install hint, emitted once per server startup when no `_oxtailHook`
-// marker is present in ~/.claude/settings.json. Stderr surfacing in Claude
-// Code is a soft assumption; if the hint never reaches the user they miss
-// the prompt and fall back to polling — acceptable.
-function maybeHookHint(): void {
+// Hook-install hint, emitted once per server startup. Warns in two cases:
+//   - absent: no `_oxtailHook` marker → hooks never installed.
+//   - stale:  marker present but an installed hook's hash drifted from what
+//             this package version ships (i.e. the user upgraded oxtail but
+//             never re-ran install-hook, so the OLD script keeps running).
+// The stale case is the one that bit v0.10.1: a present-but-outdated
+// pretooluse.sh silently strips request_id and breaks correlated ask/reply,
+// and the old presence-only check never noticed. Stderr surfacing in Claude
+// Code is a soft assumption; a missed hint just degrades to polling.
+async function maybeHookHint(): Promise<void> {
   if (entry.client.type !== "claude-code") return;
   try {
-    const settings = readFileSync(join(homedir(), ".claude", "settings.json"), "utf8");
-    if (settings.includes("_oxtailHook")) return;
+    const url = new URL("../scripts/hook-constants.mjs", import.meta.url).href;
+    const { assessHookFreshness } = (await import(url)) as {
+      assessHookFreshness: () => {
+        status: "ok" | "absent" | "stale" | "unknown";
+        driftedHooks: string[];
+        versionMismatch: boolean;
+      };
+    };
+    const fresh = assessHookFreshness();
+    if (fresh.status === "absent") {
+      process.stderr.write(
+        "[oxtail] PreToolUse hook not installed — run `npx oxtail install-hook` to enable mid-turn peer messaging.\n",
+      );
+    } else if (fresh.status === "stale") {
+      process.stderr.write(
+        `[oxtail] installed hooks are out of date (${fresh.driftedHooks.join(", ")} drifted from this version) — ` +
+          "run `npx oxtail install-hook` to upgrade. A stale PreToolUse hook silently breaks correlated " +
+          "ask/reply by not surfacing request_id to the receiving peer.\n",
+      );
+    }
+    // "ok" / "unknown" → stay silent.
   } catch {
-    // settings file missing is itself a signal the hook isn't installed
+    // Best-effort hint; never block or crash startup on a freshness-check error.
   }
-  process.stderr.write(
-    "[oxtail] PreToolUse hook not installed — run `npx oxtail install-hook` to enable mid-turn peer messaging.\n",
-  );
 }
 
 // Importing server.ts (e.g. from a test that needs an exported helper) used
@@ -1790,5 +1834,5 @@ const invokedDirectly =
 if (invokedDirectly) {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  maybeHookHint();
+  await maybeHookHint();
 }
