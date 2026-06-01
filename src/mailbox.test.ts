@@ -177,7 +177,17 @@ test("mailbox: field-order invariant — schema_version, id, body in order on ev
     assert.match(firstLine, /^\{"schema_version":1,"id":"[0-9a-f]{16}","body":"/);
     const parsed = JSON.parse(firstLine);
     const keys = Object.keys(parsed);
-    assert.deepEqual(keys, ["schema_version", "id", "body", "enqueued_at", "from_session_id"]);
+    assert.deepEqual(keys, [
+      "schema_version",
+      "id",
+      "body",
+      "enqueued_at",
+      "body_bytes",
+      "origin",
+      "from_session_id",
+    ]);
+    assert.equal(parsed.body_bytes, 3);
+    assert.equal(parsed.origin, "peer");
   });
 });
 
@@ -330,6 +340,28 @@ test("drainMatchingSession: loop drains all matching, leaves non-matching untouc
     assert.equal(remaining.length, 1);
     assert.equal(remaining[0].body, "from-other");
     assert.equal(remaining[0].from_session_id, "peer-y");
+  });
+});
+
+test("drainMatchingReply: matches from_session_id plus reply_to, leaves uncorrelated messages", () => {
+  withHome(() => {
+    const pid = 100009;
+    mailbox.enqueue(pid, "placeholder", "peer-x");
+    mailbox.enqueue(pid, "wrong request", "peer-x", { reply_to: "req-other" });
+    mailbox.enqueue(pid, "right reply", "peer-x", { reply_to: "req-1" });
+    mailbox.enqueue(pid, "after", "peer-y", { reply_to: "req-1" });
+
+    const matched = mailbox.drainMatchingReply(pid, "peer-x", "req-1");
+    assert.ok(matched);
+    assert.equal(matched!.body, "right reply");
+    assert.equal(matched!.reply_to, "req-1");
+
+    const remaining = mailbox.drain(pid);
+    assert.deepEqual(
+      remaining.map((m) => m.body),
+      ["placeholder", "wrong request", "after"],
+      "non-matching messages are not consumed",
+    );
   });
 });
 

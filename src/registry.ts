@@ -25,6 +25,23 @@ export type RegistryEntry = {
   tmux_pane: string | null;
   tmux_session: string | null;
   state: StateCard | null;
+  capabilities?: RegistryCapabilities;
+};
+
+export type RegistryCapabilities = {
+  mailbox?: {
+    reply_to?: boolean;
+    provenance?: boolean;
+    push_budget?: boolean;
+  };
+};
+
+export const CURRENT_CAPABILITIES: RegistryCapabilities = {
+  mailbox: {
+    reply_to: true,
+    provenance: true,
+    push_budget: true,
+  },
 };
 
 // Lazy so tests can swap HOME between cases; homedir() defers to $HOME on POSIX.
@@ -157,6 +174,7 @@ export function buildEntry(client: ClientInfo, env = process.env): RegistryEntry
     tmux_pane,
     tmux_session: resolveTmuxSessionFromPane(tmux_pane),
     state: null,
+    capabilities: CURRENT_CAPABILITIES,
   };
 }
 
