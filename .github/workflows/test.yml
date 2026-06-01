@@ -27,3 +27,17 @@ jobs:
       - run: npm ci
 
       - run: npm test
+
+  # Guard: any change to a shipped hook asset (assets/*.sh) must bump
+  # HOOK_MARKER_VERSION, so upgraded installs are forced to re-run install-hook.
+  # Runs only on PRs (needs a base ref to diff against).
+  hook-version-guard:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure hook asset changes bump HOOK_MARKER_VERSION
+        run: node scripts/check-hook-version.mjs "${{ github.event.pull_request.base.sha }}"
