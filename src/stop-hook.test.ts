@@ -93,6 +93,13 @@ test("stop: happy path — single message becomes a decision:block reason", asyn
     assert.ok(reason.includes("message_id:"));
     assert.ok(reason.includes(`from_session_id: ${senderSid}`));
     assert.ok(reason.includes("body:\nhello from peer"));
+    // Phase D: terse reply instruction; verbose pre-Phase-D sentence gone;
+    // message_id + from_session_id retained.
+    assert.ok(
+      reason.includes("Reply to any that need it via mcp__oxtail__send_message"),
+      "terse reply instruction present",
+    );
+    assert.ok(!reason.includes("using that UUID as target"), "verbose instruction removed");
 
     // Mailbox truncated.
     assert.equal(readFileSync(mailboxFilePath(peerPid), "utf8"), "");

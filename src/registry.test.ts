@@ -20,7 +20,7 @@ import {
   register,
   type RegistryEntry,
 } from "./registry.js";
-import { joinSessionsWithRegistry, type Session } from "./server.js";
+import { joinSessionsWithRegistry, tailChars, toCompactList, type Session } from "./server.js";
 
 type TmuxRow = Omit<Session, "client_type" | "client_session_id" | "state">;
 
@@ -448,4 +448,103 @@ test("register: leaves live sibling alone (legitimate multi-scope case)", () => 
     assert.equal(result.length, 1);
     assert.equal(result[0].server_pid, process.pid, "freshest started_at wins");
   });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase C — pane char cap (tailChars) + opt-in list de-dup (toCompactList)
+// ────────────────────────────────────────────────────────────────────────────
+
+test("phase-c: tailChars leaves short text untouched", () => {
+  const r = tailChars("short pane output", 1000);
+  assert.equal(r.truncated, false);
+  assert.equal(r.text, "short pane output");
+});
+
+test("phase-c: tailChars keeps the TAIL (most recent output) with a marker", () => {
+  const text = Array.from({ length: 100 }, (_, i) => `line ${i}`).join("\n");
+  const r = tailChars(text, 50);
+  assert.equal(r.truncated, true);
+  assert.ok(r.text.startsWith("…[pane truncated to last 50 chars]\n"), "marker prefix present");
+  assert.ok(r.text.endsWith("line 99"), "tail-preserving: ends with the newest output");
+  // Body after the marker line is exactly the budget worth of code points.
+  const body = r.text.slice(r.text.indexOf("\n") + 1);
+  assert.equal(Array.from(body).length, 50);
+});
+
+test("phase-c: tailChars never splits a surrogate pair at the boundary", () => {
+  // 100 emoji, each a surrogate pair (2 UTF-16 code units). A naive slice by
+  // .length could cut one in half; Array.from slices by code point.
+  const text = "😀".repeat(100);
+  const r = tailChars(text, 10);
+  assert.equal(r.truncated, true);
+  assert.ok(!r.text.includes("�"), "no replacement char from a split surrogate");
+  const body = r.text.slice(r.text.indexOf("\n") + 1);
+  assert.equal(Array.from(body).length, 10, "exactly 10 whole emoji kept");
+});
+
+function sessionRow(over: Partial<Session> & Pick<Session, "name" | "client_session_id">): Session {
+  return {
+    name: over.name,
+    path: over.path ?? "/tmp/proj",
+    attached: over.attached ?? true,
+    created_at: over.created_at ?? 1,
+    windows: over.windows ?? 2,
+    client_type: over.client_type ?? "claude-code",
+    client_session_id: over.client_session_id,
+    state: over.state ?? null,
+  };
+}
+
+test("phase-c: toCompactList groups co-located agents and hoists shared tmux fields", () => {
+  const sessions: Session[] = [
+    sessionRow({ name: "shared", client_session_id: "uuid-a" }),
+    sessionRow({ name: "shared", client_session_id: "uuid-b", client_type: "codex", state: { purpose: "x", updated_at: 5 } }),
+  ];
+  const compact = toCompactList({
+    schema_version: 1,
+    project_root: "/tmp/proj",
+    inferred: false,
+    sessions,
+    error: null,
+  });
+
+  assert.equal(compact.tmux_sessions.length, 1, "two agents collapse to one tmux group");
+  const g = compact.tmux_sessions[0]!;
+  assert.equal(g.name, "shared");
+  assert.equal(g.path, "/tmp/proj");
+  assert.equal(g.windows, 2);
+  assert.equal(g.agents.length, 2);
+  assert.deepEqual(g.agents.map((a) => a.client_session_id), ["uuid-a", "uuid-b"]);
+  assert.equal(g.agents[1]!.state?.purpose, "x");
+  // Envelope fields carried through.
+  assert.equal(compact.schema_version, 1);
+  assert.equal(compact.project_root, "/tmp/proj");
+  assert.equal(compact.inferred, false);
+  assert.equal(compact.error, null);
+});
+
+test("phase-c: toCompactList represents an unclaimed tmux session as a group with no agents", () => {
+  const sessions: Session[] = [
+    { name: "ghost", path: "/tmp/proj", attached: false, created_at: 9, windows: 1, client_type: null, client_session_id: null, state: null },
+  ];
+  const compact = toCompactList({ schema_version: 1, project_root: "/tmp/proj", inferred: true, sessions, error: null });
+  assert.equal(compact.tmux_sessions.length, 1);
+  assert.equal(compact.tmux_sessions[0]!.name, "ghost");
+  assert.deepEqual(compact.tmux_sessions[0]!.agents, [], "no phantom null-agent");
+});
+
+test("phase-c: compact shape is smaller than the flat shape for multi-agent sessions", () => {
+  // Four agents sharing one tmux session — the matrix oxtail targets. The flat
+  // shape repeats name/path/attached/created_at/windows four times.
+  const sessions: Session[] = Array.from({ length: 4 }, (_, i) =>
+    sessionRow({ name: "matrix", client_session_id: `uuid-${i}`, path: "/tmp/some/long/project/path" }),
+  );
+  const flat = { schema_version: 1 as const, project_root: "/tmp/some/long/project/path", inferred: false, sessions, error: null };
+  const compact = toCompactList(flat);
+  const flatBytes = JSON.stringify(flat).length;
+  const compactBytes = JSON.stringify(compact).length;
+  assert.ok(
+    compactBytes < flatBytes,
+    `compact (${compactBytes}) must be smaller than flat (${flatBytes}) for 4 co-located agents`,
+  );
 });

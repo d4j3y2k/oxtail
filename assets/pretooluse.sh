@@ -113,7 +113,7 @@ output=$(awk '
   END {
     if (count == 0) exit 0
     ctx = "<system-reminder>\\n[oxtail] You have " count " new peer message(s)."
-    ctx = ctx "\\nIf a message asks for a response and from_session_id is present, reply with mcp__oxtail__send_message using that UUID as target."
+    ctx = ctx "\\nReply to any that need it via mcp__oxtail__send_message (target = the from_session_id below)."
     for (j = 0; j < count; j++) {
       ctx = ctx "\\n\\n--- message " (j + 1) " ---"
       if (ids[j] != "") ctx = ctx "\\nmessage_id: " ids[j]

@@ -53,6 +53,7 @@ import { recoverClaim, resolveAncestors, writeClaim } from "./claims.js";
 import {
   readClaudeTranscript,
   readCodexTranscript,
+  type ReadTranscriptOptions,
   type TranscriptMessage,
 } from "./transcripts.js";
 
@@ -83,11 +84,50 @@ type ReadResult = {
   messages: TranscriptMessage[] | null;
   pane_text: string | null;
   truncated: boolean;
+  count_truncated: boolean;
+  bytes_truncated: boolean;
   total_messages: number | null;
+  total_messages_exact: boolean;
   project_root: string;
   inferred: boolean;
   error: string | null;
 };
+
+// Single builder for every readSession return so the field set (including the
+// truncation flags) is always complete and consistent across the ~9 exit paths.
+// Callers pass only what differs from the defaults.
+function makeReadResult(o: {
+  session: string;
+  project_root: string;
+  inferred: boolean;
+  mode?: ReadResult["mode"];
+  client_type?: ClientType | null;
+  messages?: TranscriptMessage[] | null;
+  pane_text?: string | null;
+  truncated?: boolean;
+  count_truncated?: boolean;
+  bytes_truncated?: boolean;
+  total_messages?: number | null;
+  total_messages_exact?: boolean;
+  error?: string | null;
+}): ReadResult {
+  return {
+    schema_version: 1,
+    session: o.session,
+    mode: o.mode ?? "none",
+    client_type: o.client_type ?? null,
+    messages: o.messages ?? null,
+    pane_text: o.pane_text ?? null,
+    truncated: o.truncated ?? false,
+    count_truncated: o.count_truncated ?? false,
+    bytes_truncated: o.bytes_truncated ?? false,
+    total_messages: o.total_messages ?? null,
+    total_messages_exact: o.total_messages_exact ?? false,
+    project_root: o.project_root,
+    inferred: o.inferred,
+    error: o.error ?? null,
+  };
+}
 
 const TMUX_LIST_FORMAT =
   "#{session_name}|#{session_path}|#{session_created}|#{session_attached}|#{session_windows}";
@@ -245,6 +285,71 @@ export function buildListResult(input: { project_root?: string }): ListResult {
   return { schema_version: 1, project_root: resolvedRoot, inferred: !explicit, sessions, error };
 }
 
+type CompactAgent = {
+  client_type: ClientType | null;
+  client_session_id: string | null;
+  state: StateCard | null;
+};
+type CompactTmuxSession = {
+  name: string;
+  path: string;
+  attached: boolean;
+  created_at: number;
+  windows: number;
+  agents: CompactAgent[];
+};
+type ListCompactResult = {
+  schema_version: 1;
+  project_root: string;
+  inferred: boolean;
+  tmux_sessions: CompactTmuxSession[];
+  error: string | null;
+};
+
+// Opt-in compact shape: hoist the tmux fields that are byte-identical across
+// every agent sharing a session (name/path/attached/created_at/windows) into one
+// group, with the per-agent fields nested under `agents`. Kills the per-row
+// duplication that grows with the agent matrix (and the redundant per-row `path`
+// that usually equals project_root). The DEFAULT response keeps the flat
+// `sessions[]` shape — backward compatible; callers ask for this with
+// compact:true. An unclaimed tmux session (no oxtail-aware agent) becomes a group
+// with an empty `agents` array.
+export function toCompactList(r: ListResult): ListCompactResult {
+  const groups = new Map<string, CompactTmuxSession>();
+  const order: string[] = [];
+  for (const s of r.sessions) {
+    let g = groups.get(s.name);
+    if (!g) {
+      g = {
+        name: s.name,
+        path: s.path,
+        attached: s.attached,
+        created_at: s.created_at,
+        windows: s.windows,
+        agents: [],
+      };
+      groups.set(s.name, g);
+      order.push(s.name);
+    }
+    // joinSessionsWithRegistry emits a single all-null row for a tmux session
+    // with no registry match; don't materialize that as a phantom agent.
+    if (s.client_type !== null || s.client_session_id !== null || s.state !== null) {
+      g.agents.push({
+        client_type: s.client_type,
+        client_session_id: s.client_session_id,
+        state: s.state,
+      });
+    }
+  }
+  return {
+    schema_version: 1,
+    project_root: r.project_root,
+    inferred: r.inferred,
+    tmux_sessions: order.map((n) => groups.get(n)!),
+    error: r.error,
+  };
+}
+
 function capturePane(target: string, lines: number): string {
   const safe = Math.max(20, Math.min(2000, Math.floor(lines)));
   return execFileSync(
@@ -252,6 +357,25 @@ function capturePane(target: string, lines: number): string {
     ["capture-pane", "-p", "-J", "-t", target, "-S", `-${safe}`, "-E", "-"],
     { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
   );
+}
+
+// pane_lines bounds how many ROWS tmux captures, but a single row can be
+// arbitrarily wide, so the joined blob is still unbounded by characters. This
+// caps the returned text and is tail-preserving — the most recent terminal
+// output is at the bottom, which is what a peer-watcher actually wants.
+const DEFAULT_PANE_MAX_CHARS = 20_000;
+const MIN_PANE_MAX_CHARS = 500;
+const MAX_PANE_MAX_CHARS = 200_000;
+
+export function tailChars(text: string, maxChars: number): { text: string; truncated: boolean } {
+  // Fast path: code-unit length is an upper bound on code-point count, so if it
+  // already fits there's nothing to do (and we skip the Array.from allocation).
+  if (text.length <= maxChars) return { text, truncated: false };
+  // Slice by code points so we never split a surrogate pair at the boundary.
+  const cps = Array.from(text);
+  if (cps.length <= maxChars) return { text, truncated: false };
+  const tail = cps.slice(cps.length - maxChars).join("");
+  return { text: `…[pane truncated to last ${maxChars} chars]\n${tail}`, truncated: true };
 }
 
 type ScopeResolution = {
@@ -356,46 +480,57 @@ function readSession(input: {
   project_root?: string;
   mode?: "auto" | "transcript" | "pane";
   limit?: number;
+  max_bytes?: number;
+  include_timestamps?: boolean;
+  tail_scan?: boolean;
   pane_lines?: number;
+  pane_max_chars?: number;
 }): ReadResult {
   const mode = input.mode ?? "auto";
-  const limit = input.limit ?? 100;
   const paneLines = input.pane_lines ?? 240;
+  // Mirror the transcript budgets' finite-number hardening: a non-finite
+  // pane_max_chars (only reachable via a direct call, never through zod) coerces
+  // to the default rather than producing a NaN cap. Per Codex Phase-C note.
+  const paneMaxChars = Math.max(
+    MIN_PANE_MAX_CHARS,
+    Math.min(
+      MAX_PANE_MAX_CHARS,
+      Math.floor(
+        Number.isFinite(input.pane_max_chars)
+          ? (input.pane_max_chars as number)
+          : DEFAULT_PANE_MAX_CHARS,
+      ),
+    ),
+  );
   const explicit = typeof input.project_root === "string" && input.project_root.length > 0;
   const resolvedRoot = safeRealpath(
     explicit ? input.project_root! : inferProjectRoot(process.cwd()),
   );
+  // The reader applies its own conservative defaults (DEFAULT_LIMIT /
+  // DEFAULT_MAX_BYTES) and clamps; we just forward whatever the caller set.
+  const readerOpts: ReadTranscriptOptions = {
+    limit: input.limit,
+    maxBytes: input.max_bytes,
+    includeTimestamps: input.include_timestamps,
+    tailScan: input.tail_scan,
+  };
 
   const scope = resolveSessionInScope(input.name, resolvedRoot);
   if (scope.ambiguousCandidates) {
-    return {
-      schema_version: 1,
+    return makeReadResult({
       session: input.name,
-      mode: "none",
-      client_type: null,
-      messages: null,
-      pane_text: null,
-      truncated: false,
-      total_messages: null,
       project_root: resolvedRoot,
       inferred: !explicit,
       error: `ambiguous-target: multiple agents share tmux session '${input.name}'; pass a client_session_id (UUID) instead. candidates: ${scope.ambiguousCandidates.join(", ")}`,
-    };
+    });
   }
   if (!scope.inScope) {
-    return {
-      schema_version: 1,
+    return makeReadResult({
       session: input.name,
-      mode: "none",
-      client_type: null,
-      messages: null,
-      pane_text: null,
-      truncated: false,
-      total_messages: null,
       project_root: resolvedRoot,
       inferred: !explicit,
       error: `session '${input.name}' not in project scope`,
-    };
+    });
   }
 
   const canonical = scope.canonicalName;
@@ -411,108 +546,82 @@ function readSession(input: {
   // (an in-scope, transcript-capable, tmux-less peer) was wrongly rejected as
   // "not in project scope".
   if (!canonical && !transcriptPath) {
-    return {
-      schema_version: 1,
+    return makeReadResult({
       session: input.name,
-      mode: "none",
-      client_type: clientType,
-      messages: null,
-      pane_text: null,
-      truncated: false,
-      total_messages: null,
       project_root: resolvedRoot,
       inferred: !explicit,
+      client_type: clientType,
       error: `session '${input.name}' is in scope but has no transcript and no tmux session to read`,
-    };
+    });
   }
 
   const wantTranscript = mode === "transcript" || (mode === "auto" && transcriptPath);
   if (wantTranscript) {
     if (!transcriptPath) {
       if (mode === "transcript") {
-        return {
-          schema_version: 1,
+        return makeReadResult({
           session: canonical ?? input.name,
-          mode: "none",
-          client_type: clientType,
-          messages: null,
-          pane_text: null,
-          truncated: false,
-          total_messages: null,
           project_root: resolvedRoot,
           inferred: !explicit,
+          client_type: clientType,
           error: "no registry entry with transcript path; agent may not be oxtail-aware",
-        };
+        });
       }
       // fall through to pane
     } else {
       const reader = clientType === "codex" ? readCodexTranscript : readClaudeTranscript;
-      const result = reader(transcriptPath, limit);
-      return {
-        schema_version: 1,
+      const result = reader(transcriptPath, readerOpts);
+      return makeReadResult({
         session: canonical ?? input.name,
+        project_root: resolvedRoot,
+        inferred: !explicit,
         mode: "transcript",
         client_type: clientType,
         messages: result.messages,
-        pane_text: null,
         truncated: result.truncated,
+        count_truncated: result.count_truncated,
+        bytes_truncated: result.bytes_truncated,
         total_messages: result.total_messages,
-        project_root: resolvedRoot,
-        inferred: !explicit,
-        error: null,
-      };
+        total_messages_exact: result.total_messages_exact,
+      });
     }
   }
 
   // Pane fallback needs a tmux session to capture from. Reachable only when a
   // caller forces mode:"pane" on a transcript-only peer (no tmux binding).
   if (!canonical) {
-    return {
-      schema_version: 1,
+    return makeReadResult({
       session: input.name,
-      mode: "none",
-      client_type: clientType,
-      messages: null,
-      pane_text: null,
-      truncated: false,
-      total_messages: null,
       project_root: resolvedRoot,
       inferred: !explicit,
+      client_type: clientType,
       error: `session '${input.name}' has no tmux pane to capture (transcript-only peer)`,
-    };
+    });
   }
 
   try {
-    const text = capturePane(canonical, paneLines);
-    return {
-      schema_version: 1,
+    const captured = tailChars(capturePane(canonical, paneLines), paneMaxChars);
+    return makeReadResult({
       session: canonical,
-      mode: "pane",
-      client_type: clientType,
-      messages: null,
-      pane_text: text,
-      truncated: false,
-      total_messages: null,
       project_root: resolvedRoot,
       inferred: !explicit,
-      error: null,
-    };
+      mode: "pane",
+      client_type: clientType,
+      pane_text: captured.text,
+      // Pane mode has no message-count/byte-budget split; `truncated` is the
+      // catch-all signal that the char cap shortened the captured text.
+      truncated: captured.truncated,
+    });
   } catch (err) {
     const e = err as NodeJS.ErrnoException & { stderr?: Buffer | string };
     const stderr = e.stderr ? e.stderr.toString() : "";
-    return {
-      schema_version: 1,
+    return makeReadResult({
       session: canonical,
-      mode: "none",
-      client_type: clientType,
-      messages: null,
-      pane_text: null,
-      truncated: false,
-      total_messages: null,
       project_root: resolvedRoot,
       inferred: !explicit,
+      client_type: clientType,
       error: stderr.trim() || e.message || "pane capture failed",
-    };
+    });
   }
 }
 
@@ -546,6 +655,21 @@ const pkgVersion = (
 ).version;
 
 const server = new McpServer({ name: "oxtail", version: pkgVersion });
+
+// All MCP tool responses are JSON-encoded text that lands directly in a peer
+// agent's context window. They are minified, never pretty-printed: indentation
+// is pure whitespace cost that recurs on every call for the life of a session,
+// and every consumer (tests, hooks) parses structurally — none depend on the
+// indented form. On-disk registry/claim writes stay pretty (human-debuggable
+// artifacts, not agent context). Single source of truth for response encoding.
+// `payload` is constrained to object/array (never a bare primitive) so the
+// encoder can't silently yield a non-string — JSON.stringify(undefined) returns
+// undefined, which would violate the text-content contract. Per Codex review.
+function jsonResult(
+  payload: Record<string, unknown> | unknown[],
+): { content: [{ type: "text"; text: string }] } {
+  return { content: [{ type: "text", text: JSON.stringify(payload) }] };
+}
 
 const LATE_REDETECT_DELAYS_MS = [1_000, 5_000, 30_000, 5 * 60_000];
 let lateRedetectScheduled = false;
@@ -633,7 +757,7 @@ server.registerTool(
   "list_project_sessions",
   {
     description:
-      "List agent sessions in or under a project root, enriched with client_type, client_session_id, and each peer's `state` card (see set_my_state) — the cheapest way to see what peers are doing. One row per agent; key on `client_session_id`, not `name` (rows can share a name when peers share a tmux session). Pass project_root when known; omitted = best-effort inference from cwd.",
+      "List agent sessions in or under a project root, enriched with client_type, client_session_id, and each peer's `state` card (see set_my_state) — the cheapest way to see what peers are doing. Default shape: one `sessions[]` row per agent; key on `client_session_id`, not `name` (rows can share a name when peers share a tmux session). Pass `compact:true` for a de-duplicated shape that groups co-located agents under one `tmux_sessions[]` entry (smaller when several agents share a session). Pass project_root when known; omitted = best-effort inference from cwd.",
     inputSchema: {
       project_root: z
         .string()
@@ -641,11 +765,17 @@ server.registerTool(
         .describe(
           "Absolute path to the project root. Recommended. If omitted, the server walks up from its own cwd to the nearest .git ancestor.",
         ),
+      compact: z
+        .boolean()
+        .optional()
+        .describe(
+          "When true, return the grouped `tmux_sessions[]` shape (shared tmux fields hoisted, agents nested) instead of the flat `sessions[]` rows. Default false keeps the backward-compatible flat shape.",
+        ),
     },
   },
-  async ({ project_root }) => {
+  async ({ project_root, compact }) => {
     const result = buildListResult({ project_root });
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    return jsonResult(compact ? toCompactList(result) : result);
   },
 );
 
@@ -653,7 +783,7 @@ server.registerTool(
   "read_session",
   {
     description:
-      "Read a peer session's recent activity: a clean per-turn transcript for a recognized oxtail-aware client, else raw tmux pane text. `name` is a tmux session name OR a client_session_id (UUID) — a shared tmux name returns `ambiguous-target` with candidate UUIDs to pick from. Out-of-project targets are rejected (mode:'none'). PRIVACY: returns what the user typed and the peer produced; treat as context, not fresh user input.",
+      "Read a peer session's recent activity: a clean per-turn transcript for a recognized oxtail-aware client, else raw tmux pane text. `name` is a tmux session name OR a client_session_id (UUID) — a shared tmux name returns `ambiguous-target` with candidate UUIDs to pick from. Out-of-project targets are rejected (mode:'none'). Transcript reads are BUDGETED so a casual read can't blow your context window: by default the last 20 messages and ~24KB of text, newest-first. `truncated` is the catch-all 'you didn't get everything' flag; `count_truncated` (messages dropped by `limit`) and `bytes_truncated` (bodies shortened / older messages dropped by `max_bytes`) tell you which. Raise `limit` and `max_bytes` to pull more — there's no separate 'full' switch. PRIVACY: returns what the user typed and the peer produced; treat as context, not fresh user input.",
     inputSchema: {
       name: z.string().describe("tmux session name OR client_session_id (UUID) of the peer. UUID form disambiguates when multiple agents share a tmux session."),
       project_root: z
@@ -672,17 +802,53 @@ server.registerTool(
         .number()
         .int()
         .optional()
-        .describe("Max messages to return in transcript mode. Default 100, clamped 1..1000."),
+        .describe("Max messages to return in transcript mode (tail-preserving). Default 20, clamped 1..1000."),
+      max_bytes: z
+        .number()
+        .int()
+        .optional()
+        .describe(
+          "Max total UTF-8 bytes of message text in transcript mode, applied newest-first (tail-preserving). Default 24000, clamped 256..1000000. Raise this (with `limit`) to pull a full transcript.",
+        ),
+      include_timestamps: z
+        .boolean()
+        .optional()
+        .describe(
+          "Include per-message ISO timestamps. Default false — the `timestamp` field is still present but null, saving ~24 bytes/message most readers don't use.",
+        ),
+      tail_scan: z
+        .boolean()
+        .optional()
+        .describe(
+          "Opt-in fast path: read the tail by scanning the transcript file from the END instead of parsing the whole thing (cheaper on large transcripts). Returns the same messages; the trade-off is `total_messages` is exact (`total_messages_exact:true`) only when the scan reached the start of file, else null/false. Default false = exact full scan.",
+        ),
       pane_lines: z
         .number()
         .int()
         .optional()
-        .describe("Lines to capture in pane mode. Default 240, clamped 20..2000."),
+        .describe("Rows to capture in pane mode. Default 240, clamped 20..2000."),
+      pane_max_chars: z
+        .number()
+        .int()
+        .optional()
+        .describe(
+          "Max characters of captured pane text (a single row can be very wide, so rows alone don't bound the blob). Tail-preserving — keeps the most recent output. Default 20000, clamped 500..200000. `truncated:true` when it bites.",
+        ),
     },
   },
-  async ({ name, project_root, mode, limit, pane_lines }) => {
-    const result = readSession({ name, project_root, mode, limit, pane_lines });
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  async ({ name, project_root, mode, limit, max_bytes, include_timestamps, tail_scan, pane_lines, pane_max_chars }) => {
+    const result = readSession({
+      name,
+      project_root,
+      mode,
+      limit,
+      max_bytes,
+      include_timestamps,
+      tail_scan,
+      pane_lines,
+      pane_max_chars,
+    });
+    return jsonResult(result);
   },
 );
 
@@ -780,27 +946,16 @@ server.registerTool(
   },
   async ({ session_id }) => {
     pinSessionId(session_id);
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            {
-              schema_version: 1,
-              ok: true,
-              entry: {
-                server_pid: entry.server_pid,
-                started_at: entry.started_at,
-                tmux_session: entry.tmux_session,
-                client: entry.client,
-              },
-            },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
+    return jsonResult({
+      schema_version: 1,
+      ok: true,
+      entry: {
+        server_pid: entry.server_pid,
+        started_at: entry.started_at,
+        tmux_session: entry.tmux_session,
+        client: entry.client,
+      },
+    });
   },
 );
 
@@ -818,23 +973,12 @@ server.registerTool(
   },
   async ({ session_id }) => {
     pinSessionId(session_id);
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            {
-              schema_version: 1,
-              ok: true,
-              session_id: entry.client.session_id,
-              transcript_path: entry.client.transcript_path,
-            },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
+    return jsonResult({
+      schema_version: 1,
+      ok: true,
+      session_id: entry.client.session_id,
+      transcript_path: entry.client.transcript_path,
+    });
   },
 );
 
@@ -882,29 +1026,18 @@ server.registerTool(
       }
       diagnosis = live ?? { per_strategy: {}, winning: null, next_step: null };
     }
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            {
-              schema_version: 1,
-              entry: {
-                server_pid: entry.server_pid,
-                started_at: entry.started_at,
-                tmux_pane: entry.tmux_pane,
-                tmux_session: entry.tmux_session,
-                client: entry.client,
-                state: entry.state,
-              },
-              detect_diagnosis: diagnosis,
-            },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
+    return jsonResult({
+      schema_version: 1,
+      entry: {
+        server_pid: entry.server_pid,
+        started_at: entry.started_at,
+        tmux_pane: entry.tmux_pane,
+        tmux_session: entry.tmux_session,
+        client: entry.client,
+        state: entry.state,
+      },
+      detect_diagnosis: diagnosis,
+    });
   },
 );
 
@@ -930,14 +1063,7 @@ server.registerTool(
     };
     entry.state = next;
     register(entry);
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({ schema_version: 1, ok: true, state: next }, null, 2),
-        },
-      ],
-    };
+    return jsonResult({ schema_version: 1, ok: true, state: next });
   },
 );
 
@@ -1069,42 +1195,20 @@ server.registerTool(
   async ({ target, body, wake }) => {
     const resolved = resolveTarget(target, entry);
     if (!resolved.ok) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              { schema_version: 1, ...resolved },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
+      return jsonResult({ schema_version: 1, ...resolved });
     }
     const peer = resolved.entry;
     const fromSessionId = entry.client.session_id ?? undefined;
     const msg = mailbox.enqueue(peer.server_pid, body, fromSessionId);
     const wake_status = wake === "auto" ? await wakeForSend(peer) : undefined;
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            {
-              schema_version: 1,
-              ok: true,
-              message_id: msg.id,
-              target_session_id: peer.client.session_id,
-              target_server_pid: peer.server_pid,
-              ...(wake_status ? { wake_status } : {}),
-            },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
+    return jsonResult({
+      schema_version: 1,
+      ok: true,
+      message_id: msg.id,
+      target_session_id: peer.client.session_id,
+      target_server_pid: peer.server_pid,
+      ...(wake_status ? { wake_status } : {}),
+    });
   },
 );
 
@@ -1117,24 +1221,13 @@ server.registerTool(
   },
   async () => {
     const messages = mailbox.drain(entry.server_pid);
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            {
-              schema_version: 1,
-              ok: true,
-              drained: true,
-              count: messages.length,
-              messages,
-            },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
+    return jsonResult({
+      schema_version: 1,
+      ok: true,
+      drained: true,
+      count: messages.length,
+      messages,
+    });
   },
 );
 
@@ -1153,8 +1246,13 @@ const ASK_PEER_TIMEOUT_MS = (() => {
 })();
 const ASK_PEER_GRACE_MS = 500;
 const ASK_PEER_POLL_MS = 200;
-const ASK_PEER_WAKE_TEXT =
-  "[oxtail] new peer message — run mcp__oxtail__read_my_messages and respond via mcp__oxtail__send_message";
+// Typed into the peer's TUI as a synthetic prompt, so it lands in their context
+// once per wake — kept terse. For HOOKED Claude Code the delivered envelope
+// carries the full reply instruction, but Codex and hookless Claude peers only
+// get raw mailbox JSON from read_my_messages — so the wake itself must preserve
+// the reply path (read → reply via send_message). Per Codex Phase-D review.
+export const ASK_PEER_WAKE_TEXT =
+  "[oxtail] peer msg — read_my_messages; reply via mcp__oxtail__send_message if asked";
 
 // Codex's TUI has a paste-burst heuristic at codex-rs/tui/src/bottom_pane/
 // paste_burst.rs (PASTE_BURST_MIN_CHARS=3, PASTE_BURST_CHAR_INTERVAL=8ms,
@@ -1435,36 +1533,18 @@ server.registerTool(
   async ({ target, body }, extra) => {
     const resolved = resolveTarget(target, entry);
     if (!resolved.ok) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ schema_version: 1, ...resolved }, null, 2),
-          },
-        ],
-      };
+      return jsonResult({ schema_version: 1, ...resolved });
     }
     const peer = resolved.entry;
     const expectedSessionId = peer.client.session_id;
     if (!expectedSessionId) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                schema_version: 1,
-                ok: false,
-                error: "peer-has-no-session-id",
-                message:
-                  "Target peer has no registered client.session_id. Ask the peer to call register_my_session before retrying ask_peer.",
-              },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
+      return jsonResult({
+        schema_version: 1,
+        ok: false,
+        error: "peer-has-no-session-id",
+        message:
+          "Target peer has no registered client.session_id. Ask the peer to call register_my_session before retrying ask_peer.",
+      });
     }
 
     // Stale-reply guard: evict any pre-existing messages from the target out
@@ -1568,32 +1648,21 @@ server.registerTool(
       timed_out: timedOut,
     });
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            {
-              schema_version: 1,
-              ok: true,
-              message_id: msg.id,
-              wake_status: wakeStatus,
-              reply: reply
-                ? {
-                    id: reply.id,
-                    body: reply.body,
-                    enqueued_at: reply.enqueued_at,
-                    from_session_id: reply.from_session_id ?? null,
-                  }
-                : null,
-              timed_out: timedOut,
-            },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
+    return jsonResult({
+      schema_version: 1,
+      ok: true,
+      message_id: msg.id,
+      wake_status: wakeStatus,
+      reply: reply
+        ? {
+            id: reply.id,
+            body: reply.body,
+            enqueued_at: reply.enqueued_at,
+            from_session_id: reply.from_session_id ?? null,
+          }
+        : null,
+      timed_out: timedOut,
+    });
   },
 );
 

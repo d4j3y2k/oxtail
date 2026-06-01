@@ -143,7 +143,7 @@ output=$(awk '
   END {
     if (count == 0) exit 0
     r = "[oxtail] " count " new peer message(s) arrived as you finished your turn. Read them and respond before stopping."
-    r = r "\\nIf a message asks for a response and from_session_id is present, reply with mcp__oxtail__send_message using that UUID as target."
+    r = r "\\nReply to any that need it via mcp__oxtail__send_message (target = the from_session_id below)."
     for (j = 0; j < count; j++) {
       r = r "\\n\\n--- message " (j + 1) " ---"
       if (ids[j] != "") r = r "\\nmessage_id: " ids[j]
