@@ -94,14 +94,23 @@ const TMUX_LIST_FORMAT =
 
 const TMUX_PANES_FORMAT = "#{session_name}|#{pane_current_path}";
 
-function inferProjectRoot(start: string): string {
+type ProjectRootLookup = {
+  root: string;
+  foundGit: boolean;
+};
+
+function findProjectRoot(start: string): ProjectRootLookup {
   let dir = start;
   while (true) {
-    if (existsSync(join(dir, ".git"))) return dir;
+    if (existsSync(join(dir, ".git"))) return { root: dir, foundGit: true };
     const parent = dirname(dir);
-    if (parent === dir) return start;
+    if (parent === dir) return { root: start, foundGit: false };
     dir = parent;
   }
+}
+
+function inferProjectRoot(start: string): string {
+  return findProjectRoot(start).root;
 }
 
 function safeRealpath(p: string): string {
@@ -116,6 +125,19 @@ function isDescendantOrEqual(child: string, root: string): boolean {
   if (child === root) return true;
   const rootWithSep = root.endsWith(sep) ? root : root + sep;
   return child.startsWith(rootWithSep);
+}
+
+function pathBelongsToProjectScope(path: string, resolvedRoot: string): boolean {
+  const resolvedPath = safeRealpath(path);
+  if (!isDescendantOrEqual(resolvedPath, resolvedRoot)) return false;
+
+  const project = findProjectRoot(resolvedPath);
+  if (!project.foundGit) return true;
+
+  // A nested repository under the requested root is a separate project. The
+  // descendant check above is necessary for subdirectories of the same repo,
+  // but by itself it leaks nested project sessions across the project boundary.
+  return safeRealpath(project.root) === resolvedRoot;
 }
 
 function listTmuxSessionsRaw(): {
@@ -213,10 +235,10 @@ export function buildListResult(input: { project_root?: string }): ListResult {
   const { rows, error } = listTmuxSessionsRaw();
   const paneCwds = listTmuxPaneCwds();
   const matched = rows.filter((s) => {
-    if (isDescendantOrEqual(s.path, resolvedRoot)) return true;
+    if (pathBelongsToProjectScope(s.path, resolvedRoot)) return true;
     const cwds = paneCwds.get(s.name);
     if (!cwds) return false;
-    return cwds.some((p) => isDescendantOrEqual(safeRealpath(p), resolvedRoot));
+    return cwds.some((p) => pathBelongsToProjectScope(p, resolvedRoot));
   });
 
   const sessions = joinSessionsWithRegistry(matched, readAll());
@@ -253,7 +275,7 @@ function anyPaneInScope(canonical: string, resolvedRoot: string): boolean {
   }
   for (const line of raw.split("\n")) {
     const p = line.trim();
-    if (p && isDescendantOrEqual(safeRealpath(p), resolvedRoot)) return true;
+    if (p && pathBelongsToProjectScope(p, resolvedRoot)) return true;
   }
   return false;
 }
@@ -274,9 +296,8 @@ function resolveSessionInScope(name: string, resolvedRoot: string): ScopeResolut
     const matched = readAll().filter((e) => e.client.session_id === name);
     if (matched.length === 1) {
       const reg = matched[0];
-      const cwd = safeRealpath(reg.client.cwd);
       return {
-        inScope: isDescendantOrEqual(cwd, resolvedRoot),
+        inScope: pathBelongsToProjectScope(reg.client.cwd, resolvedRoot),
         canonicalName: reg.tmux_session,
         sessionPath: reg.client.cwd,
         registryEntry: reg,
@@ -299,9 +320,8 @@ function resolveSessionInScope(name: string, resolvedRoot: string): ScopeResolut
   }
   const reg = regs[0];
   if (reg) {
-    const cwd = safeRealpath(reg.client.cwd);
     return {
-      inScope: isDescendantOrEqual(cwd, resolvedRoot),
+      inScope: pathBelongsToProjectScope(reg.client.cwd, resolvedRoot),
       canonicalName: reg.tmux_session,
       sessionPath: reg.client.cwd,
       registryEntry: reg,
@@ -321,7 +341,7 @@ function resolveSessionInScope(name: string, resolvedRoot: string): ScopeResolut
   if (!canonical || !path) {
     return { inScope: false, canonicalName: null, sessionPath: null, registryEntry: null };
   }
-  const sessionInScope = isDescendantOrEqual(safeRealpath(path), resolvedRoot);
+  const sessionInScope = pathBelongsToProjectScope(path, resolvedRoot);
   const inScope = sessionInScope || anyPaneInScope(canonical, resolvedRoot);
   return {
     inScope,
@@ -933,12 +953,25 @@ type ResolveErr =
   | { ok: false; error: "self-send" };
 
 function projectRootsMatch(caller: RegistryEntry, peer: RegistryEntry): boolean {
-  const myRoot = safeRealpath(inferProjectRoot(caller.client.cwd));
-  const peerRoot = safeRealpath(inferProjectRoot(peer.client.cwd));
-  if (myRoot === peerRoot) return true;
-  if (isDescendantOrEqual(safeRealpath(peer.client.cwd), myRoot)) return true;
-  if (isDescendantOrEqual(safeRealpath(caller.client.cwd), peerRoot)) return true;
-  return false;
+  const callerProject = findProjectRoot(caller.client.cwd);
+  const peerProject = findProjectRoot(peer.client.cwd);
+  const callerRoot = safeRealpath(callerProject.root);
+  const peerRoot = safeRealpath(peerProject.root);
+
+  if (callerProject.foundGit || peerProject.foundGit) {
+    return callerProject.foundGit && peerProject.foundGit && callerRoot === peerRoot;
+  }
+
+  // No .git boundary exists for either side. Preserve the pre-v0.8 loose
+  // behavior for ad-hoc directories so two agents in parent/child cwd under the
+  // same scratch tree can still coordinate.
+  const callerCwd = safeRealpath(caller.client.cwd);
+  const peerCwd = safeRealpath(peer.client.cwd);
+  return (
+    callerRoot === peerRoot ||
+    isDescendantOrEqual(peerCwd, callerRoot) ||
+    isDescendantOrEqual(callerCwd, peerRoot)
+  );
 }
 
 function isAliveLocal(pid: number): boolean {

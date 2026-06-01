@@ -635,6 +635,33 @@ test("messaging: send_message cross-project rejected", async () => {
   }
 });
 
+test("messaging: nested git repository is cross-project, not descendant scope", async () => {
+  const parent = mkdtempSync(join(tmpdir(), "oxtail-parent-project-"));
+  const nested = join(parent, "nested");
+  mkdirSync(join(parent, ".git"), { recursive: true });
+  mkdirSync(join(nested, ".git"), { recursive: true });
+
+  const server = await spawnServer({ cwd: parent });
+  try {
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: "abababab-abab-abab-abab-abababababab",
+      tmux_session: "nested-project-peer",
+      cwd: nested,
+    });
+
+    const sent = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: "nested-project-peer",
+      body: "should not cross nested project boundary",
+    });
+    assert.equal(sent.ok, false);
+    assert.equal((sent as SendErr).error, "cross-project");
+  } finally {
+    await server.cleanup();
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
 test("messaging: send_message to unknown target returns target-not-found", async () => {
   const server = await spawnServer();
   try {
