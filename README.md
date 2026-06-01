@@ -61,8 +61,8 @@ Contributing? `git clone https://github.com/d4j3y2k/oxtail && cd oxtail && npm i
 
 ## MCP tools
 
-- `list_project_sessions` — tmux sessions in or under a given project root, enriched with `client_type`, `client_session_id`, and the peer's `state` card. Returns **one row per registered agent** — rows may share `name` when peers share a tmux session (Terminator multi-window). Disambiguate via `client_session_id`.
-- `read_session` — the recent transcript of a peer session, as clean per-turn messages when the peer is oxtail-aware (Claude Code and Codex CLI), or as raw tmux pane text otherwise. Accepts a tmux session name OR a `client_session_id` UUID; an ambiguous tmux name returns `ambiguous-target` with the candidate UUIDs.
+- `list_project_sessions` — tmux sessions in or under a given project root, enriched with `client_type`, `client_session_id`, and the peer's `state` card. Returns **one row per registered agent** — rows may share `name` when peers share a tmux session (Terminator multi-window). Disambiguate via `client_session_id`. Pass `compact: true` for a de-duplicated `tmux_sessions[]` shape that hoists the shared tmux fields and nests agents (smaller when several agents share a session); the default flat `sessions[]` shape is unchanged.
+- `read_session` — the recent transcript of a peer session, as clean per-turn messages when the peer is oxtail-aware (Claude Code and Codex CLI), or as raw tmux pane text otherwise. Accepts a tmux session name OR a `client_session_id` UUID; an ambiguous tmux name returns `ambiguous-target` with the candidate UUIDs. Transcript reads are **budgeted** so a casual read can't blow your context window: by default the last 20 messages and ~24KB of text (newest-first), per-message ISO timestamps omitted. `count_truncated` / `bytes_truncated` say which budget bit; raise `limit` + `max_bytes` to pull more, set `include_timestamps: true` to keep timestamps, and pass `tail_scan: true` to read the file tail without parsing the whole transcript (qualifies `total_messages` via `total_messages_exact`).
 - `claim_session` — single-shot session registration. The routine path: `Bash echo $CLAUDE_CODE_SESSION_ID` (or `$CODEX_THREAD_ID` for Codex) → `claim_session({ session_id })`. Returns `{ ok, session_id, transcript_path }`.
 - `set_my_state` — write a small "state card" onto this session's registry entry so peers can see what we're doing without reading our transcript. v1 surfaces a single field, `purpose` (≤200 chars).
 - `send_message` — **fire-and-forget** message to a peer. Target is a tmux session name or a raw `client_session_id` UUID. Body ≤ 8KB. Delivery is async via the peer's mailbox file. By default does **not** wake an idle peer; pass `wake: "auto"` to nudge one (state-gated — see [Waking an idle peer](#waking-an-idle-peer)). (v0.5+)
@@ -79,9 +79,11 @@ See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.9.1/AGENTS.md)
 claim_session({ session_id: "<uuid from $CLAUDE_CODE_SESSION_ID or $CODEX_THREAD_ID>" })
 set_my_state({ purpose: "wiring up state cards" })
 list_project_sessions({ project_root: "/path/to/project" })
-read_session({ name: "primary" })                    // auto: transcript if peer registered, else pane
-read_session({ name: "claude", mode: "transcript", limit: 50 })
-read_session({ name: "primary", mode: "pane", pane_lines: 500 })
+read_session({ name: "primary" })                    // auto: transcript if peer registered, else pane (budgeted: last 20 msgs, ~24KB)
+read_session({ name: "claude", mode: "transcript", limit: 50, max_bytes: 60000 })  // pull more
+read_session({ name: "claude", mode: "transcript", include_timestamps: true })      // keep ISO timestamps
+read_session({ name: "claude", mode: "transcript", tail_scan: true })               // fast tail read on huge transcripts
+read_session({ name: "primary", mode: "pane", pane_lines: 500, pane_max_chars: 40000 })
 read_session({ name: "<peer-uuid>", mode: "transcript" })   // UUID form: needed when peers share a tmux session
 send_message({ target: "primary", body: "<system-reminder>checking in</system-reminder>" })
 send_message({ target: "<peer-uuid>", body: "..." })        // UUID form: same disambiguation
@@ -94,7 +96,7 @@ Omitting `project_root` triggers a best-effort `.git`-ancestor walk from the ser
 
 ## Peer awareness without raw transcripts
 
-The cheapest way to learn what peers are doing is `list_project_sessions`. Each row carries an optional `state` card written by the peer via `set_my_state` — currently `{ purpose, updated_at }`. Reading the card costs almost nothing compared to `read_session`, which spends tokens on the full transcript. Use `read_session` when the card isn't enough.
+The cheapest way to learn what peers are doing is `list_project_sessions`. Each row carries an optional `state` card written by the peer via `set_my_state` — currently `{ purpose, updated_at }`. Reading the card costs almost nothing compared to `read_session`, which — even budgeted (last 20 messages / ~24KB by default) — spends real tokens on transcript content. Use `read_session` when the card isn't enough.
 
 ## Peer messaging (v0.5)
 

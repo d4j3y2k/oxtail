@@ -1,7 +1,22 @@
 import { strict as assert } from "node:assert";
 import { execFileSync } from "node:child_process";
 import { test } from "node:test";
-import { askPeerWakeImpl } from "./server.js";
+import { ASK_PEER_WAKE_TEXT, askPeerWakeImpl } from "./server.js";
+
+// Phase D: the wake prompt is trimmed, but because Codex / hookless Claude peers
+// see only raw mailbox JSON (no reply instruction) after waking, the wake text
+// itself MUST preserve the read→reply path. Guards against a future over-trim.
+test("wake text stays terse but keeps the read + reply path", () => {
+  assert.ok(ASK_PEER_WAKE_TEXT.includes("read_my_messages"), "wake text points at the inbox");
+  assert.ok(
+    ASK_PEER_WAKE_TEXT.includes("send_message"),
+    "wake text preserves the reply path (send_message) for hookless peers",
+  );
+  assert.ok(
+    Buffer.byteLength(ASK_PEER_WAKE_TEXT, "utf8") < 100,
+    "wake text stays terse (< 100 bytes)",
+  );
+});
 
 // Opt-in tmux behavior test. Verifies the paste-burst-aware wake actually
 // submits to a running shell, end-to-end. Gated on OXTAIL_TMUX_TESTS=1 because

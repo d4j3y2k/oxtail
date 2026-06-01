@@ -124,6 +124,14 @@ test("hook: stdin happy path — single message becomes additionalContext", asyn
     assert.ok(ctx.includes("message_id:"));
     assert.ok(ctx.includes(`from_session_id: ${senderSid}`));
     assert.ok(ctx.includes("body:\nhello from peer"));
+    // Phase D: reply instruction trimmed to the terse form; the verbose
+    // pre-Phase-D sentence is gone; message_id + from_session_id are retained
+    // (Codex constraint: keep both for reply routing + dup/loss debugging).
+    assert.ok(
+      ctx.includes("Reply to any that need it via mcp__oxtail__send_message"),
+      "terse reply instruction present",
+    );
+    assert.ok(!ctx.includes("using that UUID as target"), "verbose instruction removed");
 
     // Mailbox truncated.
     assert.equal(readFileSync(mailboxFilePath(peerPid), "utf8"), "");

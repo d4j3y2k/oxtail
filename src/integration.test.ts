@@ -381,6 +381,182 @@ test("integration: read_session reads a transcript-capable peer with no tmux ses
   }
 });
 
+test("integration: list_project_sessions compact:true returns grouped shape; default stays flat", async () => {
+  const server = await spawnServer();
+  try {
+    // Default shape: flat sessions[] (backward compatible).
+    const flat = JSON.parse(await callToolRaw(server.client, "list_project_sessions")) as Record<string, unknown>;
+    assert.ok("sessions" in flat, "default response carries sessions[]");
+    assert.ok(!("tmux_sessions" in flat), "default response has no tmux_sessions");
+    assert.ok(Array.isArray(flat.sessions));
+
+    // compact:true flips to the grouped tmux_sessions[] shape and drops the flat
+    // rows. (Empty arrays here since the temp cwd matches no tmux session — we're
+    // asserting the wiring/shape, which is what the compact branch controls.)
+    const compact = JSON.parse(
+      await callToolRaw(server.client, "list_project_sessions", { compact: true }),
+    ) as Record<string, unknown>;
+    assert.ok("tmux_sessions" in compact, "compact response carries tmux_sessions[]");
+    assert.ok(!("sessions" in compact), "compact response drops the flat sessions[]");
+    assert.ok(Array.isArray(compact.tmux_sessions));
+    assert.equal(compact.schema_version, 1);
+    assert.equal(typeof compact.project_root, "string");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+type ReadSessionTranscript = ReadSessionResponse & {
+  messages: Array<{ role: string; text: string; timestamp: string | null }> | null;
+  truncated: boolean;
+  count_truncated: boolean;
+  bytes_truncated: boolean;
+  total_messages: number | null;
+  total_messages_exact: boolean;
+};
+
+test("integration: read_session applies count + byte budgets through the tool boundary", async () => {
+  const server = await spawnServer();
+  try {
+    const me = await callTool<GetMySessionResponse>(server.client, "get_my_session");
+    const projectRoot = me.entry.client.cwd;
+
+    // 8 sizeable user turns (~1KB each) so both the count cap and the byte cap
+    // engage on a single read.
+    const transcriptPath = join(server.home, "codex-rollout-budget.jsonl");
+    const lines = Array.from({ length: 8 }, (_, i) => ({
+      type: "response_item",
+      timestamp: `2026-05-08T13:28:0${i}.000Z`,
+      payload: {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: `m${i}-${"z".repeat(1000)}` }],
+      },
+    }));
+    writeFileSync(transcriptPath, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+
+    const codexUuid = "019e7d25-bdb4-7f90-a422-795f18cbd222";
+    const sessionsDir = join(server.home, ".oxtail", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(
+      join(sessionsDir, `${process.pid}.json`),
+      JSON.stringify(
+        {
+          server_pid: process.pid,
+          started_at: Math.floor(Date.now() / 1000),
+          client: {
+            type: "codex",
+            session_id: codexUuid,
+            transcript_path: transcriptPath,
+            session_id_source: "self-register",
+            cwd: projectRoot,
+          },
+          tmux_pane: null,
+          tmux_session: null,
+        },
+        null,
+        2,
+      ),
+    );
+
+    // limit 3 (count cap) + max_bytes 2500 (byte cap). Tail of 3 is ~3KB > 2500,
+    // so the oldest of the three gets head-truncated; the newest stays intact.
+    const r = await callTool<ReadSessionTranscript>(server.client, "read_session", {
+      name: codexUuid,
+      project_root: projectRoot,
+      limit: 3,
+      max_bytes: 2500,
+    });
+
+    assert.equal(r.mode, "transcript", `expected transcript, got ${r.mode} err=${r.error}`);
+    assert.equal(r.total_messages, 8, "total reflects all 8 turns");
+    assert.equal(r.messages!.length, 3, "count cap returns at most 3");
+    assert.equal(r.count_truncated, true, "8 > limit 3 → count_truncated");
+    assert.equal(r.bytes_truncated, true, "tail exceeds max_bytes → bytes_truncated");
+    assert.equal(r.truncated, true, "catch-all truncated flag set");
+    // Tail-preserving: the newest message is present and intact.
+    const newest = r.messages![r.messages!.length - 1]!;
+    assert.ok(newest.text.startsWith("m7-"), "newest turn is the last one in the file");
+    assert.ok(!newest.text.includes("truncated]"), "newest turn is not byte-truncated");
+    // Oldest returned message is the one head-truncated by the byte budget.
+    assert.match(r.messages![0]!.text, /truncated\]$/, "boundary message carries the marker");
+    // Timestamps gated off by default.
+    assert.equal(newest.timestamp, null, "timestamps null unless include_timestamps");
+
+    // Opt back in: timestamps surface.
+    const withTs = await callTool<ReadSessionTranscript>(server.client, "read_session", {
+      name: codexUuid,
+      project_root: projectRoot,
+      limit: 1,
+      include_timestamps: true,
+    });
+    assert.equal(withTs.messages![0]!.timestamp, "2026-05-08T13:28:07.000Z");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("integration: read_session tail_scan path returns newest turns and qualifies total", async () => {
+  const server = await spawnServer();
+  try {
+    const me = await callTool<GetMySessionResponse>(server.client, "get_my_session");
+    const projectRoot = me.entry.client.cwd;
+
+    const transcriptPath = join(server.home, "codex-rollout-tail.jsonl");
+    const lines = Array.from({ length: 10 }, (_, i) => ({
+      type: "response_item",
+      timestamp: `2026-05-08T13:30:0${i}.000Z`,
+      payload: { type: "message", role: "user", content: [{ type: "input_text", text: `turn ${i}` }] },
+    }));
+    writeFileSync(transcriptPath, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+
+    const codexUuid = "019e7d25-bdb4-7f90-a422-795f18cbd333";
+    const sessionsDir = join(server.home, ".oxtail", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(
+      join(sessionsDir, `${process.pid}.json`),
+      JSON.stringify(
+        {
+          server_pid: process.pid,
+          started_at: Math.floor(Date.now() / 1000),
+          client: { type: "codex", session_id: codexUuid, transcript_path: transcriptPath, session_id_source: "self-register", cwd: projectRoot },
+          tmux_pane: null,
+          tmux_session: null,
+        },
+        null,
+        2,
+      ),
+    );
+
+    // tail_scan with a small limit: newest turns, total qualified as inexact.
+    const capped = await callTool<ReadSessionTranscript>(server.client, "read_session", {
+      name: codexUuid,
+      project_root: projectRoot,
+      tail_scan: true,
+      limit: 2,
+    });
+    assert.equal(capped.mode, "transcript", `err=${capped.error}`);
+    assert.deepEqual(capped.messages!.map((m) => m.text), ["turn 8", "turn 9"], "newest two turns");
+    assert.equal(capped.count_truncated, true);
+    assert.equal(capped.total_messages, null, "total unknown when tail scan stops early");
+    assert.equal(capped.total_messages_exact, false);
+
+    // tail_scan with a high limit reaches start → exact total, all messages.
+    const whole = await callTool<ReadSessionTranscript>(server.client, "read_session", {
+      name: codexUuid,
+      project_root: projectRoot,
+      tail_scan: true,
+      limit: 1000,
+    });
+    assert.equal(whole.messages!.length, 10);
+    assert.equal(whole.total_messages, 10);
+    assert.equal(whole.total_messages_exact, true);
+    assert.equal(whole.count_truncated, false);
+  } finally {
+    await server.cleanup();
+  }
+});
+
 test("integration: read_session ambiguous tmux name returns candidates", async () => {
   const server = await spawnServer();
   try {
@@ -1470,6 +1646,71 @@ test("messaging: send_message without wake carries no wake_status (contract pres
     });
     assert.equal(res.ok, true);
     assert.equal(res.wake_status, undefined, "default send_message must not wake");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase A — response serialization is minified (no pretty-print whitespace)
+// ────────────────────────────────────────────────────────────────────────────
+
+// Read the raw response text for a tool (callTool parses; here we need the
+// on-the-wire string to assert it carries no indentation/newlines).
+async function callToolRaw(
+  client: Client,
+  name: string,
+  args: Record<string, unknown> = {},
+): Promise<string> {
+  const result = await client.callTool({ name, arguments: args });
+  const content = result.content as Array<{ type: string; text: string }>;
+  return content.find((c) => c.type === "text")?.text ?? "";
+}
+
+test("phase-a: tool responses are minified JSON, schema fields intact, smaller than pretty", async () => {
+  const server = await spawnServer();
+  try {
+    // get_my_session returns a deeply NESTED object — the strongest proof that
+    // minification reaches nested structures, not just the top level.
+    const text = await callToolRaw(server.client, "get_my_session");
+    assert.ok(text.length > 0, "response must carry text");
+
+    // Whitespace-gone, two independent ways:
+    //  (1) JSON.stringify escapes any newline INSIDE a string value as the two
+    //      chars backslash-n, never a literal 0x0A byte. So the only possible
+    //      source of a literal newline in the payload is pretty-print indentation.
+    assert.ok(
+      !text.includes("\n"),
+      `minified response must contain no literal newline (pretty-print leak): ${text.slice(0, 80)}`,
+    );
+    //  (2) An already-minified payload round-trips to byte-identical output.
+    //      A pretty-printed one would not.
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    assert.equal(text, JSON.stringify(parsed), "response text must already be minified");
+
+    //  (3) Explicit size assertion: the minified form is strictly smaller than
+    //      the pretty form would have been — the token win, quantified in-test.
+    const prettyLen = JSON.stringify(parsed, null, 2).length;
+    assert.ok(
+      text.length < prettyLen,
+      `minified length (${text.length}) must be < pretty length (${prettyLen})`,
+    );
+
+    // Serialization-only change: every field is preserved (no renames/removals).
+    assert.equal(parsed.schema_version, 1, "schema_version preserved");
+    assert.ok("entry" in parsed, "entry field preserved");
+    assert.ok("detect_diagnosis" in parsed, "detect_diagnosis field preserved");
+    const entry = parsed.entry as Record<string, unknown>;
+    assert.ok("client" in entry, "nested entry.client preserved");
+
+    // A second tool with a top-level ARRAY (list_project_sessions) — confirms the
+    // shared jsonResult() helper minifies array-bearing payloads too.
+    const listText = await callToolRaw(server.client, "list_project_sessions");
+    assert.ok(!listText.includes("\n"), "list response must contain no literal newline");
+    const listParsed = JSON.parse(listText) as Record<string, unknown>;
+    assert.equal(listText, JSON.stringify(listParsed), "list response must be minified");
+    assert.equal(listParsed.schema_version, 1, "list schema_version preserved");
+    assert.ok(Array.isArray(listParsed.sessions), "sessions[] shape preserved");
   } finally {
     await server.cleanup();
   }
