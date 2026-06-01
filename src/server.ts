@@ -567,14 +567,14 @@ function allAbstentionsStructural(diagnosis: DetectDiagnosis | null): boolean {
   return outcomes.every((o) => isAbstain(o) && o.structural === true);
 }
 
-server.server.oninitialized = (): void => {
+function refineFromHandshake(trigger: string): ReturnType<typeof diagnoseDetect> | null {
   const info = server.server.getClientVersion();
-  if (!info) return;
+  if (!info) return null;
   const { client: refined, diagnosis } = enrichWithDiagnosis(
     clientFromHandshake(info),
     entry.started_at,
   );
-  emitDetectTrace("oninitialized", diagnosis);
+  emitDetectTrace(trigger, diagnosis);
   // Refine from the handshake, but never let a re-detect that resolved nothing
   // wipe an already-resolved session_id (e.g. one recovered via sticky-claim at
   // startup). Keep our id/source/transcript unless the handshake resolved an id.
@@ -593,6 +593,11 @@ server.server.oninitialized = (): void => {
   // The handshake may have just revealed the client type (e.g. unknown→codex);
   // sticky recovery can apply now even if it couldn't at startup.
   maybeRecoverStickyClaim();
+  return diagnosis;
+}
+
+server.server.oninitialized = (): void => {
+  const diagnosis = refineFromHandshake("oninitialized");
   // After type is known via handshake, schedule retries to catch transcript files
   // that don't exist yet at handshake time. No-op if session_id is already set.
   if (!entry.client.session_id && entry.client.type !== "unknown") {
@@ -734,6 +739,11 @@ function maybeRecoverStickyClaim(): void {
   });
   // Refresh the record so it carries our new server_pid going forward.
   persistStickyClaim();
+  // Recovery mutates the in-memory registry entry. When recovery happens after
+  // the MCP initialize handshake revealed the client type, we may already have
+  // written a null-session entry; publish the recovered id immediately so peers
+  // do not see this agent as unclaimed until another write happens.
+  register(entry);
 }
 
 server.registerTool(
@@ -816,6 +826,11 @@ server.registerTool(
     inputSchema: {},
   },
   async () => {
+    // Some MCP clients make getClientVersion available before the oninitialized
+    // callback has run. Refining here makes the first explicit self-check repair
+    // type/session state instead of returning a transient unknown/null registry
+    // entry.
+    refineFromHandshake("get_my_session");
     let diagnosis;
     if (entry.client.session_id) {
       // Registry is authoritative. Skip detection I/O entirely and surface
@@ -979,8 +994,13 @@ function resolveTarget(target: string, caller: RegistryEntry): ResolveOk | Resol
     };
   }
   const peer = candidates[0];
-  // Self-send by pid (definitive identity), not by tmux name / session_id.
-  if (peer.server_pid === caller.server_pid) return { ok: false, error: "self-send" };
+  if (
+    peer.server_pid === caller.server_pid ||
+    (caller.client.session_id &&
+      peer.client.session_id === caller.client.session_id)
+  ) {
+    return { ok: false, error: "self-send" };
+  }
   if (!projectRootsMatch(caller, peer)) return { ok: false, error: "cross-project" };
   return { ok: true, entry: peer };
 }

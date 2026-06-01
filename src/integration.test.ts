@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -705,6 +705,34 @@ test("messaging: send_message to self by pid returns self-send", async () => {
   }
 });
 
+test("messaging: send_message to same agent session_id through a sibling MCP child is self-send", async () => {
+  const server = await spawnServer();
+  try {
+    const myUuid = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+    await callTool(server.client, "claim_session", { session_id: myUuid });
+
+    // Simulate a fresher live sibling from a dual-scope MCP setup. readAll()
+    // collapses duplicate session_ids to this sibling, so pid-only self-send
+    // detection would incorrectly enqueue to our own other MCP child.
+    seedPeerEntry(server.home, {
+      server_pid: process.ppid,
+      started_at: Math.floor(Date.now() / 1000) + 10,
+      session_id: myUuid,
+      tmux_session: "self-sibling",
+      cwd: server.home,
+    });
+
+    const sent = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: myUuid,
+      body: "echo through sibling",
+    });
+    assert.equal(sent.ok, false);
+    assert.equal((sent as SendErr).error, "self-send");
+  } finally {
+    await server.cleanup();
+  }
+});
+
 test("messaging: send_message to stale registry entry (dead pid) returns target-not-found", async () => {
   const server = await spawnServer();
   try {
@@ -1254,6 +1282,88 @@ test("integration: a restarted Codex MCP child recovers its session via sticky c
     const me = await callTool<GetMySessionResponse>(s2.client, "get_my_session");
     assert.equal(me.entry.client.session_id, sessionId, "restarted child should recover the claimed session id");
     assert.equal(me.entry.client.session_id_source, "sticky-claim");
+  } finally {
+    if (s1) await s1.cleanup();
+    if (s2) await s2.cleanup();
+    rmSync(sharedHome, { recursive: true, force: true });
+  }
+});
+
+test("integration: sticky claim recovered after handshake is written back to registry", async () => {
+  // Claude Code's session id is normally absent from the MCP child env, so the
+  // first moment we know the client type can be the initialize handshake. This
+  // covers the path where sticky recovery happens after an initial null-session
+  // registry write.
+  const sharedHome = mkdtempSync(join(tmpdir(), "oxtail-sticky-claude-int-"));
+  const sharedCwd = realpathSync(sharedHome);
+  const sessionId = "b61d166f-cbe0-4881-bbe2-6af461e5c787";
+  const projectDir = join(
+    sharedHome,
+    ".claude",
+    "projects",
+    sharedCwd.replace(/\//g, "-"),
+  );
+  mkdirSync(projectDir, { recursive: true });
+  writeFileSync(join(projectDir, `${sessionId}.jsonl`), "\n");
+
+  let s1: Awaited<ReturnType<typeof spawnServer>> | undefined;
+  let s2: Awaited<ReturnType<typeof spawnServer>> | undefined;
+  try {
+    s1 = await spawnServer({
+      cwd: sharedCwd,
+      clientName: "claude-code",
+      extraEnv: { HOME: sharedHome, CLAUDECODE: "1" },
+    });
+    const claim = await callTool<{ ok: boolean; session_id: string; transcript_path: string | null }>(
+      s1.client,
+      "claim_session",
+      { session_id: sessionId },
+    );
+    assert.equal(claim.session_id, sessionId);
+    assert.ok(claim.transcript_path, "claim must persist a transcript-backed sticky record");
+    await s1.cleanup();
+    s1 = undefined;
+    assert.equal(
+      readdirSync(join(sharedHome, ".oxtail", "claims")).filter((f) => f.endsWith(".json")).length,
+      1,
+      "first child must leave one sticky claim record for the restart",
+    );
+
+    const prevHome = process.env.HOME;
+    process.env.HOME = sharedHome;
+    try {
+      for (let i = 0; i < 100; i++) {
+        if (!readAll().some((e) => e.client.session_id === sessionId)) break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    } finally {
+      process.env.HOME = prevHome;
+    }
+    // Keep the transcript birth time clearly before the restarted child's
+    // started_at second. Otherwise second-resolution started_at can make a
+    // same-second transcript look post-start and let birth-time win instead of
+    // exercising sticky recovery.
+    await new Promise((r) => setTimeout(r, 1100));
+
+    s2 = await spawnServer({
+      cwd: sharedCwd,
+      clientName: "claude-code",
+      extraEnv: { HOME: sharedHome },
+    });
+    const me = await callTool<GetMySessionResponse>(s2.client, "get_my_session");
+    assert.equal(me.entry.client.session_id, sessionId);
+    assert.equal(me.entry.client.session_id_source, "sticky-claim");
+
+    const prevHomeForRegistry = process.env.HOME;
+    process.env.HOME = sharedHome;
+    try {
+      assert.ok(
+        readAll().some((e) => e.client.session_id === sessionId),
+        "recovered sticky claim must be visible to peers through the registry",
+      );
+    } finally {
+      process.env.HOME = prevHomeForRegistry;
+    }
   } finally {
     if (s1) await s1.cleanup();
     if (s2) await s2.cleanup();

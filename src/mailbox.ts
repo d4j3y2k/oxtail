@@ -47,10 +47,7 @@ function lockPath(pid: number): string {
 }
 
 function sleepSync(ms: number): void {
-  const end = Date.now() + ms;
-  while (Date.now() < end) {
-    // tight spin — short enough (10ms) that this is acceptable
-  }
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 export function acquireLock(pid: number): void {
