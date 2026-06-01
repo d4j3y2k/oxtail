@@ -21,7 +21,7 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 **Claude Code** — add to `~/.claude.json` (global) or any project's `.mcp.json`:
 
 ```jsonc
-{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.9.1"] } } }
+{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.10.0"] } } }
 ```
 
 **Codex CLI** — add to `~/.codex/config.toml`:
@@ -29,14 +29,14 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 ```toml
 [mcp_servers.oxtail]
 command = "npx"
-args = ["-y", "oxtail@0.9.1"]
+args = ["-y", "oxtail@0.10.0"]
 ```
 
 **Claude slash command** (`/oxtail-join`):
 
 ```sh
 mkdir -p ~/.claude/commands
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.9.1/.claude/commands/oxtail-join.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.10.0/.claude/commands/oxtail-join.md \
   -o ~/.claude/commands/oxtail-join.md
 ```
 
@@ -44,9 +44,9 @@ curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.9.1/.claude/commands
 
 ```sh
 mkdir -p ~/.codex/skills/oxtail-join/agents
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.9.1/integrations/codex/oxtail-join/SKILL.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.10.0/integrations/codex/oxtail-join/SKILL.md \
   -o ~/.codex/skills/oxtail-join/SKILL.md
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.9.1/integrations/codex/oxtail-join/agents/openai.yaml \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.10.0/integrations/codex/oxtail-join/agents/openai.yaml \
   -o ~/.codex/skills/oxtail-join/agents/openai.yaml
 ```
 
@@ -71,7 +71,7 @@ Contributing? `git clone https://github.com/d4j3y2k/oxtail && cd oxtail && npm i
 - `register_my_session` — pin this MCP server's `session_id` directly. Kept for debugging; prefer `claim_session`.
 - `get_my_session` — return this MCP server's own registry entry plus a per-strategy detection diagnosis. Useful for debugging.
 
-See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.9.1/AGENTS.md) for scope and architecture.
+See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.10.0/AGENTS.md) for scope and architecture.
 
 ## Usage from an agent
 
@@ -216,7 +216,7 @@ Pane targeting can go stale: `tmux_pane` is cached at server startup, but tmux c
 If `ask_peer` returns an abort error before its built-in 45s timeout fires, your MCP client's tool-call ceiling is lower than 45s. Override the bound at server startup:
 
 ```sh
-OXTAIL_ASK_PEER_TIMEOUT_MS=30000 npx -y oxtail@0.9.1
+OXTAIL_ASK_PEER_TIMEOUT_MS=30000 npx -y oxtail@0.10.0
 ```
 
 The server reads the env var once at boot and uses it as the fixed timeout for all `ask_peer` calls in that session. Values must be positive numbers; anything else falls back to the 45000ms default.
