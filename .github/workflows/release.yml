@@ -1,0 +1,62 @@
+name: release
+
+# Publishes to npm when a version tag is pushed, using OIDC "trusted publishing"
+# — no npm token or 2FA OTP. npm verifies the workflow's GitHub identity directly,
+# and attaches a provenance attestation to the published package automatically.
+#
+# One-time setup on npmjs.com (package → Settings → Trusted Publisher → GitHub
+# Actions): owner `d4j3y2k`, repo `oxtail`, workflow `release.yml`.
+#
+# To cut a release: bump package.json version, commit, then
+#   git tag vX.Y.Z && git push origin vX.Y.Z
+# The tag must match the version in package.json (guarded below).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # required for OIDC trusted publishing + provenance
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+          cache: "npm"
+
+      # Trusted publishing requires a recent npm. Pin to a version that supports
+      # OIDC (>=11.5.1); the runner's bundled npm may lag.
+      - name: Ensure npm supports trusted publishing
+        run: npm install -g npm@latest
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - run: npm ci
+
+      # Guard: the pushed tag (vX.Y.Z) must match package.json's version, so a
+      # stray tag can't publish a mismatched version.
+      - name: Verify tag matches package.json version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "Tag $GITHUB_REF_NAME ($TAG) does not match package.json version $PKG" >&2
+            exit 1
+          fi
+          echo "Releasing v$PKG"
+
+      - run: npm test
+
+      - run: npm run build
+
+      # No NODE_AUTH_TOKEN: OIDC trusted publishing authenticates via id-token.
+      - name: Publish to npm
+        run: npm publish --provenance --access public
