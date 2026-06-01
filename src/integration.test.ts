@@ -1612,9 +1612,16 @@ test("integration: a restarted Codex MCP child recovers its session via sticky c
   const codexEnv = { HOME: sharedHome, CODEX_HOME: join(sharedHome, ".codex") };
   const sessionId = "019e7d25-bdb4-7f90-a422-795f18cbd07e";
 
-  // Place a Codex rollout so the claim resolves a non-null transcript_path
-  // (findCodexTranscriptPath scans ~/.codex/sessions/<recent>). Write into both
-  // UTC and local "today" dirs to stay clear of a date-boundary flake.
+  // Place Codex rollouts so the claim resolves a non-null transcript_path
+  // (findCodexTranscriptPath scans ~/.codex/sessions/<recent>). We seed TWO
+  // distinct session ids for this cwd on purpose: birth-time only resolves on
+  // exactly one post-start candidate (pickByDelta requires ranked.length === 1),
+  // so >=2 candidates force it to abstain and the restarted child must recover
+  // via the sticky claim. Without the decoy, a UTC CI runner collapses both day
+  // dirs into a single file and birth-time can win the startup race against
+  // sticky-claim under load, flaking the source attribution. Write into both UTC
+  // and local "today" dirs to also stay clear of a date-boundary flake.
+  const decoyId = "019e7d25-0000-7000-a000-0000000000de";
   const d = new Date();
   const dayDirs = [
     [d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate()],
@@ -1626,7 +1633,9 @@ test("integration: a restarted Codex MCP child recovers its session via sticky c
       String(y), String(m).padStart(2, "0"), String(day).padStart(2, "0"),
     );
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, `rollout-${sessionId}.jsonl`), JSON.stringify({ payload: { cwd: sharedHome } }) + "\n");
+    for (const id of [sessionId, decoyId]) {
+      writeFileSync(join(dir, `rollout-${id}.jsonl`), JSON.stringify({ payload: { cwd: sharedHome } }) + "\n");
+    }
   }
 
   let s1: Awaited<ReturnType<typeof spawnServer>> | undefined;
