@@ -277,6 +277,28 @@ test("stop: lock contention — held lock blocks the run; exits 0 without delive
   });
 });
 
+test("stop: all mailbox locks held → allow stop, preserve mailbox, mark idle", async () => {
+  await withHome(async (home) => {
+    const peerPid = 72023;
+    const sid = "23232323-aaaa-bbbb-cccc-232323232323";
+    register(fakeEntry(home, peerPid, sid));
+    enqueue(peerPid, "held but should survive");
+
+    const activityDir = join(home, ".oxtail", "activity");
+    mkdirSync(activityDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(activityDir, sid), "busy");
+
+    const lock = mailboxLockPath(peerPid);
+    mkdirSync(lock, { mode: 0o700 });
+
+    const r = await runHook({ HOME: home }, JSON.stringify({ session_id: sid, stop_hook_active: false }));
+    assert.equal(r.code, 0, `stderr: ${r.stderr}`);
+    assert.equal(r.stdout, "");
+    assert.ok(readFileSync(mailboxFilePath(peerPid), "utf8").includes("held but should survive"));
+    assert.equal(activityStatus(home, sid), "idle");
+  });
+});
+
 test("stop: stale lock (mtime 60s ago) is force-cleared and delivery proceeds", async () => {
   await withHome(async (home) => {
     const peerPid = 72010;

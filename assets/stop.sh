@@ -101,8 +101,11 @@ for m in "${mboxes[@]}"; do
     sleep 0.01
   done
 done
-# Couldn't lock anything → leave messages for next time; don't mark idle.
+# Couldn't lock anything → leave messages for next time. This still allows the
+# turn to stop, so mark idle; otherwise wake:auto will suppress a wake for a
+# peer that is no longer actually busy.
 if [ "${#locked[@]}" -eq 0 ]; then
+  mark_idle
   exit 0
 fi
 
