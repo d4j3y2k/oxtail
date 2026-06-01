@@ -21,7 +21,7 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 **Claude Code** — add to `~/.claude.json` (global) or any project's `.mcp.json`:
 
 ```jsonc
-{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.8.0"] } } }
+{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.9.0"] } } }
 ```
 
 **Codex CLI** — add to `~/.codex/config.toml`:
@@ -29,14 +29,14 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 ```toml
 [mcp_servers.oxtail]
 command = "npx"
-args = ["-y", "oxtail@0.8.0"]
+args = ["-y", "oxtail@0.9.0"]
 ```
 
 **Claude slash command** (`/oxtail-join`):
 
 ```sh
 mkdir -p ~/.claude/commands
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.8.0/.claude/commands/oxtail-join.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.9.0/.claude/commands/oxtail-join.md \
   -o ~/.claude/commands/oxtail-join.md
 ```
 
@@ -44,9 +44,9 @@ curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.8.0/.claude/commands
 
 ```sh
 mkdir -p ~/.codex/skills/oxtail-join/agents
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.8.0/integrations/codex/oxtail-join/SKILL.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.9.0/integrations/codex/oxtail-join/SKILL.md \
   -o ~/.codex/skills/oxtail-join/SKILL.md
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.8.0/integrations/codex/oxtail-join/agents/openai.yaml \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.9.0/integrations/codex/oxtail-join/agents/openai.yaml \
   -o ~/.codex/skills/oxtail-join/agents/openai.yaml
 ```
 
@@ -71,7 +71,7 @@ Contributing? `git clone https://github.com/d4j3y2k/oxtail && cd oxtail && npm i
 - `register_my_session` — pin this MCP server's `session_id` directly. Kept for debugging; prefer `claim_session`.
 - `get_my_session` — return this MCP server's own registry entry plus a per-strategy detection diagnosis. Useful for debugging.
 
-See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.5.0/AGENTS.md) for scope and architecture.
+See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.9.0/AGENTS.md) for scope and architecture.
 
 ## Usage from an agent
 
@@ -214,7 +214,7 @@ Pane targeting can go stale: `tmux_pane` is cached at server startup, but tmux c
 If `ask_peer` returns an abort error before its built-in 45s timeout fires, your MCP client's tool-call ceiling is lower than 45s. Override the bound at server startup:
 
 ```sh
-OXTAIL_ASK_PEER_TIMEOUT_MS=30000 npx -y oxtail@0.8.0
+OXTAIL_ASK_PEER_TIMEOUT_MS=30000 npx -y oxtail@0.9.0
 ```
 
 The server reads the env var once at boot and uses it as the fixed timeout for all `ask_peer` calls in that session. Values must be positive numbers; anything else falls back to the 45000ms default.
@@ -261,4 +261,11 @@ If `MCP_TRACE_FILE` is set in the environment, every detection run appends an ND
 
 ## Status
 
-v0.8.0. Builds on v0.7's per-client wake routing — Codex peers wake via a 500ms-gap send-keys sequence that defeats their TUI's paste-burst heuristic (verified live 2026-05-13). Claude Code peers, originally fail-fasted under a misread of the Claude Code hook catalog, now wake via the same send-keys mechanism without the gap (no paste-burst in Claude Code's TUI). An end-to-end falsifying experiment 2026-05-13 against the live `oxtail-claudejr` peer in this repo confirmed the full round-trip works: ask_peer enqueue → send-keys → peer entered a turn → PreToolUse hook drained mailbox → peer replied via send_message. The symmetric-matrix vision (Claude↔Claude, Claude↔Codex, both directions, no human relay) is intact. ask_peer's response gains a `wake_status` field for caller diagnostics; `skipped_unsupported` is now reserved for forward compat with hypothetical future unwakeable client_types rather than firing on any current client. Wake strategy is overridable via `OXTAIL_ASK_PEER_WAKE_STRATEGY=auto|legacy|off` as a rollback. See [issue #3](https://github.com/d4j3y2k/oxtail/issues/3) for the v0.7 spike findings.
+v0.9.0. Completes the autonomous peer-messaging matrix: a message reaches a Claude Code peer whether it's mid-turn, finishing, or fully idle — in both directions, with no human relay.
+
+- **Deliver-on-complete (Stop hook).** PreToolUse only fires before a tool call, so a text-only turn never triggered it. The new `Stop` hook closes that gap: a message that lands as the agent finishes a turn blocks the stop and is read + answered before it goes idle. Loop-safe via `stop_hook_active`.
+- **State-gated idle wake.** `send_message({ wake: "auto" })` nudges an idle peer via per-client `tmux send-keys`, gated off a busy/idle activity flag maintained by the `UserPromptSubmit`/`Stop` hooks — so it never types into a peer that's mid-turn. Returns `wake_status: fired | skipped_busy | skipped_no_target | disabled`. A Codex peer must be inside a tmux pane to be idle-woken (otherwise `skipped_no_target`, and delivery stays poll-based).
+- **Sticky Codex claim.** A restarted Codex MCP child — whose `CODEX_THREAD_ID` is stripped from its subprocess env — recovers its `session_id` from a persisted claim keyed by client type + cwd + a bounded process-ancestor chain, so identity survives an MCP restart without a manual re-claim.
+- **Identity hardening.** Hooks and activity key on `client.session_id` (never `server_pid`), so a dual-scope agent's sibling MCP children act as one identity; delivery hooks drain all sibling mailboxes; nested git repos are treated as separate projects for scope matching.
+
+Builds on v0.7's per-client wake routing (verified live 2026-05-13): Codex peers wake via a 500ms-gap send-keys sequence that defeats their TUI's paste-burst heuristic; Claude Code peers wake via the same mechanism without the gap (no paste-burst in its TUI). `OXTAIL_ASK_PEER_WAKE_STRATEGY=auto|legacy|off` remains as a rollback. See [issue #3](https://github.com/d4j3y2k/oxtail/issues/3) for the v0.7 spike findings.
