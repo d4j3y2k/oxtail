@@ -1,12 +1,12 @@
 import { strict as assert } from "node:assert";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { register, type RegistryEntry } from "./registry.js";
+import { readAll, register, type RegistryEntry } from "./registry.js";
 import { drain, enqueue } from "./mailbox.js";
 
 const SERVER_ENTRY = resolve(import.meta.dirname, "server.ts");
@@ -313,6 +313,74 @@ test("integration: read_session accepts in-scope peer entry", async () => {
   }
 });
 
+test("integration: read_session reads a transcript-capable peer with no tmux session (Codex)", async () => {
+  const server = await spawnServer();
+  try {
+    const me = await callTool<GetMySessionResponse>(server.client, "get_my_session");
+    const projectRoot = me.entry.client.cwd;
+
+    // A Codex-style peer: in scope, has a transcript_path, but NO tmux binding
+    // (it runs outside tmux, so tmux_session is null). Before the fix this was
+    // wrongly rejected as "not in project scope" because canonicalName was null
+    // even though the transcript is perfectly readable without a tmux pane.
+    const transcriptPath = join(server.home, "codex-rollout.jsonl");
+    const rollout = [
+      {
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "hello from codex peer" }],
+        },
+      },
+    ];
+    writeFileSync(transcriptPath, rollout.map((l) => JSON.stringify(l)).join("\n") + "\n");
+
+    const codexUuid = "019e7d25-bdb4-7f90-a422-795f18cbd07e";
+    const peer = {
+      server_pid: process.pid,
+      started_at: Math.floor(Date.now() / 1000),
+      client: {
+        type: "codex",
+        session_id: codexUuid,
+        transcript_path: transcriptPath,
+        session_id_source: "self-register",
+        cwd: projectRoot,
+      },
+      tmux_pane: null,
+      tmux_session: null,
+    };
+    const sessionsDir = join(server.home, ".oxtail", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(
+      join(sessionsDir, `${process.pid}.json`),
+      JSON.stringify(peer, null, 2),
+    );
+
+    const result = await callTool<
+      ReadSessionResponse & { messages: Array<{ role: string; text: string }> | null }
+    >(server.client, "read_session", {
+      name: codexUuid,
+      project_root: projectRoot,
+    });
+
+    assert.equal(
+      result.mode,
+      "transcript",
+      `expected transcript read, got mode=${result.mode} error=${result.error}`,
+    );
+    assert.equal(result.client_type, "codex");
+    assert.equal(result.error, null);
+    assert.doesNotMatch(result.error ?? "", /not in project scope/);
+    assert.ok(
+      result.messages && result.messages.some((m) => m.text.includes("hello from codex peer")),
+      "transcript messages should include the peer's user turn",
+    );
+  } finally {
+    await server.cleanup();
+  }
+});
+
 test("integration: read_session ambiguous tmux name returns candidates", async () => {
   const server = await spawnServer();
   try {
@@ -567,6 +635,33 @@ test("messaging: send_message cross-project rejected", async () => {
   }
 });
 
+test("messaging: nested git repository is cross-project, not descendant scope", async () => {
+  const parent = mkdtempSync(join(tmpdir(), "oxtail-parent-project-"));
+  const nested = join(parent, "nested");
+  mkdirSync(join(parent, ".git"), { recursive: true });
+  mkdirSync(join(nested, ".git"), { recursive: true });
+
+  const server = await spawnServer({ cwd: parent });
+  try {
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: "abababab-abab-abab-abab-abababababab",
+      tmux_session: "nested-project-peer",
+      cwd: nested,
+    });
+
+    const sent = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: "nested-project-peer",
+      body: "should not cross nested project boundary",
+    });
+    assert.equal(sent.ok, false);
+    assert.equal((sent as SendErr).error, "cross-project");
+  } finally {
+    await server.cleanup();
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
 test("messaging: send_message to unknown target returns target-not-found", async () => {
   const server = await spawnServer();
   try {
@@ -632,6 +727,34 @@ test("messaging: send_message to self by pid returns self-send", async () => {
     assert.equal((sent as SendErr).error, "self-send");
     // Sanity: the server pid we read above stayed in scope (cwd is the temp HOME).
     assert.ok(me.entry.server_pid > 0);
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("messaging: send_message to same agent session_id through a sibling MCP child is self-send", async () => {
+  const server = await spawnServer();
+  try {
+    const myUuid = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+    await callTool(server.client, "claim_session", { session_id: myUuid });
+
+    // Simulate a fresher live sibling from a dual-scope MCP setup. readAll()
+    // collapses duplicate session_ids to this sibling, so pid-only self-send
+    // detection would incorrectly enqueue to our own other MCP child.
+    seedPeerEntry(server.home, {
+      server_pid: process.ppid,
+      started_at: Math.floor(Date.now() / 1000) + 10,
+      session_id: myUuid,
+      tmux_session: "self-sibling",
+      cwd: server.home,
+    });
+
+    const sent = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: myUuid,
+      body: "echo through sibling",
+    });
+    assert.equal(sent.ok, false);
+    assert.equal((sent as SendErr).error, "self-send");
   } finally {
     await server.cleanup();
   }
@@ -1119,6 +1242,234 @@ test("ask_peer: strategy=off surfaces wake_status: disabled and still polls", as
     assert.equal(ok.reply, null);
     assert.equal(ok.timed_out, true, "we did poll, and timed out");
     assert.ok(elapsed >= 1400, `should have waited the full timeout, took ${elapsed}ms`);
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("integration: a restarted Codex MCP child recovers its session via sticky claim", async () => {
+  // s1 and s2 are both spawned by THIS test process, so they share a parent
+  // identity (ppid + signature) — the durable handle a sticky claim keys on.
+  // A shared HOME lets the claim record + transcript persist across the
+  // "restart". This is the real Codex case: the MCP child cycles under the same
+  // host while its session-id env var stays stripped.
+  const sharedHome = mkdtempSync(join(tmpdir(), "oxtail-sticky-int-"));
+  const codexEnv = { HOME: sharedHome, CODEX_HOME: join(sharedHome, ".codex") };
+  const sessionId = "019e7d25-bdb4-7f90-a422-795f18cbd07e";
+
+  // Place a Codex rollout so the claim resolves a non-null transcript_path
+  // (findCodexTranscriptPath scans ~/.codex/sessions/<recent>). Write into both
+  // UTC and local "today" dirs to stay clear of a date-boundary flake.
+  const d = new Date();
+  const dayDirs = [
+    [d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate()],
+    [d.getFullYear(), d.getMonth() + 1, d.getDate()],
+  ];
+  for (const [y, m, day] of dayDirs) {
+    const dir = join(
+      sharedHome, ".codex", "sessions",
+      String(y), String(m).padStart(2, "0"), String(day).padStart(2, "0"),
+    );
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `rollout-${sessionId}.jsonl`), JSON.stringify({ payload: { cwd: sharedHome } }) + "\n");
+  }
+
+  let s1: Awaited<ReturnType<typeof spawnServer>> | undefined;
+  let s2: Awaited<ReturnType<typeof spawnServer>> | undefined;
+  try {
+    // First run: claim. The server persists a sticky claim keyed by its parent
+    // (this test process) + cwd + client_type.
+    s1 = await spawnServer({ cwd: sharedHome, clientName: "codex", extraEnv: codexEnv });
+    const claim = await callTool<{ ok: boolean; session_id: string; transcript_path: string | null }>(
+      s1.client, "claim_session", { session_id: sessionId },
+    );
+    assert.equal(claim.session_id, sessionId);
+    assert.ok(claim.transcript_path, "claim must resolve a transcript so recovery's guard can pass");
+    await s1.cleanup();
+    s1 = undefined;
+
+    // Let s1 fully exit before the "restart" so s2 starts against a clean
+    // registry — a faithful single-child restart. (Recovery no longer depends on
+    // the prior owner being gone; this just keeps the scenario unambiguous.)
+    const prevHome = process.env.HOME;
+    process.env.HOME = sharedHome;
+    try {
+      for (let i = 0; i < 100; i++) {
+        if (!readAll().some((e) => e.client.session_id === sessionId)) break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    } finally {
+      process.env.HOME = prevHome;
+    }
+
+    // Restart: a fresh Codex child, same parent + cwd + home. env detection has
+    // no session id and birth-time abstains (the transcript predates this
+    // child's started_at), so startup recovery must adopt the sticky claim.
+    s2 = await spawnServer({ cwd: sharedHome, clientName: "codex", extraEnv: codexEnv });
+    const me = await callTool<GetMySessionResponse>(s2.client, "get_my_session");
+    assert.equal(me.entry.client.session_id, sessionId, "restarted child should recover the claimed session id");
+    assert.equal(me.entry.client.session_id_source, "sticky-claim");
+  } finally {
+    if (s1) await s1.cleanup();
+    if (s2) await s2.cleanup();
+    rmSync(sharedHome, { recursive: true, force: true });
+  }
+});
+
+test("integration: sticky claim recovered after handshake is written back to registry", async () => {
+  // Claude Code's session id is normally absent from the MCP child env, so the
+  // first moment we know the client type can be the initialize handshake. This
+  // covers the path where sticky recovery happens after an initial null-session
+  // registry write.
+  const sharedHome = mkdtempSync(join(tmpdir(), "oxtail-sticky-claude-int-"));
+  const sharedCwd = realpathSync(sharedHome);
+  const sessionId = "b61d166f-cbe0-4881-bbe2-6af461e5c787";
+  const projectDir = join(
+    sharedHome,
+    ".claude",
+    "projects",
+    sharedCwd.replace(/\//g, "-"),
+  );
+  mkdirSync(projectDir, { recursive: true });
+  writeFileSync(join(projectDir, `${sessionId}.jsonl`), "\n");
+
+  let s1: Awaited<ReturnType<typeof spawnServer>> | undefined;
+  let s2: Awaited<ReturnType<typeof spawnServer>> | undefined;
+  try {
+    s1 = await spawnServer({
+      cwd: sharedCwd,
+      clientName: "claude-code",
+      extraEnv: { HOME: sharedHome, CLAUDECODE: "1" },
+    });
+    const claim = await callTool<{ ok: boolean; session_id: string; transcript_path: string | null }>(
+      s1.client,
+      "claim_session",
+      { session_id: sessionId },
+    );
+    assert.equal(claim.session_id, sessionId);
+    assert.ok(claim.transcript_path, "claim must persist a transcript-backed sticky record");
+    await s1.cleanup();
+    s1 = undefined;
+    assert.equal(
+      readdirSync(join(sharedHome, ".oxtail", "claims")).filter((f) => f.endsWith(".json")).length,
+      1,
+      "first child must leave one sticky claim record for the restart",
+    );
+
+    const prevHome = process.env.HOME;
+    process.env.HOME = sharedHome;
+    try {
+      for (let i = 0; i < 100; i++) {
+        if (!readAll().some((e) => e.client.session_id === sessionId)) break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    } finally {
+      process.env.HOME = prevHome;
+    }
+    // Keep the transcript birth time clearly before the restarted child's
+    // started_at second. Otherwise second-resolution started_at can make a
+    // same-second transcript look post-start and let birth-time win instead of
+    // exercising sticky recovery.
+    await new Promise((r) => setTimeout(r, 1100));
+
+    s2 = await spawnServer({
+      cwd: sharedCwd,
+      clientName: "claude-code",
+      extraEnv: { HOME: sharedHome },
+    });
+    const me = await callTool<GetMySessionResponse>(s2.client, "get_my_session");
+    assert.equal(me.entry.client.session_id, sessionId);
+    assert.equal(me.entry.client.session_id_source, "sticky-claim");
+
+    const prevHomeForRegistry = process.env.HOME;
+    process.env.HOME = sharedHome;
+    try {
+      assert.ok(
+        readAll().some((e) => e.client.session_id === sessionId),
+        "recovered sticky claim must be visible to peers through the registry",
+      );
+    } finally {
+      process.env.HOME = prevHomeForRegistry;
+    }
+  } finally {
+    if (s1) await s1.cleanup();
+    if (s2) await s2.cleanup();
+    rmSync(sharedHome, { recursive: true, force: true });
+  }
+});
+
+function writeActivity(home: string, sessionId: string, status: string): void {
+  const dir = join(home, ".oxtail", "activity");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, sessionId), status);
+}
+
+test("messaging: send_message wake:auto skips a busy peer (skipped_busy)", async () => {
+  const server = await spawnServer();
+  try {
+    const peerSid = "0a0a0a0a-0b0b-0c0c-0d0d-0e0e0e0e0e0e";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: peerSid,
+      tmux_session: "busy-peer",
+      cwd: server.home,
+    });
+    writeActivity(server.home, peerSid, "busy");
+
+    const res = await callTool<SendOk & { wake_status?: string }>(server.client, "send_message", {
+      target: peerSid,
+      body: "yo",
+      wake: "auto",
+    });
+    assert.equal(res.ok, true);
+    assert.equal(res.wake_status, "skipped_busy", "fresh busy peer must not be woken");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("messaging: send_message wake:auto with no tmux target returns skipped_no_target", async () => {
+  const server = await spawnServer();
+  try {
+    const peerSid = "1b1b1b1b-2c2c-3d3d-4e4e-5f5f5f5f5f5f";
+    // Codex-style peer: idle, but no tmux pane/session to send-keys into.
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: peerSid,
+      tmux_session: null,
+      cwd: server.home,
+      type: "codex",
+    });
+    writeActivity(server.home, peerSid, "idle");
+
+    const res = await callTool<SendOk & { wake_status?: string }>(server.client, "send_message", {
+      target: peerSid,
+      body: "yo",
+      wake: "auto",
+    });
+    assert.equal(res.ok, true);
+    assert.equal(res.wake_status, "skipped_no_target", "idle peer with no pane cannot be send-keys-woken");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("messaging: send_message without wake carries no wake_status (contract preserved)", async () => {
+  const server = await spawnServer();
+  try {
+    const peerSid = "2c2c2c2c-3d3d-4e4e-5f5f-606060606060";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: peerSid,
+      tmux_session: "quiet-peer",
+      cwd: server.home,
+    });
+    const res = await callTool<SendOk & { wake_status?: string }>(server.client, "send_message", {
+      target: peerSid,
+      body: "no wake",
+    });
+    assert.equal(res.ok, true);
+    assert.equal(res.wake_status, undefined, "default send_message must not wake");
   } finally {
     await server.cleanup();
   }

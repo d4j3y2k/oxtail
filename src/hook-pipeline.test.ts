@@ -105,8 +105,9 @@ test("hook: stdin happy path — single message becomes additionalContext", asyn
   await withHome(async (home) => {
     const peerPid = 71002;
     const sid = "11111111-2222-3333-4444-555555555555";
+    const senderSid = "22222222-3333-4444-5555-666666666666";
     register(fakeEntry(home, peerPid, sid));
-    enqueue(peerPid, "hello from peer");
+    enqueue(peerPid, "hello from peer", senderSid);
 
     const stdin = JSON.stringify({
       session_id: sid,
@@ -118,7 +119,11 @@ test("hook: stdin happy path — single message becomes additionalContext", asyn
     assert.ok(r.stdout.length > 0, "hook must emit envelope");
     const parsed = JSON.parse(r.stdout);
     assert.equal(parsed.hookSpecificOutput.hookEventName, "PreToolUse");
-    assert.equal(parsed.hookSpecificOutput.additionalContext, "hello from peer");
+    const ctx = parsed.hookSpecificOutput.additionalContext;
+    assert.ok(ctx.includes("[oxtail] You have 1 new peer message(s)."));
+    assert.ok(ctx.includes("message_id:"));
+    assert.ok(ctx.includes(`from_session_id: ${senderSid}`));
+    assert.ok(ctx.includes("body:\nhello from peer"));
 
     // Mailbox truncated.
     assert.equal(readFileSync(mailboxFilePath(peerPid), "utf8"), "");
@@ -127,19 +132,26 @@ test("hook: stdin happy path — single message becomes additionalContext", asyn
   });
 });
 
-test("hook: multiple messages concatenated with \\n\\n", async () => {
+test("hook: multiple messages include reply metadata and bodies", async () => {
   await withHome(async (home) => {
     const peerPid = 71003;
     const sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
     register(fakeEntry(home, peerPid, sid));
-    enqueue(peerPid, "first");
-    enqueue(peerPid, "second");
+    enqueue(peerPid, "first", "11111111-1111-1111-1111-111111111111");
+    enqueue(peerPid, "second", "22222222-2222-2222-2222-222222222222");
 
     const stdin = JSON.stringify({ session_id: sid });
     const r = await runHook({ HOME: home }, stdin);
     assert.equal(r.code, 0);
     const parsed = JSON.parse(r.stdout);
-    assert.equal(parsed.hookSpecificOutput.additionalContext, "first\n\nsecond");
+    const ctx = parsed.hookSpecificOutput.additionalContext;
+    assert.ok(ctx.includes("[oxtail] You have 2 new peer message(s)."));
+    assert.ok(ctx.includes("--- message 1 ---"));
+    assert.ok(ctx.includes("from_session_id: 11111111-1111-1111-1111-111111111111"));
+    assert.ok(ctx.includes("body:\nfirst"));
+    assert.ok(ctx.includes("--- message 2 ---"));
+    assert.ok(ctx.includes("from_session_id: 22222222-2222-2222-2222-222222222222"));
+    assert.ok(ctx.includes("body:\nsecond"));
   });
 });
 
@@ -206,7 +218,7 @@ test('hook: body with escapes ("\\"", "\\\\", "\\n", non-ASCII) round-trips', as
     const r = await runHook({ HOME: home }, stdin);
     assert.equal(r.code, 0, `stderr: ${r.stderr}`);
     const parsed = JSON.parse(r.stdout);
-    assert.equal(parsed.hookSpecificOutput.additionalContext, body);
+    assert.ok(parsed.hookSpecificOutput.additionalContext.includes(`body:\n${body}`));
   });
 });
 
@@ -239,7 +251,7 @@ test("hook: lock contention — held lock blocks the run; exits 0 without delive
     assert.equal(r2.code, 0);
     assert.ok(r2.stdout.length > 0, "post-unlock run must deliver");
     const parsed = JSON.parse(r2.stdout);
-    assert.equal(parsed.hookSpecificOutput.additionalContext, "held");
+    assert.ok(parsed.hookSpecificOutput.additionalContext.includes("body:\nheld"));
   });
 });
 
@@ -259,7 +271,7 @@ test("hook: stale lock (mtime 60s ago) is force-cleared and delivery proceeds", 
     const r = await runHook({ HOME: home }, stdin);
     assert.equal(r.code, 0, `stderr: ${r.stderr}`);
     const parsed = JSON.parse(r.stdout);
-    assert.equal(parsed.hookSpecificOutput.additionalContext, "stale-cleared");
+    assert.ok(parsed.hookSpecificOutput.additionalContext.includes("body:\nstale-cleared"));
   });
 });
 
@@ -279,7 +291,7 @@ test("hook coexistence: a second PreToolUse script's stdout is independent of ou
     assert.equal(r.code, 0);
     const parsed = JSON.parse(r.stdout);
     assert.equal(parsed.hookSpecificOutput.hookEventName, "PreToolUse");
-    assert.equal(parsed.hookSpecificOutput.additionalContext, "oxtail-payload");
+    assert.ok(parsed.hookSpecificOutput.additionalContext.includes("body:\noxtail-payload"));
     // The hook's stdout is exactly one JSON line + trailing newline; no
     // sentinel markers (like Terminator's %%MSG-IDS%%) leak into stdout.
     assert.ok(!r.stdout.includes("%%"), "no sentinel markers in oxtail stdout");
@@ -288,5 +300,32 @@ test("hook coexistence: a second PreToolUse script's stdout is independent of ou
       1,
       "exactly one non-empty line on stdout",
     );
+  });
+});
+
+test("hook: dual-scope — drains ALL sibling mailboxes, not just the first pid", async () => {
+  await withHome(async (home) => {
+    // One agent, two MCP children sharing a session_id (the documented
+    // project-.mcp.json + user-~/.claude.json dual scope). The message is
+    // enqueued to the HIGHER pid; the old `grep | head -1` resolved the lower
+    // pid and missed it. Draining all siblings must still deliver it.
+    const sid = "5ce5ce5c-e5ce-5ce5-ce5c-e5ce5ce5ce5c";
+    const lowPid = 71500;
+    const highPid = 71501;
+    // Write both sibling registry files directly — register() would GC the
+    // dead-pid sibling, but we need both present to prove drain-all.
+    const sessionsDir = join(home, ".oxtail", "sessions");
+    mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(sessionsDir, `${lowPid}.json`), JSON.stringify(fakeEntry(home, lowPid, sid), null, 2));
+    writeFileSync(join(sessionsDir, `${highPid}.json`), JSON.stringify(fakeEntry(home, highPid, sid), null, 2));
+    mkdirSync(join(home, ".oxtail", "mailboxes"), { recursive: true, mode: 0o700 });
+    enqueue(highPid, "from the second child", "5e5e5e5e-5e5e-5e5e-5e5e-5e5e5e5e5e5e");
+
+    const r = await runHook({ HOME: home }, JSON.stringify({ session_id: sid }));
+    assert.equal(r.code, 0, `stderr: ${r.stderr}`);
+    const ctx = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
+    assert.ok(ctx.includes("body:\nfrom the second child"), "must deliver from the non-first sibling mailbox");
+    // The mailbox it lived in is drained.
+    assert.equal(readFileSync(mailboxFilePath(highPid), "utf8"), "");
   });
 });

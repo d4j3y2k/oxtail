@@ -125,13 +125,13 @@ function recentCodexDateDirs(base: string, days: number): string[] {
 }
 
 export function detectClient(env = process.env, cwd = process.cwd()): ClientInfo {
-  if (env.CLAUDECODE === "1" && env.CLAUDE_CODE_SESSION_ID) {
-    const sessionId = env.CLAUDE_CODE_SESSION_ID;
+  if (env.CLAUDECODE === "1") {
+    const sessionId = env.CLAUDE_CODE_SESSION_ID ?? null;
     return {
       type: "claude-code",
       session_id: sessionId,
-      transcript_path: claudeTranscriptPath(sessionId, cwd),
-      session_id_source: "env",
+      transcript_path: sessionId ? claudeTranscriptPath(sessionId, cwd) : null,
+      session_id_source: sessionId ? "env" : null,
       cwd,
     };
   }

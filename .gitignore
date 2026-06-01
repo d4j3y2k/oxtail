@@ -4,3 +4,9 @@ dist/
 .claude/cache/
 .claude/settings.local.json
 NOTES.md
+
+# joint review working notes (not shipped)
+.review/
+
+# local Codex MCP config (machine-local)
+.codex/

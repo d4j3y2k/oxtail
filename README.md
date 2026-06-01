@@ -21,7 +21,7 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 **Claude Code** — add to `~/.claude.json` (global) or any project's `.mcp.json`:
 
 ```jsonc
-{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.8.0"] } } }
+{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.9.0"] } } }
 ```
 
 **Codex CLI** — add to `~/.codex/config.toml`:
@@ -29,14 +29,14 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 ```toml
 [mcp_servers.oxtail]
 command = "npx"
-args = ["-y", "oxtail@0.8.0"]
+args = ["-y", "oxtail@0.9.0"]
 ```
 
 **Claude slash command** (`/oxtail-join`):
 
 ```sh
 mkdir -p ~/.claude/commands
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.8.0/.claude/commands/oxtail-join.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.9.0/.claude/commands/oxtail-join.md \
   -o ~/.claude/commands/oxtail-join.md
 ```
 
@@ -44,9 +44,9 @@ curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.8.0/.claude/commands
 
 ```sh
 mkdir -p ~/.codex/skills/oxtail-join/agents
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.8.0/integrations/codex/oxtail-join/SKILL.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.9.0/integrations/codex/oxtail-join/SKILL.md \
   -o ~/.codex/skills/oxtail-join/SKILL.md
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.8.0/integrations/codex/oxtail-join/agents/openai.yaml \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.9.0/integrations/codex/oxtail-join/agents/openai.yaml \
   -o ~/.codex/skills/oxtail-join/agents/openai.yaml
 ```
 
@@ -65,13 +65,13 @@ Contributing? `git clone https://github.com/d4j3y2k/oxtail && cd oxtail && npm i
 - `read_session` — the recent transcript of a peer session, as clean per-turn messages when the peer is oxtail-aware (Claude Code and Codex CLI), or as raw tmux pane text otherwise. Accepts a tmux session name OR a `client_session_id` UUID; an ambiguous tmux name returns `ambiguous-target` with the candidate UUIDs.
 - `claim_session` — single-shot session registration. The routine path: `Bash echo $CLAUDE_CODE_SESSION_ID` (or `$CODEX_THREAD_ID` for Codex) → `claim_session({ session_id })`. Returns `{ ok, session_id, transcript_path }`.
 - `set_my_state` — write a small "state card" onto this session's registry entry so peers can see what we're doing without reading our transcript. v1 surfaces a single field, `purpose` (≤200 chars).
-- `send_message` — **fire-and-forget** message to a peer. **Does NOT wake an idle peer.** Target is a tmux session name or a raw `client_session_id` UUID. Body ≤ 8KB. Delivery is async via the peer's mailbox file. (v0.5+)
-- `read_my_messages` — drain this session's mailbox and return any queued messages. Codex peers (and unhooked Claude Code) poll this; Claude Code peers with the PreToolUse hook installed see messages mid-turn instead. (v0.5+)
+- `send_message` — **fire-and-forget** message to a peer. Target is a tmux session name or a raw `client_session_id` UUID. Body ≤ 8KB. Delivery is async via the peer's mailbox file. By default does **not** wake an idle peer; pass `wake: "auto"` to nudge one (state-gated — see [Waking an idle peer](#waking-an-idle-peer)). (v0.5+)
+- `read_my_messages` — drain this session's mailbox and return any queued messages. Codex peers (and unhooked Claude Code) poll this; Claude Code peers with the hooks installed see messages mid-turn (PreToolUse) or at turn end (Stop) instead. (v0.5+)
 - `ask_peer` — **delegate-and-wait**. Enqueues a message and blocks server-side until the peer replies (or the fixed timeout elapses, default 45s, tunable via `OXTAIL_ASK_PEER_TIMEOUT_MS`). Routes the wake per `client_type`: Codex gets a paste-burst-aware `tmux send-keys` wake (500ms gap before Enter to defeat the paste-burst heuristic); Claude Code gets the same send-keys mechanism without the gap (its TUI has no paste-burst). Response includes `wake_status` so the caller can distinguish "we polled and got nothing" from "no tmux pane resolved." Use `send_message` for fire-and-forget. (v0.7+)
 - `register_my_session` — pin this MCP server's `session_id` directly. Kept for debugging; prefer `claim_session`.
 - `get_my_session` — return this MCP server's own registry entry plus a per-strategy detection diagnosis. Useful for debugging.
 
-See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.5.0/AGENTS.md) for scope and architecture.
+See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.9.0/AGENTS.md) for scope and architecture.
 
 ## Usage from an agent
 
@@ -114,23 +114,42 @@ Cross-project sends are rejected, never silently dropped. Sending to a peer with
 
 ### Mid-turn vs next-turn delivery (the asymmetry)
 
-Claude Code peers can receive messages **mid-turn** via an opt-in PreToolUse hook:
+Claude Code peers can receive messages **autonomously** via three opt-in hooks:
 
 ```sh
 npx oxtail install-hook
 ```
 
-This drops a small bash script at `~/.oxtail/hooks/pretooluse.sh` and adds a `hooks.PreToolUse` entry in `~/.claude/settings.json`. The hook reads each `PreToolUse` event's `session_id` from stdin, locates the matching mailbox, and emits `additionalContext` into the next tool-call boundary. Reverse with `npx oxtail uninstall-hook`.
+This installs three small bash scripts under `~/.oxtail/hooks/` and adds matching entries to `~/.claude/settings.json` (tracked by a `_oxtailHook` marker). Reverse with `npx oxtail uninstall-hook`:
 
-Codex CLI peers and any Claude Code session without the hook installed receive messages **next-turn** by calling `read_my_messages` explicitly. Both clients send messages identically. The asymmetry exists because Claude Code exposes a PreToolUse hook surface that injects `additionalContext`; Codex CLI does not currently expose an equivalent.
+- **`hooks.PreToolUse`** → `pretooluse.sh` — delivers **mid-turn**. It reads each `PreToolUse` event's `session_id` from stdin, locates the matching mailbox, and emits the queued messages as `additionalContext` on the next tool-call boundary.
+- **`hooks.Stop`** → `stop.sh` — delivers **at turn end** (deliver-on-complete). When the agent finishes a turn with messages still waiting, it emits a `decision: "block"` envelope so the agent continues and reads + responds before going idle, instead of leaving the messages until the next turn.
+- **`hooks.UserPromptSubmit`** → `userpromptsubmit.sh` — no delivery; it maintains a **busy/idle activity flag** in `~/.oxtail/activity/<session_id>` (busy on a turn start, idle on a real Stop). A sender consults this so `send_message({ wake: "auto" })` only fires a send-keys wake when the peer is actually idle (see [Waking an idle peer](#waking-an-idle-peer)).
 
-**Caveat for Claude Code receivers:** PreToolUse fires only before a tool call. A turn that produces only text — no tool calls — never triggers the hook; messages enqueued during that turn surface on the next tool call (or via an explicit `read_my_messages`). For pair-debugging UX, senders should not assume mid-turn delivery is universal.
+The PreToolUse and Stop hooks include the message body plus `message_id` and `from_session_id` metadata when the sender is registered, so a receiver can reply with `send_message({ target: "<from_session_id>", body: "..." })` even when the sender is not visible in `list_project_sessions`.
+
+Codex CLI peers and any Claude Code session without the hooks installed receive messages **next-turn** by calling `read_my_messages` explicitly. Both clients send messages identically. The asymmetry exists because Claude Code exposes PreToolUse/Stop/UserPromptSubmit hook surfaces that inject context or fire on lifecycle events; Codex CLI does not currently expose an equivalent.
+
+**Coverage and its edges.** PreToolUse fires only before a tool call, so a turn that produces only text — no tool calls — never triggers it; the Stop hook closes that gap by delivering at turn end. One deliberate edge remains: the Stop hook honors the `stop_hook_active` flag and exits without blocking on a re-entry, so `decision: "block"` can never loop — which means a message that arrives *during* a Stop-blocked continuation waits for the next turn rather than extending the current one. A truly idle peer (no turn in flight) is reached by `send_message({ wake: "auto" })` or `ask_peer` (both fire an external wake), or by an explicit `read_my_messages`.
+
+### Waking an idle peer
+
+`send_message` is fire-and-forget by default. Pass `wake: "auto"` to also nudge an **idle** peer into a turn so it drains its mailbox promptly:
+
+```js
+send_message({ target: "<peer>", body: "...", wake: "auto" })
+// → { ok: true, message_id, ..., wake_status: "fired" | "skipped_busy" | "skipped_no_target" | "disabled" }
+```
+
+It is **state-gated** off the activity flag above: if the peer is mid-turn (`busy`), the wake is skipped (`skipped_busy`) because its PreToolUse/Stop hooks will deliver during the turn — no point typing into a busy composer. Idle, unknown (hooks not installed), or stale-busy peers get a per-client `tmux send-keys` wake (Codex gets the paste-burst-aware gap; Claude Code does not). `wake: "off"` (the default) preserves the pure fire-and-forget contract.
+
+**Codex and the wake matrix.** The send-keys wake needs a tmux pane. A Codex peer running **outside tmux** has none, so it returns `wake_status: "skipped_no_target"` — its idle delivery stays poll-based (`read_my_messages`). Run Codex **inside a tmux pane** to get symmetric idle-wake; the routing already handles the Codex paste-burst case.
 
 ### Hook coexistence
 
-The oxtail hook coexists with other `hooks.PreToolUse` entries. **Verified against Terminator's `_terminatorHook` v1 in Claude Code 2.1.139:** both hooks' `additionalContext` envelopes reached the model. Install order: Terminator first, oxtail second — `install-hook.mjs` appends to a non-empty array, which matches the verified configuration. If you reinstall hooks in a different order, you may need to re-test.
+`install-hook` manages three events (`PreToolUse`, `Stop`, `UserPromptSubmit`); on each it replaces any prior oxtail entry in place and otherwise appends, so existing third-party entries are preserved. **The PreToolUse path is verified against Terminator's `_terminatorHook` v1 in Claude Code 2.1.139:** both hooks' `additionalContext` envelopes reached the model (install order: Terminator first, oxtail second — which is what `install-hook.mjs` produces by appending). Coexistence of the Stop and UserPromptSubmit hooks with third-party entries on those events uses the same append logic but is not separately verified.
 
-If you have a PreToolUse hook installed that isn't from Terminator and isn't oxtail, `install-hook` prints a one-line note and proceeds — coexistence behavior with arbitrary third-party hooks is not pre-verified.
+If you have a hook installed on a managed event that isn't from Terminator and isn't oxtail, `install-hook` prints a one-line note and proceeds — coexistence behavior with arbitrary third-party hooks is not pre-verified.
 
 ### Trust model
 
@@ -177,7 +196,7 @@ ask_peer({ target, body })
 
 1. Enqueue `body` into the target's mailbox (same as `send_message`).
 2. Wait ~500ms for a hook-delivered reply (rare path — handles the case where the peer was already mid-tool-call and replied immediately).
-3. Route the wake via `wake_status` resolution (see above). For Claude Code, return immediately. Otherwise fire the wake.
+3. Route and fire the wake via `wake_status` resolution (see above).
 4. Poll the caller's mailbox at 200ms for a reply with `from_session_id == target.session_id`. Other peers' messages stay in the mailbox untouched.
 5. Return the reply on match, or `{ reply: null, timed_out: true, wake_status }` after the fixed timeout. Late replies fall back to the normal v0.5 hook / `read_my_messages` path — never lost, just delivered out of band.
 
@@ -195,7 +214,7 @@ Pane targeting can go stale: `tmux_pane` is cached at server startup, but tmux c
 If `ask_peer` returns an abort error before its built-in 45s timeout fires, your MCP client's tool-call ceiling is lower than 45s. Override the bound at server startup:
 
 ```sh
-OXTAIL_ASK_PEER_TIMEOUT_MS=30000 npx -y oxtail@0.8.0
+OXTAIL_ASK_PEER_TIMEOUT_MS=30000 npx -y oxtail@0.9.0
 ```
 
 The server reads the env var once at boot and uses it as the fixed timeout for all `ask_peer` calls in that session. Values must be positive numbers; anything else falls back to the 45000ms default.
@@ -242,4 +261,11 @@ If `MCP_TRACE_FILE` is set in the environment, every detection run appends an ND
 
 ## Status
 
-v0.8.0. Builds on v0.7's per-client wake routing — Codex peers wake via a 500ms-gap send-keys sequence that defeats their TUI's paste-burst heuristic (verified live 2026-05-13). Claude Code peers, originally fail-fasted under a misread of the Claude Code hook catalog, now wake via the same send-keys mechanism without the gap (no paste-burst in Claude Code's TUI). An end-to-end falsifying experiment 2026-05-13 against the live `oxtail-claudejr` peer in this repo confirmed the full round-trip works: ask_peer enqueue → send-keys → peer entered a turn → PreToolUse hook drained mailbox → peer replied via send_message. The symmetric-matrix vision (Claude↔Claude, Claude↔Codex, both directions, no human relay) is intact. ask_peer's response gains a `wake_status` field for caller diagnostics; `skipped_unsupported` is now reserved for forward compat with hypothetical future unwakeable client_types rather than firing on any current client. Wake strategy is overridable via `OXTAIL_ASK_PEER_WAKE_STRATEGY=auto|legacy|off` as a rollback. See [issue #3](https://github.com/d4j3y2k/oxtail/issues/3) for the v0.7 spike findings.
+v0.9.0. Completes the autonomous peer-messaging matrix: a message reaches a Claude Code peer whether it's mid-turn, finishing, or fully idle — in both directions, with no human relay.
+
+- **Deliver-on-complete (Stop hook).** PreToolUse only fires before a tool call, so a text-only turn never triggered it. The new `Stop` hook closes that gap: a message that lands as the agent finishes a turn blocks the stop and is read + answered before it goes idle. Loop-safe via `stop_hook_active`.
+- **State-gated idle wake.** `send_message({ wake: "auto" })` nudges an idle peer via per-client `tmux send-keys`, gated off a busy/idle activity flag maintained by the `UserPromptSubmit`/`Stop` hooks — so it never types into a peer that's mid-turn. Returns `wake_status: fired | skipped_busy | skipped_no_target | disabled`. A Codex peer must be inside a tmux pane to be idle-woken (otherwise `skipped_no_target`, and delivery stays poll-based).
+- **Sticky Codex claim.** A restarted Codex MCP child — whose `CODEX_THREAD_ID` is stripped from its subprocess env — recovers its `session_id` from a persisted claim keyed by client type + cwd + a bounded process-ancestor chain, so identity survives an MCP restart without a manual re-claim.
+- **Identity hardening.** Hooks and activity key on `client.session_id` (never `server_pid`), so a dual-scope agent's sibling MCP children act as one identity; delivery hooks drain all sibling mailboxes; nested git repos are treated as separate projects for scope matching.
+
+Builds on v0.7's per-client wake routing (verified live 2026-05-13): Codex peers wake via a 500ms-gap send-keys sequence that defeats their TUI's paste-burst heuristic; Claude Code peers wake via the same mechanism without the gap (no paste-burst in its TUI). `OXTAIL_ASK_PEER_WAKE_STRATEGY=auto|legacy|off` remains as a rollback. See [issue #3](https://github.com/d4j3y2k/oxtail/issues/3) for the v0.7 spike findings.
