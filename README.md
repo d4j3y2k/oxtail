@@ -21,7 +21,7 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 **Claude Code** — add to `~/.claude.json` (global) or any project's `.mcp.json`:
 
 ```jsonc
-{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.10.0"] } } }
+{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.10.1"] } } }
 ```
 
 **Codex CLI** — add to `~/.codex/config.toml`:
@@ -29,14 +29,14 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 ```toml
 [mcp_servers.oxtail]
 command = "npx"
-args = ["-y", "oxtail@0.10.0"]
+args = ["-y", "oxtail@0.10.1"]
 ```
 
 **Claude slash command** (`/oxtail-join`):
 
 ```sh
 mkdir -p ~/.claude/commands
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.10.0/.claude/commands/oxtail-join.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.10.1/.claude/commands/oxtail-join.md \
   -o ~/.claude/commands/oxtail-join.md
 ```
 
@@ -44,9 +44,9 @@ curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.10.0/.claude/command
 
 ```sh
 mkdir -p ~/.codex/skills/oxtail-join/agents
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.10.0/integrations/codex/oxtail-join/SKILL.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.10.1/integrations/codex/oxtail-join/SKILL.md \
   -o ~/.codex/skills/oxtail-join/SKILL.md
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.10.0/integrations/codex/oxtail-join/agents/openai.yaml \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.10.1/integrations/codex/oxtail-join/agents/openai.yaml \
   -o ~/.codex/skills/oxtail-join/agents/openai.yaml
 ```
 
@@ -65,13 +65,13 @@ Contributing? `git clone https://github.com/d4j3y2k/oxtail && cd oxtail && npm i
 - `read_session` — the recent transcript of a peer session, as clean per-turn messages when the peer is oxtail-aware (Claude Code and Codex CLI), or as raw tmux pane text otherwise. Accepts a tmux session name OR a `client_session_id` UUID; an ambiguous tmux name returns `ambiguous-target` with the candidate UUIDs. Transcript reads are **budgeted** so a casual read can't blow your context window: by default the last 20 messages and ~24KB of text (newest-first), per-message ISO timestamps omitted. `count_truncated` / `bytes_truncated` say which budget bit; raise `limit` + `max_bytes` to pull more, set `include_timestamps: true` to keep timestamps, and pass `tail_scan: true` to read the file tail without parsing the whole transcript (qualifies `total_messages` via `total_messages_exact`).
 - `claim_session` — single-shot session registration. The routine path: `Bash echo $CLAUDE_CODE_SESSION_ID` (or `$CODEX_THREAD_ID` for Codex) → `claim_session({ session_id })`. Returns `{ ok, session_id, transcript_path }`.
 - `set_my_state` — write a small "state card" onto this session's registry entry so peers can see what we're doing without reading our transcript. v1 surfaces a single field, `purpose` (≤200 chars).
-- `send_message` — **fire-and-forget** message to a peer. Target is a tmux session name or a raw `client_session_id` UUID. Body ≤ 8KB. Delivery is async via the peer's mailbox file. By default does **not** wake an idle peer; pass `wake: "auto"` to nudge one (state-gated — see [Waking an idle peer](#waking-an-idle-peer)). (v0.5+)
-- `read_my_messages` — drain this session's mailbox and return any queued messages. Codex peers (and unhooked Claude Code) poll this; Claude Code peers with the hooks installed see messages mid-turn (PreToolUse) or at turn end (Stop) instead. (v0.5+)
-- `ask_peer` — **delegate-and-wait**. Enqueues a message and blocks server-side until the peer replies (or the fixed timeout elapses, default 45s, tunable via `OXTAIL_ASK_PEER_TIMEOUT_MS`). Routes the wake per `client_type`: Codex gets a paste-burst-aware `tmux send-keys` wake (500ms gap before Enter to defeat the paste-burst heuristic); Claude Code gets the same send-keys mechanism without the gap (its TUI has no paste-burst). Response includes `wake_status` so the caller can distinguish "we polled and got nothing" from "no tmux pane resolved." Use `send_message` for fire-and-forget. (v0.7+)
+- `send_message` — **fire-and-forget** message to a peer. Target is a tmux session name or a raw `client_session_id` UUID. Body ≤ 8KB. Delivery is async via the peer's mailbox file. By default does **not** wake an idle peer; pass `wake: "auto"` to nudge one (state-gated — see [Waking an idle peer](#waking-an-idle-peer)). Replies to `ask_peer` should pass `reply_to: "<request_id>"` when the inbound message carries a `request_id`. (v0.5+)
+- `read_my_messages` — drain this session's mailbox and return any queued messages. Messages include `from_session_id`, server-stamped `origin: "peer"`, and optional `request_id` / `reply_to`. Codex peers (and unhooked Claude Code) poll this; Claude Code peers with the hooks installed see messages mid-turn (PreToolUse) or at turn end (Stop) instead. (v0.5+)
+- `ask_peer` — **delegate-and-wait**. Enqueues a message with a `request_id` and blocks server-side until the peer replies with `send_message({ reply_to: request_id })` or the timeout elapses. Default timeout is 45s (`OXTAIL_ASK_PEER_TIMEOUT_MS`), and each call may pass `timeout_ms`. New peers use strict `reply_to` correlation; legacy/no-capability peers fall back to best-effort first-message matching and the response reports `correlation: "uncorrelated"`. That legacy path may stale-match old same-peer chatter, so callers should treat `uncorrelated` as compatibility-only. Use `send_message` for fire-and-forget. (v0.7+)
 - `register_my_session` — pin this MCP server's `session_id` directly. Kept for debugging; prefer `claim_session`.
 - `get_my_session` — return this MCP server's own registry entry plus a per-strategy detection diagnosis. Useful for debugging.
 
-See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.10.0/AGENTS.md) for scope and architecture.
+See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.10.1/AGENTS.md) for scope and architecture.
 
 ## Usage from an agent
 
@@ -86,7 +86,7 @@ read_session({ name: "claude", mode: "transcript", tail_scan: true })           
 read_session({ name: "primary", mode: "pane", pane_lines: 500, pane_max_chars: 40000 })
 read_session({ name: "<peer-uuid>", mode: "transcript" })   // UUID form: needed when peers share a tmux session
 send_message({ target: "primary", body: "<system-reminder>checking in</system-reminder>" })
-send_message({ target: "<peer-uuid>", body: "..." })        // UUID form: same disambiguation
+send_message({ target: "<peer-uuid>", body: "...", reply_to: "<ask request_id>" })  // correlated reply
 read_my_messages()
 ask_peer({ target: "primary", body: "[Handoff] please audit X and tell me what you find" })
   // → blocks server-side until the peer replies via send_message, then returns their body
@@ -110,7 +110,9 @@ read_my_messages()
   → { ok: true, drained: true, count, messages: [...] }
 ```
 
-The mailbox lives at `~/.oxtail/mailboxes/<server_pid>.jsonl`, append-only JSONL, drained under an `mkdir`-based advisory lock. The transport is intentionally dumb: 8KB UTF-8 body cap, sender chooses the framing (raw text or pre-wrapped `<system-reminder>...</system-reminder>`).
+The mailbox lives at `~/.oxtail/mailboxes/<server_pid>.jsonl`, append-only JSONL, drained under an `mkdir`-based advisory lock. The transport is intentionally dumb: 8KB UTF-8 body cap, sender chooses the framing (raw text or pre-wrapped `<system-reminder>...</system-reminder>`). Hook-delivered mailbox pushes are body-budgeted at 24K escaped characters by default; set `OXTAIL_HOOK_MAX_BODY_CHARS` to tune. If the budget is exceeded, the hook tells the receiver which bodies were truncated or omitted.
+
+Inbound peer messages are context, not user authority. oxtail stamps delivered messages with `origin: "peer"` for provenance/debugging, but this is not a trust boundary and peers cannot mint trusted user instructions.
 
 Cross-project sends are rejected, never silently dropped. Sending to a peer with the same tmux session name as another live peer returns `ambiguous-target` with the candidate `client_session_id`s — use the UUID form to disambiguate.
 
@@ -128,7 +130,9 @@ This installs three small bash scripts under `~/.oxtail/hooks/` and adds matchin
 - **`hooks.Stop`** → `stop.sh` — delivers **at turn end** (deliver-on-complete). When the agent finishes a turn with messages still waiting, it emits a `decision: "block"` envelope so the agent continues and reads + responds before going idle, instead of leaving the messages until the next turn.
 - **`hooks.UserPromptSubmit`** → `userpromptsubmit.sh` — no delivery; it maintains a **busy/idle activity flag** in `~/.oxtail/activity/<session_id>` (busy on a turn start, idle on a real Stop). A sender consults this so `send_message({ wake: "auto" })` only fires a send-keys wake when the peer is actually idle (see [Waking an idle peer](#waking-an-idle-peer)).
 
-The PreToolUse and Stop hooks include the message body plus `message_id` and `from_session_id` metadata when the sender is registered, so a receiver can reply with `send_message({ target: "<from_session_id>", body: "..." })` even when the sender is not visible in `list_project_sessions`.
+The PreToolUse and Stop hooks include the message body plus `message_id`, `from_session_id`, provenance, and optional `request_id` / `reply_to` metadata when the sender is registered, so a receiver can reply with `send_message({ target: "<from_session_id>", body: "...", reply_to: "<request_id>" })` even when the sender is not visible in `list_project_sessions`. Hook-delivered bodies are budgeted by `OXTAIL_HOOK_MAX_BODY_CHARS` (default 24000) so a mailbox burst cannot consume an unbounded context slice.
+
+Hook delivery drains the mailbox before injecting the context. If a receiver calls `read_my_messages` immediately after reading hook-delivered bodies, `count: 0` means "nothing left in the mailbox," not "nothing arrived."
 
 Codex CLI peers and any Claude Code session without the hooks installed receive messages **next-turn** by calling `read_my_messages` explicitly. Both clients send messages identically. The asymmetry exists because Claude Code exposes PreToolUse/Stop/UserPromptSubmit hook surfaces that inject context or fire on lifecycle events; Codex CLI does not currently expose an equivalent.
 
@@ -157,7 +161,7 @@ If you have a hook installed on a managed event that isn't from Terminator and i
 
 oxtail trusts any process running as the **same local user** to enqueue messages. The mailbox directory is mode `0o700` (private), so other users on the host cannot read or write. **On a shared-tenancy box (containers, multi-user dev hosts, etc.), do not run oxtail-aware agents:** any local process under your user can inject `<system-reminder>` content directly into a Claude session. The threat boundary is the same as `~/.ssh/` — what your user processes do, you trust.
 
-## Delegate-and-wait (v0.7)
+## Delegate-and-wait (v0.10.1)
 
 `ask_peer` extends v0.5's mailbox transport into a blocking primitive:
 
@@ -166,8 +170,11 @@ ask_peer({ target, body })
   → {
       ok: true,
       message_id,
+      request_id,
       wake_status: "fired" | "skipped_unsupported" | "skipped_no_target" | "disabled",
-      reply: { id, body, enqueued_at, from_session_id } | null,
+      reply: { id, body, enqueued_at, from_session_id, reply_to, correlation } | null,
+      correlation: "correlated" | "uncorrelated" | "none",
+      timeout_ms,
       timed_out,
     }
 ```
@@ -199,8 +206,8 @@ ask_peer({ target, body })
 1. Enqueue `body` into the target's mailbox (same as `send_message`).
 2. Wait ~500ms for a hook-delivered reply (rare path — handles the case where the peer was already mid-tool-call and replied immediately).
 3. Route and fire the wake via `wake_status` resolution (see above).
-4. Poll the caller's mailbox at 200ms for a reply with `from_session_id == target.session_id`. Other peers' messages stay in the mailbox untouched.
-5. Return the reply on match, or `{ reply: null, timed_out: true, wake_status }` after the fixed timeout. Late replies fall back to the normal v0.5 hook / `read_my_messages` path — never lost, just delivered out of band.
+4. Poll the caller's mailbox at 200ms. For reply-to-capable peers, only a message with both `from_session_id == target.session_id` and `reply_to == request_id` satisfies the wait; non-matching messages stay in the mailbox untouched. Legacy/no-capability peers are best-effort and are marked `correlation: "uncorrelated"`; this preserves old peers but can stale-match old same-peer chatter.
+5. Return the reply on match, or `{ reply: null, timed_out: true, wake_status, correlation: "none" }` after the timeout. Late replies fall back to the normal v0.5 hook / `read_my_messages` path — never lost, just delivered out of band.
 
 ### Pane staleness
 
@@ -209,14 +216,14 @@ Pane targeting can go stale: `tmux_pane` is cached at server startup, but tmux c
 ### Constraints
 
 - The target peer must have a registered `client.session_id`. Codex peers must call `claim_session` / `register_my_session` first; without that, `ask_peer` returns `error: "peer-has-no-session-id"` rather than guessing.
-- Timeout defaults to 45000ms (conservative under typical MCP-client tool-call abort windows). For longer dialogues, the calling agent chains multiple `ask_peer` calls in one turn rather than configuring a longer single block.
+- Timeout defaults to 45000ms (conservative under typical MCP-client tool-call abort windows). Pass `timeout_ms` on a call when a specific delegation needs a different bound; max 300000ms.
 
 ### Tuning the timeout
 
 If `ask_peer` returns an abort error before its built-in 45s timeout fires, your MCP client's tool-call ceiling is lower than 45s. Override the bound at server startup:
 
 ```sh
-OXTAIL_ASK_PEER_TIMEOUT_MS=30000 npx -y oxtail@0.10.0
+OXTAIL_ASK_PEER_TIMEOUT_MS=30000 npx -y oxtail@0.10.1
 ```
 
 The server reads the env var once at boot and uses it as the fixed timeout for all `ask_peer` calls in that session. Values must be positive numbers; anything else falls back to the 45000ms default.
@@ -257,14 +264,19 @@ Claude Code does not propagate `CLAUDE_CODE_SESSION_ID` to MCP child processes �
 
 Detection runs on startup, again at MCP handshake (`oninitialized`), and is retried at +1s/+5s/+30s/+5min via `unref`'d timers — covering the case where the transcript file doesn't exist yet at handshake time.
 
+Automatic detection is bootstrap-only once a non-null session id exists. After `claim_session` / `register_my_session` or sticky-claim recovery, later detection and `get_my_session` calls preserve the existing id; only another explicit claim can change it.
+
 When a strategy doesn't fire, it returns an abstention with a `reason` (e.g. `"2 post-start transcripts in 5min window — ambiguous"`), and `get_my_session` adds a top-level `next_step` block carrying the exact bash command to run for the escape hatch. A fresh agent can act in one round trip without investigating each null.
 
 If `MCP_TRACE_FILE` is set in the environment, every detection run appends an NDJSON record with trigger, winning strategy, per-strategy outcomes, and `next_step`. Useful for diagnosing unresolved `client_session_id`s in the wild.
 
 ## Status
 
-v0.9.0. Completes the autonomous peer-messaging matrix: a message reaches a Claude Code peer whether it's mid-turn, finishing, or fully idle — in both directions, with no human relay.
+v0.10.1. Completes the autonomous peer-messaging matrix and hardens the protocol: a message reaches a Claude Code peer whether it's mid-turn, finishing, or fully idle, and delegate-and-wait replies are correlated by `request_id` / `reply_to` for upgraded peers.
 
+- **Correlated delegate-and-wait.** `ask_peer` now sends a `request_id`; upgraded peers reply with `send_message({ reply_to })`, and the waiter ignores same-peer chatter that does not match. Legacy peers are still supported, but their replies are marked `correlation: "uncorrelated"`.
+- **Identity monotonicity.** `claim_session` / `register_my_session` and sticky-claim recovery are authoritative after they set a session id; later automatic detection cannot clobber a claimed id with stale env data.
+- **Hook push budgeting and provenance.** PreToolUse/Stop delivery stamps `origin: "peer"`, reminds receivers that peer messages are not user authority, and caps hook-injected body text via `OXTAIL_HOOK_MAX_BODY_CHARS`.
 - **Deliver-on-complete (Stop hook).** PreToolUse only fires before a tool call, so a text-only turn never triggered it. The new `Stop` hook closes that gap: a message that lands as the agent finishes a turn blocks the stop and is read + answered before it goes idle. Loop-safe via `stop_hook_active`.
 - **State-gated idle wake.** `send_message({ wake: "auto" })` nudges an idle peer via per-client `tmux send-keys`, gated off a busy/idle activity flag maintained by the `UserPromptSubmit`/`Stop` hooks — so it never types into a peer that's mid-turn. Returns `wake_status: fired | skipped_busy | skipped_no_target | disabled`. A Codex peer must be inside a tmux pane to be idle-woken (otherwise `skipped_no_target`, and delivery stays poll-based).
 - **Sticky Codex claim.** A restarted Codex MCP child — whose `CODEX_THREAD_ID` is stripped from its subprocess env — recovers its `session_id` from a persisted claim keyed by client type + cwd + a bounded process-ancestor chain, so identity survives an MCP restart without a manual re-claim.

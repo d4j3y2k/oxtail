@@ -17,7 +17,18 @@ export type Mailbox = {
   id: string;
   body: string;
   enqueued_at: number;
+  body_bytes?: number;
+  origin?: "peer";
   from_session_id?: string;
+  request_id?: string;
+  reply_to?: string;
+  source_message_id?: string;
+};
+
+export type EnqueueOptions = {
+  request_id?: string;
+  reply_to?: string;
+  source_message_id?: string;
 };
 
 // Resolved lazily so tests can swap HOME between cases. Each call re-reads
@@ -101,13 +112,19 @@ export function enqueue(
   target_pid: number,
   body: string,
   from_session_id?: string,
+  options: EnqueueOptions = {},
 ): Mailbox {
   const msg: Mailbox = {
     schema_version: 1,
     id: randomBytes(8).toString("hex"),
     body,
     enqueued_at: Math.floor(Date.now() / 1000),
+    body_bytes: Buffer.byteLength(body, "utf8"),
+    origin: "peer",
     ...(from_session_id ? { from_session_id } : {}),
+    ...(options.request_id ? { request_id: options.request_id } : {}),
+    ...(options.reply_to ? { reply_to: options.reply_to } : {}),
+    ...(options.source_message_id ? { source_message_id: options.source_message_id } : {}),
   };
 
   // Build the line by inserting keys in the invariant order. Node's
@@ -118,8 +135,13 @@ export function enqueue(
     id: msg.id,
     body: msg.body,
     enqueued_at: msg.enqueued_at,
+    body_bytes: msg.body_bytes,
+    origin: msg.origin,
   };
   if (from_session_id) obj.from_session_id = from_session_id;
+  if (msg.request_id) obj.request_id = msg.request_id;
+  if (msg.reply_to) obj.reply_to = msg.reply_to;
+  if (msg.source_message_id) obj.source_message_id = msg.source_message_id;
   const line = JSON.stringify(obj) + "\n";
 
   if (!FIELD_ORDER_PREFIX.test(line)) {
@@ -197,6 +219,24 @@ export function drainMatchingSession(
   my_pid: number,
   from_session_id: string,
 ): Mailbox | null {
+  return drainFirstMatching(my_pid, (msg) => msg.from_session_id === from_session_id);
+}
+
+export function drainMatchingReply(
+  my_pid: number,
+  from_session_id: string,
+  reply_to: string,
+): Mailbox | null {
+  return drainFirstMatching(
+    my_pid,
+    (msg) => msg.from_session_id === from_session_id && msg.reply_to === reply_to,
+  );
+}
+
+function drainFirstMatching(
+  my_pid: number,
+  matches: (msg: Mailbox) => boolean,
+): Mailbox | null {
   acquireLock(my_pid);
   try {
     let raw: string;
@@ -222,7 +262,7 @@ export function drainMatchingSession(
         parsed &&
         typeof parsed === "object" &&
         (parsed as Mailbox).schema_version === 1 &&
-        (parsed as Mailbox).from_session_id === from_session_id
+        matches(parsed as Mailbox)
       ) {
         matchIdx = i;
         matchedMsg = parsed as Mailbox;

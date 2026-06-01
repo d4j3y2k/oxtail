@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as z from "zod/v4";
 import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, sep } from "node:path";
@@ -12,6 +13,7 @@ import {
   enrichSessionId,
   enrichWithDiagnosis,
   transcriptPathFor,
+  type ClientInfo,
   type ClientType,
 } from "./clients.js";
 import { diagnoseDetect, isAbstain, type DetectDiagnosis } from "./detect/index.js";
@@ -711,6 +713,38 @@ function allAbstentionsStructural(diagnosis: DetectDiagnosis | null): boolean {
   return outcomes.every((o) => isAbstain(o) && o.structural === true);
 }
 
+function clientInfoEqual(a: ClientInfo, b: ClientInfo): boolean {
+  return (
+    a.type === b.type &&
+    a.session_id === b.session_id &&
+    a.transcript_path === b.transcript_path &&
+    a.session_id_source === b.session_id_source &&
+    a.cwd === b.cwd
+  );
+}
+
+function mergeDetectedClient(current: ClientInfo, detected: ClientInfo): ClientInfo {
+  // Session identity is monotonic after the first non-null value. Detection is
+  // a bootstrap mechanism, not authority over an explicit claim or an already
+  // adopted sticky claim. A stale MCP env var must not make get_my_session
+  // rewrite a claimed session_id.
+  if (!current.session_id) return detected;
+
+  const type = detected.type !== "unknown" ? detected.type : current.type;
+  const cwd = detected.cwd || current.cwd;
+  const recomputedTranscript =
+    type === "unknown" ? null : transcriptPathFor(type, current.session_id, cwd);
+
+  return {
+    ...detected,
+    type,
+    cwd,
+    session_id: current.session_id,
+    session_id_source: current.session_id_source,
+    transcript_path: recomputedTranscript ?? current.transcript_path,
+  };
+}
+
 function refineFromHandshake(trigger: string): ReturnType<typeof diagnoseDetect> | null {
   const info = server.server.getClientVersion();
   if (!info) return null;
@@ -719,18 +753,21 @@ function refineFromHandshake(trigger: string): ReturnType<typeof diagnoseDetect>
     entry.started_at,
   );
   emitDetectTrace(trigger, diagnosis);
-  // Refine from the handshake, but never let a re-detect that resolved nothing
-  // wipe an already-resolved session_id (e.g. one recovered via sticky-claim at
-  // startup). Keep our id/source/transcript unless the handshake resolved an id.
-  const merged = refined.session_id
-    ? refined
-    : {
-        ...refined,
-        session_id: entry.client.session_id,
-        session_id_source: entry.client.session_id_source,
-        transcript_path: entry.client.transcript_path,
-      };
-  if (merged.type !== entry.client.type || merged.session_id !== entry.client.session_id) {
+  const merged = mergeDetectedClient(entry.client, refined);
+  if (
+    entry.client.session_id &&
+    refined.session_id &&
+    refined.session_id !== entry.client.session_id
+  ) {
+    trace("detect_preserved_existing_session_id", {
+      trigger,
+      existing_session_id: entry.client.session_id,
+      existing_source: entry.client.session_id_source,
+      detected_session_id: refined.session_id,
+      detected_source: refined.session_id_source,
+    });
+  }
+  if (!clientInfoEqual(merged, entry.client)) {
     entry.client = merged;
     register(entry);
   }
@@ -1078,6 +1115,14 @@ type ResolveErr =
   | { ok: false; error: "cross-project" }
   | { ok: false; error: "self-send" };
 
+function resolveErrorWakeStatus(error: ResolveErr["error"]): WakeStatus | undefined {
+  return error === "target-not-found" ? "skipped_no_target" : undefined;
+}
+
+function peerSupportsReplyTo(peer: RegistryEntry): boolean {
+  return peer.capabilities?.mailbox?.reply_to === true;
+}
+
 function projectRootsMatch(caller: RegistryEntry, peer: RegistryEntry): boolean {
   const callerProject = findProjectRoot(caller.client.cwd);
   const peerProject = findProjectRoot(peer.client.cwd);
@@ -1170,7 +1215,7 @@ server.registerTool(
     description: [
       "Fire-and-forget message to a peer in the same project root. Target: a tmux session name OR a client_session_id (UUID). Async via the peer's mailbox — delivered mid-turn (PreToolUse hook) or next-turn (read_my_messages); cross-project targets are rejected.",
       "By default does NOT wake an idle peer. Pass wake:\"auto\" to nudge one via per-client send-keys, state-gated (skipped if the peer is mid-turn). Response then carries wake_status: \"fired\" | \"skipped_busy\" | \"skipped_no_target\" | \"disabled\".",
-      "Body is verbatim — wrap in <system-reminder>...</system-reminder> yourself if you want that framing. For a blocking send-and-wait, use ask_peer instead.",
+      "Body is verbatim — wrap in <system-reminder>...</system-reminder> yourself if you want that framing. When replying to ask_peer, include reply_to: request_id from the inbound message. For a blocking send-and-wait, use ask_peer instead.",
     ].join(" "),
     inputSchema: {
       target: z
@@ -1190,16 +1235,34 @@ server.registerTool(
         .describe(
           'Wake strategy. "off" (default): pure fire-and-forget, no nudge. "auto": nudge an idle peer via per-client send-keys, state-gated (skipped if the peer is mid-turn). Response carries wake_status when set.',
         ),
+      reply_to: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Optional ask_peer request_id this message is replying to."),
+      source_message_id: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Optional prior oxtail message_id this message is derived from. Debug/provenance only; not a trust boundary."),
     },
   },
-  async ({ target, body, wake }) => {
+  async ({ target, body, wake, reply_to, source_message_id }) => {
     const resolved = resolveTarget(target, entry);
     if (!resolved.ok) {
-      return jsonResult({ schema_version: 1, ...resolved });
+      const wake_status = wake === "auto" ? resolveErrorWakeStatus(resolved.error) : undefined;
+      return jsonResult({
+        schema_version: 1,
+        ...resolved,
+        ...(wake_status ? { wake_status } : {}),
+      });
     }
     const peer = resolved.entry;
     const fromSessionId = entry.client.session_id ?? undefined;
-    const msg = mailbox.enqueue(peer.server_pid, body, fromSessionId);
+    const msg = mailbox.enqueue(peer.server_pid, body, fromSessionId, {
+      reply_to,
+      source_message_id,
+    });
     const wake_status = wake === "auto" ? await wakeForSend(peer) : undefined;
     return jsonResult({
       schema_version: 1,
@@ -1216,7 +1279,7 @@ server.registerTool(
   "read_my_messages",
   {
     description:
-      "Drain this session's mailbox and return any messages peers have sent via send_message. Codex peers and any Claude Code peer without the PreToolUse hook installed must poll this tool explicitly; Claude Code peers with the hook installed will see messages mid-turn instead. Always safe to call — returns an empty list when the mailbox is empty.",
+      "Drain this session's mailbox and return any messages peers have sent via send_message. Codex peers and any Claude Code peer without the PreToolUse hook installed must poll this tool explicitly; Claude Code peers with the hooks installed will see messages mid-turn or at turn end instead. After hook delivery, this tool may return count:0 because the hook already drained and injected those messages. Always safe to call — returns an empty list when the mailbox is empty.",
     inputSchema: {},
   },
   async () => {
@@ -1231,9 +1294,11 @@ server.registerTool(
   },
 );
 
-// ask_peer (v0.6): blocking send + wait-for-reply. Builds on send_message's
-// async mailbox transport by holding the request open server-side until the
-// peer replies (filtered by from_session_id) or a fixed timeout elapses.
+// ask_peer (v0.6, hardened in v0.10): blocking send + wait-for-reply. Builds on
+// send_message's mailbox path: enqueue a message to the target peer with a
+// request_id, wake them, then poll until a correlated reply lands or the timeout
+// elapses. Reply-to-capable peers must reply with reply_to=request_id; legacy
+// peers fall back to the original from_session_id-only matching.
 //
 // User-tunable override via OXTAIL_ASK_PEER_TIMEOUT_MS; defaults to 45000ms
 // (conservative under typical MCP-client tool-call abort windows). Set to a
@@ -1252,7 +1317,7 @@ const ASK_PEER_POLL_MS = 200;
 // get raw mailbox JSON from read_my_messages — so the wake itself must preserve
 // the reply path (read → reply via send_message). Per Codex Phase-D review.
 export const ASK_PEER_WAKE_TEXT =
-  "[oxtail] peer msg — read_my_messages; reply via mcp__oxtail__send_message if asked";
+  "oxtail msg: read_my_messages; reply via send_message; set reply_to=request_id if present";
 
 // Codex's TUI has a paste-burst heuristic at codex-rs/tui/src/bottom_pane/
 // paste_burst.rs (PASTE_BURST_MIN_CHARS=3, PASTE_BURST_CHAR_INTERVAL=8ms,
@@ -1483,6 +1548,8 @@ async function wakeForSend(peer: RegistryEntry): Promise<WakeStatus> {
 async function askPeerPoll(
   my_pid: number,
   from_session_id: string,
+  request_id: string,
+  require_reply_to: boolean,
   deadlineMs: number,
   signal: AbortSignal,
 ): Promise<mailbox.Mailbox | null> {
@@ -1498,7 +1565,9 @@ async function askPeerPoll(
     }
     if (stat && stat.mtimeMs !== lastMtime) {
       lastMtime = stat.mtimeMs;
-      const reply = mailbox.drainMatchingSession(my_pid, from_session_id);
+      const reply = require_reply_to
+        ? mailbox.drainMatchingReply(my_pid, from_session_id, request_id)
+        : mailbox.drainMatchingSession(my_pid, from_session_id);
       if (reply) return reply;
     }
     const remaining = deadlineMs - Date.now();
@@ -1508,12 +1577,23 @@ async function askPeerPoll(
   return null;
 }
 
+function drainAskPeerReply(
+  my_pid: number,
+  from_session_id: string,
+  request_id: string,
+  require_reply_to: boolean,
+): mailbox.Mailbox | null {
+  return require_reply_to
+    ? mailbox.drainMatchingReply(my_pid, from_session_id, request_id)
+    : mailbox.drainMatchingSession(my_pid, from_session_id);
+}
+
 server.registerTool(
   "ask_peer",
   {
     description: [
       "Delegate-and-wait: enqueue a message to a peer in the same project root, wake them, and block until they reply (via send_message) or the timeout elapses. Use this for back-and-forth; use send_message for fire-and-forget.",
-      "Wakes the peer via per-client tmux send-keys (Codex gets a paste-burst-aware gap, Claude Code doesn't), then polls for a reply whose from_session_id matches the target. Response carries wake_status: \"fired\" | \"skipped_no_target\" | \"disabled\" (skipped_unsupported is reserved). Returns reply: null, timed_out: true on timeout (default 45000ms, OXTAIL_ASK_PEER_TIMEOUT_MS to tune). Late replies still arrive via read_my_messages / the hook.",
+      "Wakes the peer via per-client tmux send-keys (Codex gets a paste-burst-aware gap, Claude Code doesn't), then polls for a reply. For reply_to-capable peers, only from_session_id + reply_to == request_id satisfies the wait; legacy peers fall back to best-effort from_session_id matching and the response reports correlation:\"uncorrelated\". Response carries wake_status: \"fired\" | \"skipped_no_target\" | \"disabled\" (skipped_unsupported is reserved). Returns reply: null, timed_out: true on timeout (default 45000ms, override per call with timeout_ms, or set OXTAIL_ASK_PEER_TIMEOUT_MS at startup). Late replies still arrive via read_my_messages / the hook.",
       "Target must have a registered client.session_id (Codex peers call claim_session first). Body is verbatim — frame it as an assignment (objective + requested action) so it reads as delegation, not chat. Wake overridable via OXTAIL_ASK_PEER_WAKE_STRATEGY=auto|legacy|off.",
     ].join(" "),
     inputSchema: {
@@ -1528,12 +1608,24 @@ server.registerTool(
           message: "body exceeds 8192 UTF-8 bytes",
         })
         .describe("Message body, ≤8KB UTF-8."),
+      timeout_ms: z
+        .number()
+        .int()
+        .positive()
+        .max(300_000)
+        .optional()
+        .describe("Optional per-call timeout in milliseconds."),
     },
   },
-  async ({ target, body }, extra) => {
+  async ({ target, body, timeout_ms }, extra) => {
     const resolved = resolveTarget(target, entry);
     if (!resolved.ok) {
-      return jsonResult({ schema_version: 1, ...resolved });
+      const wake_status = resolveErrorWakeStatus(resolved.error);
+      return jsonResult({
+        schema_version: 1,
+        ...resolved,
+        ...(wake_status ? { wake_status } : {}),
+      });
     }
     const peer = resolved.entry;
     const expectedSessionId = peer.client.session_id;
@@ -1547,34 +1639,20 @@ server.registerTool(
       });
     }
 
-    // Stale-reply guard: evict any pre-existing messages from the target out
-    // of our own mailbox before sending. By definition, anything already
-    // there from this target is not a reply to the question we're about to
-    // ask. Without this, the grace-window drain (or first poll tick) would
-    // claim a stale prior message as "the reply" and return wrong content
-    // for hookless clients (Codex; unhooked Claude Code). For hook-installed
-    // peers the PreToolUse hook usually drains first and masks the race, but
-    // it's not guaranteed.
-    let drainedStale = 0;
-    while (
-      mailbox.drainMatchingSession(entry.server_pid, expectedSessionId) !== null
-    ) {
-      drainedStale++;
-    }
-    if (drainedStale > 0) {
-      trace("ask_peer_drained_stale", {
-        from_session_id: expectedSessionId,
-        count: drainedStale,
-      });
-    }
-
+    const requestId = randomBytes(8).toString("hex");
+    const requireReplyTo = peerSupportsReplyTo(peer);
     const fromSessionId = entry.client.session_id ?? undefined;
-    const msg = mailbox.enqueue(peer.server_pid, body, fromSessionId);
+    const msg = mailbox.enqueue(peer.server_pid, body, fromSessionId, {
+      request_id: requestId,
+    });
     const startedAt = Date.now();
-    const deadlineMs = startedAt + ASK_PEER_TIMEOUT_MS;
+    const effectiveTimeoutMs = timeout_ms ?? ASK_PEER_TIMEOUT_MS;
+    const deadlineMs = startedAt + effectiveTimeoutMs;
     trace("ask_peer_start", {
       target_session_id: expectedSessionId,
       message_id: msg.id,
+      request_id: requestId,
+      require_reply_to: requireReplyTo,
     });
 
     let reply: mailbox.Mailbox | null = null;
@@ -1585,7 +1663,12 @@ server.registerTool(
       // our outbound arrived, their hook delivered it as additionalContext and
       // their response may already be in our mailbox.
       await askPeerDelay(ASK_PEER_GRACE_MS, extra.signal);
-      reply = mailbox.drainMatchingSession(entry.server_pid, expectedSessionId);
+      reply = drainAskPeerReply(
+        entry.server_pid,
+        expectedSessionId,
+        requestId,
+        requireReplyTo,
+      );
 
       if (!reply) {
         // Common path: peer was idle. Route the wake per client_type.
@@ -1600,6 +1683,8 @@ server.registerTool(
           reply = await askPeerPoll(
             entry.server_pid,
             expectedSessionId,
+            requestId,
+            requireReplyTo,
             deadlineMs,
             extra.signal,
           );
@@ -1622,7 +1707,11 @@ server.registerTool(
     // Re-enqueue so it's not lost.
     if (aborted && reply) {
       try {
-        mailbox.enqueue(entry.server_pid, reply.body, reply.from_session_id);
+        mailbox.enqueue(entry.server_pid, reply.body, reply.from_session_id, {
+          request_id: reply.request_id,
+          reply_to: reply.reply_to,
+          source_message_id: reply.source_message_id,
+        });
         trace("ask_peer_abort_reenqueue", { message_id: reply.id });
       } catch (e) {
         trace("ask_peer_abort_reenqueue_failed", {
@@ -1643,15 +1732,18 @@ server.registerTool(
     trace("ask_peer_end", {
       target_session_id: expectedSessionId,
       message_id: msg.id,
+      request_id: requestId,
       duration_ms: Date.now() - startedAt,
       wake_status: wakeStatus,
       timed_out: timedOut,
+      correlation: reply ? (requireReplyTo ? "correlated" : "uncorrelated") : "none",
     });
 
     return jsonResult({
       schema_version: 1,
       ok: true,
       message_id: msg.id,
+      request_id: requestId,
       wake_status: wakeStatus,
       reply: reply
         ? {
@@ -1659,8 +1751,12 @@ server.registerTool(
             body: reply.body,
             enqueued_at: reply.enqueued_at,
             from_session_id: reply.from_session_id ?? null,
+            reply_to: reply.reply_to ?? null,
+            correlation: requireReplyTo ? "correlated" : "uncorrelated",
           }
         : null,
+      correlation: reply ? (requireReplyTo ? "correlated" : "uncorrelated") : "none",
+      timeout_ms: effectiveTimeoutMs,
       timed_out: timedOut,
     });
   },

@@ -177,6 +177,42 @@ test("integration: claim_session pins session id and returns compact response", 
   }
 });
 
+test("integration: explicit claim is not clobbered by stale env on get_my_session", async () => {
+  const staleEnvId = "476241e9-d65e-4bc2-81b0-c48305298c8b";
+  const realId = "889d00f2-5cfa-4e19-a28f-38b914c6f499";
+  const server = await spawnServer({
+    clientName: "claude-code",
+    extraEnv: { CLAUDE_CODE_SESSION_ID: staleEnvId },
+  });
+  try {
+    const before = await callTool<GetMySessionResponse>(server.client, "get_my_session");
+    assert.equal(before.entry.client.session_id, staleEnvId, "stale env id is detectable before claim");
+
+    await callTool(server.client, "claim_session", { session_id: realId });
+
+    const after = await callTool<GetMySessionResponse>(server.client, "get_my_session");
+    assert.equal(after.entry.client.session_id, realId, "claimed id must survive get_my_session refinement");
+    assert.equal(after.entry.client.session_id_source, "self-register");
+    assert.ok(after.entry.client.transcript_path?.endsWith(`${realId}.jsonl`));
+
+    const staleSend = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: staleEnvId,
+      body: "should not route",
+    });
+    assert.equal(staleSend.ok, false);
+    assert.equal((staleSend as SendErr).error, "target-not-found");
+
+    const realSend = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: realId,
+      body: "self route check",
+    });
+    assert.equal(realSend.ok, false);
+    assert.equal((realSend as SendErr).error, "self-send");
+  } finally {
+    await server.cleanup();
+  }
+});
+
 test("integration: set_my_state stores purpose and bumps updated_at on touch", async () => {
   const server = await spawnServer();
   try {
@@ -665,6 +701,7 @@ type SendErr = {
   ok: false;
   error: "target-not-found" | "ambiguous-target" | "cross-project" | "self-send";
   candidates?: string[];
+  wake_status?: string;
 };
 
 type ReadMyMessagesResponse = {
@@ -677,7 +714,12 @@ type ReadMyMessagesResponse = {
     id: string;
     body: string;
     enqueued_at: number;
+    body_bytes?: number;
+    origin?: "peer";
     from_session_id?: string;
+    request_id?: string;
+    reply_to?: string;
+    source_message_id?: string;
   }>;
 };
 
@@ -693,6 +735,7 @@ function seedPeerEntry(home: string, partial: {
   tmux_session?: string | null;
   cwd?: string;
   type?: "claude-code" | "codex";
+  replyToCapable?: boolean;
 }): RegistryEntry {
   const prev = process.env.HOME;
   process.env.HOME = home;
@@ -710,6 +753,9 @@ function seedPeerEntry(home: string, partial: {
       tmux_pane: null,
       tmux_session: partial.tmux_session ?? null,
       state: null,
+      ...(partial.replyToCapable
+        ? { capabilities: { mailbox: { reply_to: true, provenance: true, push_budget: true } } }
+        : {}),
     };
     register(entry);
     return entry;
@@ -1072,13 +1118,18 @@ type AskPeerOk = {
   schema_version: 1;
   ok: true;
   message_id: string;
+  request_id: string;
   wake_status: "fired" | "skipped_unsupported" | "skipped_no_target" | "disabled";
   reply: {
     id: string;
     body: string;
     enqueued_at: number;
     from_session_id: string | null;
+    reply_to: string | null;
+    correlation: "correlated" | "uncorrelated";
   } | null;
+  correlation: "correlated" | "uncorrelated" | "none";
+  timeout_ms: number;
   timed_out: boolean;
 };
 
@@ -1088,6 +1139,38 @@ type AskPeerErr = {
   error: string;
   message?: string;
 };
+
+function scheduleReplyFromAskMailbox(input: {
+  home: string;
+  peerPid: number;
+  callerPid: number;
+  peerSessionId: string;
+  body: string;
+  delayMs?: number;
+  includeReplyTo?: boolean;
+}): void {
+  setTimeout(() => {
+    const prev = process.env.HOME;
+    process.env.HOME = input.home;
+    try {
+      let outbound = drain(input.peerPid).find((m) => m.request_id);
+      for (let i = 0; !outbound && i < 20; i++) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+        outbound = drain(input.peerPid).find((m) => m.request_id);
+      }
+      enqueue(
+        input.callerPid,
+        input.body,
+        input.peerSessionId,
+        input.includeReplyTo === false
+          ? {}
+          : { reply_to: outbound?.request_id },
+      );
+    } finally {
+      process.env.HOME = prev;
+    }
+  }, input.delayMs ?? 100);
+}
 
 test("ask_peer: peer replies via mailbox before timeout — returns the reply", async () => {
   // Use a moderate timeout so we don't hit it if the test runner is slow.
@@ -1268,11 +1351,11 @@ test("ask_peer: unrelated peer messages stay in mailbox; only matching reply is 
   }
 });
 
-// v0.6 ask_peer stale-reply guard. A pre-existing message in A's mailbox from
-// the target (e.g. a chat message that arrived before A called ask_peer) used
-// to be claimed as "the reply" by the grace-window drain. Fixed by draining
-// matching messages before enqueueing the outbound.
-test("ask_peer: pre-existing stale message from target is evicted, fresh reply wins", async () => {
+// v0.10.1 strict-correlation guard. A pre-existing message in A's mailbox from
+// the target (e.g. a chat message that arrived before A called ask_peer) must
+// not satisfy a reply_to-capable wait. The message is preserved for normal
+// mailbox delivery while the fresh correlated reply wins.
+test("ask_peer: correlated reply wins over stale chatter", async () => {
   const server = await spawnServer({ extraEnv: { OXTAIL_ASK_PEER_TIMEOUT_MS: "8000" } });
   try {
     const targetSid = "cccccccc-2222-3333-4444-555555555555";
@@ -1282,6 +1365,7 @@ test("ask_peer: pre-existing stale message from target is evicted, fresh reply w
       tmux_session: "ask-peer-stale-target",
       cwd: server.home,
       type: "codex",
+      replyToCapable: true,
     });
 
     await callTool(server.client, "claim_session", {
@@ -1290,9 +1374,10 @@ test("ask_peer: pre-existing stale message from target is evicted, fresh reply w
     const me = await callTool<GetMySessionResponse>(server.client, "get_my_session");
     const aPid = me.entry.server_pid;
 
-    // Pre-seed a stale message from the SAME target. Without the
-    // drain-before-enqueue fix, the grace-window matcher would claim this as
-    // the reply to a question we haven't even sent yet.
+    // Pre-seed a stale message from the SAME target. Under strict reply_to
+    // correlation the grace-window matcher must NOT claim this as the reply to a
+    // question we haven't even sent yet: it carries no request_id, so it stays
+    // in the mailbox for normal delivery (asserted below).
     const prev = process.env.HOME;
     process.env.HOME = server.home;
     try {
@@ -1301,16 +1386,13 @@ test("ask_peer: pre-existing stale message from target is evicted, fresh reply w
       process.env.HOME = prev;
     }
 
-    // The actual reply lands after ask_peer has started.
-    setTimeout(() => {
-      const prev2 = process.env.HOME;
-      process.env.HOME = server.home;
-      try {
-        enqueue(aPid, "real answer to the question", targetSid);
-      } finally {
-        process.env.HOME = prev2;
-      }
-    }, 600);
+    scheduleReplyFromAskMailbox({
+      home: server.home,
+      peerPid: process.pid,
+      callerPid: aPid,
+      peerSessionId: targetSid,
+      body: "real answer to the question",
+    });
 
     const result = await callTool<AskPeerOk | AskPeerErr>(server.client, "ask_peer", {
       target: "ask-peer-stale-target",
@@ -1323,13 +1405,110 @@ test("ask_peer: pre-existing stale message from target is evicted, fresh reply w
       "real answer to the question",
       "fresh reply wins; the stale 'old chatter' must not be returned",
     );
+    assert.equal(ok.reply?.reply_to, ok.request_id);
+    assert.equal(ok.correlation, "correlated");
 
-    // Mailbox should be empty afterward (stale was drained pre-enqueue, fresh
-    // reply was drained as the reply).
+    // Stale same-peer chatter remains for normal mailbox delivery.
     process.env.HOME = server.home;
     try {
       const remaining = drain(aPid);
-      assert.equal(remaining.length, 0, "no messages should remain");
+      assert.equal(remaining.length, 1);
+      assert.equal(remaining[0].body, "old chatter from earlier");
+    } finally {
+      process.env.HOME = prev;
+    }
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("ask_peer: legacy peer may stale-match same-peer chatter as uncorrelated", async () => {
+  const server = await spawnServer({ extraEnv: { OXTAIL_ASK_PEER_TIMEOUT_MS: "5000" } });
+  try {
+    const targetSid = "99999999-2222-3333-4444-555555555555";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: targetSid,
+      tmux_session: "ask-peer-legacy-stale-target",
+      cwd: server.home,
+      type: "codex",
+    });
+
+    await callTool(server.client, "claim_session", {
+      session_id: "99999999-aaaa-bbbb-cccc-555555555555",
+    });
+    const me = await callTool<GetMySessionResponse>(server.client, "get_my_session");
+    const aPid = me.entry.server_pid;
+
+    const prev = process.env.HOME;
+    process.env.HOME = server.home;
+    try {
+      enqueue(aPid, "legacy stale chatter", targetSid);
+    } finally {
+      process.env.HOME = prev;
+    }
+
+    const result = await callTool<AskPeerOk | AskPeerErr>(server.client, "ask_peer", {
+      target: "ask-peer-legacy-stale-target",
+      body: "legacy best-effort question",
+    });
+    assert.equal(result.ok, true);
+    const ok = result as AskPeerOk;
+    assert.equal(ok.timed_out, false);
+    assert.equal(ok.reply?.body, "legacy stale chatter");
+    assert.equal(ok.reply?.reply_to, null);
+    assert.equal(ok.reply?.correlation, "uncorrelated");
+    assert.equal(ok.correlation, "uncorrelated");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("ask_peer: reply_to-capable peer does not consume uncorrelated replies", async () => {
+  const server = await spawnServer({ extraEnv: { OXTAIL_ASK_PEER_TIMEOUT_MS: "8000" } });
+  try {
+    const targetSid = "eeeeeeee-2222-3333-4444-555555555555";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: targetSid,
+      tmux_session: "ask-peer-uncorrelated-target",
+      cwd: server.home,
+      type: "codex",
+      replyToCapable: true,
+    });
+    await callTool(server.client, "claim_session", {
+      session_id: "eeeeeeee-aaaa-bbbb-cccc-555555555555",
+    });
+    const me = await callTool<GetMySessionResponse>(server.client, "get_my_session");
+    const aPid = me.entry.server_pid;
+
+    scheduleReplyFromAskMailbox({
+      home: server.home,
+      peerPid: process.pid,
+      callerPid: aPid,
+      peerSessionId: targetSid,
+      body: "forgot reply_to",
+      includeReplyTo: false,
+    });
+
+    const result = await callTool<AskPeerOk | AskPeerErr>(server.client, "ask_peer", {
+      target: "ask-peer-uncorrelated-target",
+      body: "question needing strict reply_to",
+      timeout_ms: 1200,
+    });
+    assert.equal(result.ok, true);
+    const ok = result as AskPeerOk;
+    assert.equal(ok.timed_out, true);
+    assert.equal(ok.correlation, "none");
+    assert.equal(ok.timeout_ms, 1200);
+
+    const prev = process.env.HOME;
+    process.env.HOME = server.home;
+    try {
+      const remaining = drain(aPid);
+      assert.equal(remaining.length, 1);
+      assert.equal(remaining[0].body, "forgot reply_to");
+      assert.equal(remaining[0].reply_to, undefined);
     } finally {
       process.env.HOME = prev;
     }
@@ -1433,9 +1612,16 @@ test("integration: a restarted Codex MCP child recovers its session via sticky c
   const codexEnv = { HOME: sharedHome, CODEX_HOME: join(sharedHome, ".codex") };
   const sessionId = "019e7d25-bdb4-7f90-a422-795f18cbd07e";
 
-  // Place a Codex rollout so the claim resolves a non-null transcript_path
-  // (findCodexTranscriptPath scans ~/.codex/sessions/<recent>). Write into both
-  // UTC and local "today" dirs to stay clear of a date-boundary flake.
+  // Place Codex rollouts so the claim resolves a non-null transcript_path
+  // (findCodexTranscriptPath scans ~/.codex/sessions/<recent>). We seed TWO
+  // distinct session ids for this cwd on purpose: birth-time only resolves on
+  // exactly one post-start candidate (pickByDelta requires ranked.length === 1),
+  // so >=2 candidates force it to abstain and the restarted child must recover
+  // via the sticky claim. Without the decoy, a UTC CI runner collapses both day
+  // dirs into a single file and birth-time can win the startup race against
+  // sticky-claim under load, flaking the source attribution. Write into both UTC
+  // and local "today" dirs to also stay clear of a date-boundary flake.
+  const decoyId = "019e7d25-0000-7000-a000-0000000000de";
   const d = new Date();
   const dayDirs = [
     [d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate()],
@@ -1447,7 +1633,9 @@ test("integration: a restarted Codex MCP child recovers its session via sticky c
       String(y), String(m).padStart(2, "0"), String(day).padStart(2, "0"),
     );
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, `rollout-${sessionId}.jsonl`), JSON.stringify({ payload: { cwd: sharedHome } }) + "\n");
+    for (const id of [sessionId, decoyId]) {
+      writeFileSync(join(dir, `rollout-${id}.jsonl`), JSON.stringify({ payload: { cwd: sharedHome } }) + "\n");
+    }
   }
 
   let s1: Awaited<ReturnType<typeof spawnServer>> | undefined;
