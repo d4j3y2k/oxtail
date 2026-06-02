@@ -124,20 +124,75 @@ test("claims: no record returns null", () => {
   });
 });
 
-test("claims: two sessions sharing one host abstain (ambiguous → require explicit claim)", () => {
+test("claims: true tie between two matching sessions abstains", () => {
   withHome((home) => {
     const t1 = makeTranscript(home, "r1.jsonl");
     const t2 = makeTranscript(home, "r2.jsonl");
+    const claimedAt = now();
     writeClaim({
       client_type: "codex", cwd: "/repo", ancestors: [launcherA, host],
-      session_id: "sess-A", transcript_path: t1, server_pid: 1, claimed_at: now(),
+      session_id: "sess-A", transcript_path: t1, server_pid: 1, claimed_at: claimedAt,
     });
     writeClaim({
       client_type: "codex", cwd: "/repo", ancestors: [launcherB, host],
-      session_id: "sess-B", transcript_path: t2, server_pid: 2, claimed_at: now(),
+      session_id: "sess-B", transcript_path: t2, server_pid: 2, claimed_at: claimedAt,
     });
-    // Both share `host` → ambiguous → abstain.
+    // Both share only `host` at the same depth with the same recency.
     assert.equal(recoverClaim("codex", "/repo", [host]), null);
+  });
+});
+
+test("claims: stronger ancestry overlap wins over a newer weaker match", () => {
+  withHome((home) => {
+    const tWeak = makeTranscript(home, "weak.jsonl");
+    const tStrong = makeTranscript(home, "strong.jsonl");
+    writeClaim({
+      client_type: "codex", cwd: "/repo", ancestors: [host],
+      session_id: "weak", transcript_path: tWeak, server_pid: 1, claimed_at: now() + 100,
+    });
+    writeClaim({
+      client_type: "codex", cwd: "/repo", ancestors: [launcherA, host],
+      session_id: "strong", transcript_path: tStrong, server_pid: 2, claimed_at: now(),
+    });
+
+    const rec = recoverClaim("codex", "/repo", [launcherA, host]);
+    assert.equal(rec?.session_id, "strong");
+  });
+});
+
+test("claims: nearest current ancestor wins when overlap count ties", () => {
+  withHome((home) => {
+    const tNear = makeTranscript(home, "near.jsonl");
+    const tFar = makeTranscript(home, "far.jsonl");
+    writeClaim({
+      client_type: "codex", cwd: "/repo", ancestors: [host],
+      session_id: "far", transcript_path: tFar, server_pid: 1, claimed_at: now() + 100,
+    });
+    writeClaim({
+      client_type: "codex", cwd: "/repo", ancestors: [launcherA],
+      session_id: "near", transcript_path: tNear, server_pid: 2, claimed_at: now(),
+    });
+
+    const rec = recoverClaim("codex", "/repo", [launcherA, host]);
+    assert.equal(rec?.session_id, "near");
+  });
+});
+
+test("claims: newer claim wins when ancestry score ties", () => {
+  withHome((home) => {
+    const tOld = makeTranscript(home, "old.jsonl");
+    const tNew = makeTranscript(home, "new.jsonl");
+    writeClaim({
+      client_type: "codex", cwd: "/repo", ancestors: [host],
+      session_id: "old", transcript_path: tOld, server_pid: 1, claimed_at: 100,
+    });
+    writeClaim({
+      client_type: "codex", cwd: "/repo", ancestors: [host],
+      session_id: "new", transcript_path: tNew, server_pid: 2, claimed_at: 200,
+    });
+
+    const rec = recoverClaim("codex", "/repo", [host]);
+    assert.equal(rec?.session_id, "new");
   });
 });
 

@@ -108,6 +108,35 @@ export function releaseLock(pid: number): void {
 // The runtime regex below catches that.
 const FIELD_ORDER_PREFIX = /^\{"schema_version":1,"id":"[0-9a-f]{16}","body":"/;
 
+// Serialize a Mailbox into its on-disk JSONL line, inserting keys in the
+// invariant order (schema_version, id, body, …). Node's JSON.stringify
+// preserves insertion order for non-integer string keys, which the test suite
+// and the awk extractor in assets/pretooluse.sh both pin. Shared by enqueue
+// (fresh messages) and requeue/migrate (re-homing already-built messages) so
+// the FIELD_ORDER_PREFIX invariant is enforced in exactly one place.
+export function serializeMailboxLine(msg: Mailbox): string {
+  const obj: Record<string, unknown> = {
+    schema_version: msg.schema_version,
+    id: msg.id,
+    body: msg.body,
+    enqueued_at: msg.enqueued_at,
+    body_bytes: msg.body_bytes ?? Buffer.byteLength(msg.body, "utf8"),
+    origin: msg.origin ?? "peer",
+  };
+  if (msg.from_session_id) obj.from_session_id = msg.from_session_id;
+  if (msg.request_id) obj.request_id = msg.request_id;
+  if (msg.reply_to) obj.reply_to = msg.reply_to;
+  if (msg.source_message_id) obj.source_message_id = msg.source_message_id;
+  const line = JSON.stringify(obj) + "\n";
+  if (!FIELD_ORDER_PREFIX.test(line)) {
+    throw new Error(
+      `mailbox: serialized line violates field-order invariant. ` +
+      `Got prefix: ${line.slice(0, 80)}`,
+    );
+  }
+  return line;
+}
+
 export function enqueue(
   target_pid: number,
   body: string,
@@ -126,31 +155,7 @@ export function enqueue(
     ...(options.reply_to ? { reply_to: options.reply_to } : {}),
     ...(options.source_message_id ? { source_message_id: options.source_message_id } : {}),
   };
-
-  // Build the line by inserting keys in the invariant order. Node's
-  // JSON.stringify preserves insertion order for non-integer string keys,
-  // which the test suite pins.
-  const obj: Record<string, unknown> = {
-    schema_version: msg.schema_version,
-    id: msg.id,
-    body: msg.body,
-    enqueued_at: msg.enqueued_at,
-    body_bytes: msg.body_bytes,
-    origin: msg.origin,
-  };
-  if (from_session_id) obj.from_session_id = from_session_id;
-  if (msg.request_id) obj.request_id = msg.request_id;
-  if (msg.reply_to) obj.reply_to = msg.reply_to;
-  if (msg.source_message_id) obj.source_message_id = msg.source_message_id;
-  const line = JSON.stringify(obj) + "\n";
-
-  if (!FIELD_ORDER_PREFIX.test(line)) {
-    throw new Error(
-      `mailbox enqueue: serialized line violates field-order invariant. ` +
-      `Got prefix: ${line.slice(0, 80)}`,
-    );
-  }
-
+  const line = serializeMailboxLine(msg);
   acquireLock(target_pid);
   try {
     appendFileSync(mailboxPath(target_pid), line);
@@ -158,6 +163,124 @@ export function enqueue(
     releaseLock(target_pid);
   }
   return msg;
+}
+
+// Append an already-built message to a mailbox without minting a new id. Used
+// by read_my_messages to put budget-deferred overflow back into the caller's
+// own mailbox (lossless: the next drain/hook delivers it) and is the building
+// block migrateMailbox uses to re-home a dead sibling's mail.
+export function requeue(target_pid: number, msg: Mailbox): void {
+  const line = serializeMailboxLine(msg);
+  acquireLock(target_pid);
+  try {
+    appendFileSync(mailboxPath(target_pid), line);
+  } finally {
+    releaseLock(target_pid);
+  }
+}
+
+// Re-append several already-built messages under a single lock. Used by
+// read_my_messages to put budget-deferred overflow back in one atomic append
+// (one failure point instead of N) so the caller can treat it as all-or-nothing.
+export function requeueMany(target_pid: number, msgs: Mailbox[]): void {
+  if (msgs.length === 0) return;
+  let buf = "";
+  for (const m of msgs) buf += serializeMailboxLine(m);
+  acquireLock(target_pid);
+  try {
+    appendFileSync(mailboxPath(target_pid), buf);
+  } finally {
+    releaseLock(target_pid);
+  }
+}
+
+// Drain the union of several pid mailboxes — a session's inbox spread across
+// its current + prior/sibling MCP-child pids. Each pid is drained under its own
+// lock (no nested locks). Mirrors the PreToolUse hook's session_id→pid union so
+// read_my_messages reaches a message enqueued to a sibling/previous pid instead
+// of silently stranding it. Best-effort per pid: a contended/unreadable mailbox
+// is skipped (counted) and left for the next poll rather than failing the whole
+// drain — one stuck lock must not block a session's entire inbox.
+export function drainMany(pids: number[]): { messages: Mailbox[]; skipped: number } {
+  const out: Mailbox[] = [];
+  const seen = new Set<number>();
+  let skipped = 0;
+  for (const pid of pids) {
+    if (seen.has(pid)) continue;
+    seen.add(pid);
+    try {
+      for (const m of drain(pid)) out.push(m);
+    } catch {
+      skipped++;
+    }
+  }
+  return { messages: out, skipped };
+}
+
+// True if a pid's mailbox file holds any bytes. drain() truncates to 0 after a
+// successful read, so a non-empty file means "undrained mail is here" — used by
+// registry reap-deferral to avoid unlinking a dead child's registry entry while
+// its mailbox still needs to be reached by the session union-drain.
+export function mailboxHasMessages(pid: number): boolean {
+  try {
+    return statSync(mailboxPath(pid)).size > 0;
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException;
+    if (err.code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+// Move every message from `fromPid`'s mailbox into `toPid`'s, preserving the
+// raw JSONL lines byte-exact. Used when a dead MCP child is consolidated into a
+// live sibling that shares its session_id, so a message enqueued to the prior
+// pid survives the restart. Returns the count migrated.
+//
+// Correctness (per Codex review): the source mailbox is now ALSO drainable by
+// the session union (read_my_messages / the PreToolUse hook). To stop a
+// concurrent drainer from grabbing these same lines and double-delivering, the
+// source lock is held across the WHOLE move — read, dest append, and source
+// truncate. Append happens BEFORE truncate, so a dest-append failure leaves the
+// source intact (its breadcrumb is kept and a later migrate/union-drain retries
+// it) — never a lost-in-the-gap window.
+//
+// Lock order is always source→dest. drainMany holds one mailbox lock at a time
+// (never source-then-dest), and the PreToolUse hook bounds every lock wait at
+// ~500ms (it skips a contended mailbox and proceeds). So this nesting cannot
+// deadlock: under contention migrate's dest-lock acquire throws after ~500ms,
+// gcDeadSiblings keeps the breadcrumb, and the move is retried on the next
+// register. The only residual failure is a crash BETWEEN the append and the
+// truncate, which can duplicate (message_id is stable for dedup) — strictly
+// preferable to loss or orphaning.
+export function migrateMailbox(fromPid: number, toPid: number): number {
+  if (fromPid === toPid) return 0;
+  const src = mailboxPath(fromPid);
+  acquireLock(fromPid);
+  try {
+    let raw: string;
+    try {
+      raw = readFileSync(src, "utf8");
+    } catch (e) {
+      const err = e as NodeJS.ErrnoException;
+      if (err.code === "ENOENT") return 0;
+      throw err;
+    }
+    if (!raw || !raw.trim()) return 0;
+    const block = raw.endsWith("\n") ? raw : raw + "\n";
+    const count = raw.split("\n").filter((l) => l.trim().length > 0).length;
+
+    acquireLock(toPid);
+    try {
+      appendFileSync(mailboxPath(toPid), block);
+    } finally {
+      releaseLock(toPid);
+    }
+    // Append succeeded → clear the source (still under the source lock).
+    truncateSync(src, 0);
+    return count;
+  } finally {
+    releaseLock(fromPid);
+  }
 }
 
 export function drain(my_pid: number): Mailbox[] {

@@ -12,6 +12,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ClientInfo } from "./clients.js";
+import { mailboxHasMessages, migrateMailbox } from "./mailbox.js";
 
 export type StateCard = {
   purpose: string | null;
@@ -186,13 +187,15 @@ export function refreshTmuxBinding(entry: RegistryEntry): void {
 
 export function register(entry: RegistryEntry): void {
   ensureDir();
-  // Best-effort GC: drop stale entries from dead processes that share our
-  // session_id. Happens when oxtail is configured in multiple MCP scopes
-  // (user + project), so the same client session has spawned several MCP
-  // server children over its lifetime — survivors of crashed prior children
-  // accumulate otherwise. Leaves live siblings alone; readAll() collapses
-  // those by session_id.
-  gcDeadSiblings(entry);
+  // PUBLICATION ORDER (per Codex review): write OUR registry breadcrumb BEFORE
+  // touching dead siblings. gcDeadSiblings() migrates a dead sibling's mail into
+  // entry.server_pid's mailbox and then unlinks that sibling's registry file; if
+  // we GC'd first, a crash after the migration but before our own file existed
+  // would leave the migrated mail in ${entry.server_pid}.jsonl with NO registry
+  // breadcrumb for either pid — invisible to sessionPidsForId / the union-drain.
+  // Publishing first guarantees a dead-but-claimed breadcrumb for our pid
+  // survives such a crash, so readAll()'s reap-deferral keeps the mail reachable.
+  //
   // Temp file + atomic rename. Concurrent peers running readAll() can otherwise
   // catch a torn write, fail JSON.parse, and silently drop the entry until the
   // next write completes.
@@ -209,6 +212,12 @@ export function register(entry: RegistryEntry): void {
     }
     throw err;
   }
+  // Now that our breadcrumb is published, consolidate + GC dead siblings: drop
+  // stale entries from dead processes that share our session_id (accumulate when
+  // oxtail is configured in multiple MCP scopes — user + project), migrating any
+  // undrained mail into us first. Leaves live siblings alone; readAll() collapses
+  // those by session_id.
+  gcDeadSiblings(entry);
 }
 
 function gcDeadSiblings(entry: RegistryEntry): void {
@@ -228,10 +237,33 @@ function gcDeadSiblings(entry: RegistryEntry): void {
     if (other.server_pid === entry.server_pid) continue;
     if (other.client.session_id !== sid) continue;
     if (isAlive(other.server_pid)) continue;
+    // Consolidate before dropping: a peer may have enqueued to this dead
+    // sibling's pid mailbox before we (the restarted/sibling child) registered.
+    // Move that undrained mail into our own mailbox — same session_id, same
+    // agent identity — so the message survives the pid rotation instead of
+    // being orphaned with the registry file. Best-effort; never blocks register.
     try {
-      unlinkSync(full);
+      migrateMailbox(other.server_pid, entry.server_pid);
     } catch {
-      // already gone, fine
+      // migration is best-effort; we decide below whether to drop the breadcrumb
+    }
+    // Only drop the registry file once the dead sibling's mailbox is actually
+    // empty. If migration failed, or a send raced in after migrate read it, the
+    // mail is still there — keep the file so the session union-drain
+    // (read_my_messages / hook) can still reach it; readAll() reap-deferral and
+    // a later register() retry the consolidation.
+    let stillHasMail = true;
+    try {
+      stillHasMail = mailboxHasMessages(other.server_pid);
+    } catch {
+      stillHasMail = true; // conservative: keep the breadcrumb on uncertainty
+    }
+    if (!stillHasMail) {
+      try {
+        unlinkSync(full);
+      } catch {
+        // already gone, fine
+      }
     }
   }
 }
@@ -268,10 +300,20 @@ export function readAll(): RegistryEntry[] {
       continue;
     }
     if (!isAlive(entry.server_pid)) {
-      try {
-        unlinkSync(full);
-      } catch {
-        // ignore
+      // Reap-deferral: a dead child's mailbox may still hold undrained mail
+      // that the session's union-drain (PreToolUse hook + read_my_messages)
+      // must reach. Keep the registry file as a routing breadcrumb until the
+      // mailbox is empty — but ONLY for a claimed (non-null session_id) entry:
+      // a null-session dead child is not identity-addressable, so retaining it
+      // would only grow ambiguity. Either way it is excluded from `live`.
+      const keepForMail =
+        entry.client.session_id != null && mailboxHasMessages(entry.server_pid);
+      if (!keepForMail) {
+        try {
+          unlinkSync(full);
+        } catch {
+          // ignore
+        }
       }
       continue;
     }
@@ -309,4 +351,30 @@ export function dedupeBySessionId(entries: RegistryEntry[]): RegistryEntry[] {
 
 export function findByTmuxSession(name: string): RegistryEntry[] {
   return readAll().filter((e) => e.tmux_session === name);
+}
+
+// Every MCP-child pid that has a registry file on disk under this session_id,
+// live or dead, WITHOUT reaping or liveness filtering — oldest-first by
+// started_at. Mirrors the PreToolUse hook's session_id→pid grep
+// (assets/pretooluse.sh) so read_my_messages can drain the same union: a
+// message enqueued to a prior/sibling pid stays reachable (via reap-deferral)
+// until that pid's mail is drained or migrated. Oldest-first so a dead sibling's
+// older orphaned mail is drained ahead of the current child's newer mail;
+// read_my_messages still re-sorts the merged result chronologically.
+export function sessionPidsForId(sessionId: string): number[] {
+  const dir = registryDir();
+  if (!existsSync(dir)) return [];
+  const entries: RegistryEntry[] = [];
+  for (const file of readdirSync(dir)) {
+    if (!file.endsWith(".json")) continue;
+    let e: RegistryEntry;
+    try {
+      e = JSON.parse(readFileSync(join(dir, file), "utf8")) as RegistryEntry;
+    } catch {
+      continue;
+    }
+    if (e.client.session_id === sessionId) entries.push(e);
+  }
+  entries.sort((a, b) => a.started_at - b.started_at);
+  return entries.map((e) => e.server_pid);
 }

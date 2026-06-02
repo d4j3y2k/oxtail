@@ -18,8 +18,10 @@ import {
   findTmuxPaneByAncestry,
   readAll,
   register,
+  sessionPidsForId,
   type RegistryEntry,
 } from "./registry.js";
+import * as mailbox from "./mailbox.js";
 import { joinSessionsWithRegistry, tailChars, toCompactList, type Session } from "./server.js";
 
 type TmuxRow = Omit<Session, "client_type" | "client_session_id" | "state">;
@@ -447,6 +449,165 @@ test("register: leaves live sibling alone (legitimate multi-scope case)", () => 
     const result = readAll();
     assert.equal(result.length, 1);
     assert.equal(result[0].server_pid, process.pid, "freshest started_at wins");
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// session_id union drain + reap-deferral + dead-sibling consolidation
+// (fixes silent message loss on MCP-child pid rotation)
+// ────────────────────────────────────────────────────────────────────────────
+
+test("sessionPidsForId: returns all (live + dead) pids for a session, oldest-first", () => {
+  withTempHome((home) => {
+    const dir = join(home, ".oxtail", "sessions");
+    mkdirSync(dir, { recursive: true });
+    const dead = deadPid();
+    const live = process.pid;
+    writeFileSync(
+      join(dir, `${dead}.json`),
+      JSON.stringify(makeRegistryEntry({ pid: dead, session_id: "uuid-s", started_at: 10 })),
+    );
+    writeFileSync(
+      join(dir, `${live}.json`),
+      JSON.stringify(makeRegistryEntry({ pid: live, session_id: "uuid-s", started_at: 20 })),
+    );
+    // Unrelated session must be excluded.
+    writeFileSync(
+      join(dir, `4242.json`),
+      JSON.stringify(makeRegistryEntry({ pid: 4242, session_id: "uuid-other", started_at: 5 })),
+    );
+    assert.deepEqual(
+      sessionPidsForId("uuid-s"),
+      [dead, live],
+      "oldest-first, no liveness filter, only matching session",
+    );
+    assert.deepEqual(sessionPidsForId("nope"), []);
+  });
+});
+
+test("readAll: defers reaping a dead CLAIMED entry whose mailbox is non-empty", () => {
+  withTempHome((home) => {
+    const dir = join(home, ".oxtail", "sessions");
+    mkdirSync(dir, { recursive: true });
+    const dead = deadPid();
+    writeFileSync(
+      join(dir, `${dead}.json`),
+      JSON.stringify(makeRegistryEntry({ pid: dead, session_id: "uuid-keep", started_at: 1 })),
+    );
+    mailbox.enqueue(dead, "stranded"); // undrained mail in the dead child's box
+
+    const result = readAll();
+    assert.equal(result.length, 0, "dead entry excluded from live[]");
+    assert.ok(
+      existsSync(join(dir, `${dead}.json`)),
+      "registry file kept as a routing breadcrumb while mail is pending",
+    );
+
+    // Once the mail is drained, a later readAll reaps the file normally.
+    mailbox.drain(dead);
+    readAll();
+    assert.ok(!existsSync(join(dir, `${dead}.json`)), "reaped after mailbox emptied");
+  });
+});
+
+test("readAll: reaps a dead entry with an empty mailbox immediately", () => {
+  withTempHome((home) => {
+    const dir = join(home, ".oxtail", "sessions");
+    mkdirSync(dir, { recursive: true });
+    const dead = deadPid();
+    writeFileSync(
+      join(dir, `${dead}.json`),
+      JSON.stringify(makeRegistryEntry({ pid: dead, session_id: "uuid-empty", started_at: 1 })),
+    );
+    readAll();
+    assert.ok(!existsSync(join(dir, `${dead}.json`)), "no pending mail → reaped");
+  });
+});
+
+test("readAll: reaps a dead NULL-session entry even with pending mail (not addressable)", () => {
+  withTempHome((home) => {
+    const dir = join(home, ".oxtail", "sessions");
+    mkdirSync(dir, { recursive: true });
+    const dead = deadPid();
+    writeFileSync(
+      join(dir, `${dead}.json`),
+      JSON.stringify(makeRegistryEntry({ pid: dead, session_id: null, started_at: 1 })),
+    );
+    mailbox.enqueue(dead, "orphan");
+    readAll();
+    assert.ok(
+      !existsSync(join(dir, `${dead}.json`)),
+      "null-session dead entry is reaped regardless of mail — keeping it only grows ambiguity",
+    );
+  });
+});
+
+test("register: migrates a dead sibling's mailbox into the new entry before unlinking", () => {
+  withTempHome((home) => {
+    const dir = join(home, ".oxtail", "sessions");
+    mkdirSync(dir, { recursive: true });
+    const dead = deadPid();
+    writeFileSync(
+      join(dir, `${dead}.json`),
+      JSON.stringify(makeRegistryEntry({ pid: dead, session_id: "uuid-mig", started_at: 1 })),
+    );
+    // A peer enqueued to the prior (now-dead) pid before we restarted.
+    mailbox.enqueue(dead, "pre-restart", "peer-sender", { request_id: "rq" });
+
+    // Restart: register a fresh live entry under our pid, same session_id.
+    register(makeRegistryEntry({ pid: process.pid, session_id: "uuid-mig", started_at: 2 }));
+
+    assert.ok(!existsSync(join(dir, `${dead}.json`)), "dead sibling unlinked after migration");
+    const mine = mailbox.drain(process.pid);
+    assert.deepEqual(
+      mine.map((m) => m.body),
+      ["pre-restart"],
+      "stranded message consolidated into the live entry — not silently lost",
+    );
+    assert.equal(mine[0].request_id, "rq");
+    assert.equal(mine[0].from_session_id, "peer-sender");
+  });
+});
+
+test("register: publishes the new breadcrumb before migrating; migrate failure keeps old breadcrumb + mail", () => {
+  withTempHome((home) => {
+    const dir = join(home, ".oxtail", "sessions");
+    mkdirSync(dir, { recursive: true });
+    const dead = deadPid();
+    writeFileSync(
+      join(dir, `${dead}.json`),
+      JSON.stringify(makeRegistryEntry({ pid: dead, session_id: "uuid-pub", started_at: 1 })),
+    );
+    mailbox.enqueue(dead, "pending");
+    // Force migrateMailbox(dead, process.pid)'s dest append to fail by holding a
+    // fresh lock on the new pid's mailbox so the migrate times out and throws.
+    const destLock = mailbox.mailboxLockPath(process.pid);
+    mkdirSync(destLock, { recursive: true, mode: 0o700 });
+    try {
+      register(makeRegistryEntry({ pid: process.pid, session_id: "uuid-pub", started_at: 2 }));
+    } finally {
+      try {
+        rmSync(destLock, { recursive: true, force: true });
+      } catch {
+        // best effort
+      }
+    }
+    // Publication-order invariant: our breadcrumb exists even though the
+    // subsequent migration failed — so a crash there can't hide migrated mail.
+    assert.ok(
+      existsSync(join(dir, `${process.pid}.json`)),
+      "new pid breadcrumb published before migration ran",
+    );
+    // Migration failed → old sibling breadcrumb + mail preserved, not orphaned.
+    assert.ok(
+      existsSync(join(dir, `${dead}.json`)),
+      "old sibling breadcrumb kept when migration fails",
+    );
+    assert.deepEqual(
+      mailbox.drain(dead).map((m) => m.body),
+      ["pending"],
+      "old mail preserved for retry",
+    );
   });
 });
 
