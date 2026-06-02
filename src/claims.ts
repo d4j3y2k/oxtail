@@ -22,10 +22,11 @@
 // key collides. Why not birth-time on restart: the transcript predates the
 // restarted child's started_at, so the positive-delta birth-time rule abstains.
 //
-// Recovery is conservative: it adopts ONLY when exactly one record matches the
-// live ancestry and the recorded transcript still exists. Any ambiguity (zero
-// or multiple matching claims) → null → the caller falls back to the explicit
-// claim_session next_step rather than guessing.
+// Recovery is conservative but no longer requires "exactly one historical
+// claim" for the cwd. Dogfooding leaves several old claims under one project,
+// so recover the unique best live-ancestry match and abstain only on a true tie.
+// Zero matches or tied best matches → null → the caller falls back to the
+// explicit claim_session next_step rather than guessing.
 //
 // A live registry entry that already holds the recovered session_id is NOT a
 // conflict: per the AGENTS.md invariant, session_id IS the agent identity, so a
@@ -50,8 +51,7 @@ import type { ClientType } from "./clients.js";
 
 // How far up the process tree to look for a shared host. Deep enough to clear
 // launcher(s) between the host and the MCP server; if it also catches a shared
-// terminal/login-shell, the "exactly one match" guard still keeps recovery safe
-// (ambiguity → abstain → explicit claim).
+// terminal/login-shell, the scored recovery still abstains on true ties.
 const ANCESTRY_DEPTH = 8;
 
 // Records older than this with no live evidence are GC'd on the next write.
@@ -136,6 +136,67 @@ function chainsOverlap(a: Ancestor[], b: Ancestor[]): boolean {
   return false;
 }
 
+type ClaimScore = {
+  overlap_count: number;
+  nearest_overlap_current: number;
+  nearest_overlap_record: number;
+  claimed_at: number;
+};
+
+function ancestorKey(a: Ancestor): string | null {
+  return a.sig ? `${a.pid}\0${a.sig}` : null;
+}
+
+function scoreClaim(
+  recordAncestors: Ancestor[],
+  currentAncestors: Ancestor[],
+  claimedAt: number,
+): ClaimScore | null {
+  const currentIndexByKey = new Map<string, number>();
+  for (let i = 0; i < currentAncestors.length; i++) {
+    const key = ancestorKey(currentAncestors[i]!);
+    if (key && !currentIndexByKey.has(key)) currentIndexByKey.set(key, i);
+  }
+
+  let overlapCount = 0;
+  let nearestCurrent = Number.POSITIVE_INFINITY;
+  let nearestRecord = Number.POSITIVE_INFINITY;
+  const seen = new Set<string>();
+  for (let i = 0; i < recordAncestors.length; i++) {
+    const key = ancestorKey(recordAncestors[i]!);
+    if (!key || seen.has(key)) continue;
+    const currentIdx = currentIndexByKey.get(key);
+    if (currentIdx === undefined) continue;
+    seen.add(key);
+    overlapCount++;
+    nearestCurrent = Math.min(nearestCurrent, currentIdx);
+    nearestRecord = Math.min(nearestRecord, i);
+  }
+
+  if (overlapCount === 0) return null;
+  return {
+    overlap_count: overlapCount,
+    nearest_overlap_current: nearestCurrent,
+    nearest_overlap_record: nearestRecord,
+    claimed_at: claimedAt,
+  };
+}
+
+function compareClaimScores(a: ClaimScore, b: ClaimScore): number {
+  if (a.overlap_count !== b.overlap_count) return a.overlap_count - b.overlap_count;
+  if (a.nearest_overlap_current !== b.nearest_overlap_current) {
+    return b.nearest_overlap_current - a.nearest_overlap_current;
+  }
+  if (a.nearest_overlap_record !== b.nearest_overlap_record) {
+    return b.nearest_overlap_record - a.nearest_overlap_record;
+  }
+  return a.claimed_at - b.claimed_at;
+}
+
+function scoresTie(a: ClaimScore, b: ClaimScore): boolean {
+  return compareClaimScores(a, b) === 0;
+}
+
 function claimKey(clientType: ClientType, cwd: string, sessionId: string): string {
   return createHash("sha256")
     .update(`${clientType} ${cwd} ${sessionId}`)
@@ -193,9 +254,9 @@ export type RecoverDeps = {
 };
 
 // Recover the previously-claimed session for this (client_type, cwd) whose
-// stored ancestry still shares a live process with `ancestors`. Returns the
-// record only when exactly one record is an unambiguously safe match; otherwise
-// null (caller falls back to explicit claim_session).
+// stored ancestry still shares a live process with `ancestors`. Multiple old
+// claims are ranked by live-ancestry specificity, then recency. A unique best
+// match adopts; true ties return null (caller falls back to explicit claim).
 export function recoverClaim(
   clientType: ClientType,
   cwd: string,
@@ -212,7 +273,7 @@ export function recoverClaim(
     return null;
   }
 
-  const matches: ClaimRecord[] = [];
+  const matches: Array<{ rec: ClaimRecord; score: ClaimScore }> = [];
   for (const f of files) {
     if (!f.endsWith(".json")) continue;
     let rec: ClaimRecord;
@@ -223,13 +284,20 @@ export function recoverClaim(
     }
     if (rec.client_type !== clientType || rec.cwd !== cwd) continue;
     if (!rec.session_id || !rec.transcript_path) continue;
+    if (!Number.isFinite(rec.claimed_at)) continue;
     if (!Array.isArray(rec.ancestors) || !chainsOverlap(rec.ancestors, ancestors)) continue;
     if (!exists(rec.transcript_path)) continue;
-    matches.push(rec);
+    const score = scoreClaim(rec.ancestors, ancestors, rec.claimed_at);
+    if (!score) continue;
+    matches.push({ rec, score });
   }
 
-  // Exactly one safe match adopts; zero or ambiguous (>1) → abstain.
-  return matches.length === 1 ? matches[0] : null;
+  if (matches.length === 0) return null;
+  matches.sort((a, b) => compareClaimScores(b.score, a.score));
+  const best = matches[0]!;
+  const second = matches[1];
+  if (second && scoresTie(best.score, second.score)) return null;
+  return best.rec;
 }
 
 // Drop records that are clearly dead: transcript gone, or older than the max

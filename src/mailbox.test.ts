@@ -383,3 +383,123 @@ test("mailbox: stale lock (mtime 60s ago) is force-cleared and enqueue proceeds"
     assert.equal(existsSync(lock), false, "lock dir cleaned up after enqueue");
   });
 });
+
+// ────────────────────────────────────────────────────────────────────────────
+// drainMany / mailboxHasMessages / requeue / migrateMailbox
+// (session_id union drain + dead-sibling consolidation)
+// ────────────────────────────────────────────────────────────────────────────
+
+test("drainMany: unions multiple pid mailboxes in pid order; both emptied", () => {
+  withHome(() => {
+    mailbox.enqueue(201, "a1");
+    mailbox.enqueue(201, "a2");
+    mailbox.enqueue(202, "b1");
+    const { messages, skipped } = mailbox.drainMany([201, 202]);
+    assert.equal(skipped, 0);
+    assert.deepEqual(messages.map((m) => m.body), ["a1", "a2", "b1"]);
+    assert.deepEqual(mailbox.drain(201), []);
+    assert.deepEqual(mailbox.drain(202), []);
+  });
+});
+
+test("drainMany: duplicate pids are drained once", () => {
+  withHome(() => {
+    mailbox.enqueue(203, "only");
+    const { messages } = mailbox.drainMany([203, 203]);
+    assert.deepEqual(messages.map((m) => m.body), ["only"]);
+  });
+});
+
+test("drainMany: a contended mailbox lock is skipped, not fatal", () => {
+  withHome(() => {
+    mailbox.enqueue(204, "readable");
+    mailbox.enqueue(205, "blocked");
+    // Hold a FRESH (non-stale) lock on 205 so drain(205) cannot acquire it.
+    const lock = mailbox.mailboxLockPath(205);
+    mkdirSync(lock, { recursive: true, mode: 0o700 });
+    try {
+      const { messages, skipped } = mailbox.drainMany([204, 205]);
+      assert.deepEqual(messages.map((m) => m.body), ["readable"]);
+      assert.equal(skipped, 1, "the locked mailbox is reported as skipped");
+    } finally {
+      try {
+        rmSync(lock, { recursive: true, force: true });
+      } catch {
+        // best effort
+      }
+    }
+    // 205 still holds its message for the next poll — nothing lost.
+    assert.deepEqual(mailbox.drain(205).map((m) => m.body), ["blocked"]);
+  });
+});
+
+test("mailboxHasMessages: true with mail; false when missing/empty/after drain", () => {
+  withHome(() => {
+    assert.equal(mailbox.mailboxHasMessages(206), false, "missing file");
+    mailbox.enqueue(206, "x");
+    assert.equal(mailbox.mailboxHasMessages(206), true);
+    mailbox.drain(206);
+    assert.equal(mailbox.mailboxHasMessages(206), false, "empty after drain");
+  });
+});
+
+test("requeue: re-appends an existing message without minting a new id", () => {
+  withHome(() => {
+    const orig = mailbox.enqueue(207, "hello", "peer-z", { reply_to: "req-9" });
+    const drained = mailbox.drain(207);
+    assert.equal(drained.length, 1);
+    mailbox.requeue(207, drained[0]);
+    const again = mailbox.drain(207);
+    assert.equal(again.length, 1);
+    assert.equal(again[0].id, orig.id, "same id preserved");
+    assert.equal(again[0].body, "hello");
+    assert.equal(again[0].reply_to, "req-9");
+    assert.equal(again[0].from_session_id, "peer-z");
+  });
+});
+
+test("migrateMailbox: appends source lines byte-exact into dest tail; empties source", () => {
+  withHome(() => {
+    const from = 301;
+    const to = 302;
+    mailbox.enqueue(to, "dest-existing");
+    mailbox.enqueue(from, "m1", "peer-a", { request_id: "r1" });
+    mailbox.enqueue(from, "m2", "peer-b");
+    const srcRaw = readFileSync(mailbox.mailboxFilePath(from), "utf8");
+
+    const moved = mailbox.migrateMailbox(from, to);
+    assert.equal(moved, 2);
+    assert.equal(mailbox.mailboxHasMessages(from), false, "source emptied");
+
+    const destRaw = readFileSync(mailbox.mailboxFilePath(to), "utf8");
+    assert.ok(destRaw.endsWith(srcRaw), "source lines appended byte-exact to dest tail");
+
+    const destDrained = mailbox.drain(to);
+    assert.deepEqual(destDrained.map((m) => m.body), ["dest-existing", "m1", "m2"]);
+    assert.equal(destDrained[1].request_id, "r1");
+    assert.equal(destDrained[2].from_session_id, "peer-b");
+  });
+});
+
+test("migrateMailbox: empty/missing source and same-pid are no-ops (return 0)", () => {
+  withHome(() => {
+    assert.equal(mailbox.migrateMailbox(303, 304), 0, "missing source");
+    mailbox.enqueue(305, "x");
+    assert.equal(mailbox.migrateMailbox(305, 305), 0, "same pid no-op");
+    assert.deepEqual(mailbox.drain(305).map((m) => m.body), ["x"], "305 untouched");
+  });
+});
+
+test("migrateMailbox: a re-migrate of an already-drained source delivers exactly once", () => {
+  withHome(() => {
+    mailbox.enqueue(401, "x");
+    assert.equal(mailbox.migrateMailbox(401, 402), 1);
+    // Source was truncated under lock; a second migrate finds nothing.
+    assert.equal(mailbox.migrateMailbox(401, 402), 0, "nothing re-migrated");
+    assert.deepEqual(
+      mailbox.drain(402).map((m) => m.body),
+      ["x"],
+      "delivered exactly once, no duplicate",
+    );
+  });
+});

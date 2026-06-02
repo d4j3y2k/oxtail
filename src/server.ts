@@ -25,6 +25,7 @@ import {
   readAll,
   refreshTmuxBinding,
   register,
+  sessionPidsForId,
   unregister,
   type RegistryEntry,
   type StateCard,
@@ -386,6 +387,10 @@ type ScopeResolution = {
   sessionPath: string | null;
   registryEntry: RegistryEntry | null;
   ambiguousCandidates?: string[];
+  // A UUID target that matches no currently-claimed registry entry — distinct
+  // from "out of project scope". Lets the caller report the real condition
+  // (re-claim / retry) instead of a misleading scope error.
+  unknownSession?: boolean;
 };
 
 function anyPaneInScope(canonical: string, resolvedRoot: string): boolean {
@@ -429,9 +434,18 @@ function resolveSessionInScope(name: string, resolvedRoot: string): ScopeResolut
         registryEntry: reg,
       };
     }
-    // UUID with 0 or (rare) >1 matches falls through to tmux lookup below,
-    // which will likely fail with "not in scope" — explicit handling not
-    // needed since session_id is unique by construction.
+    // A UUID that resolves to no live registry entry is NOT a tmux session
+    // name; don't fall through to the tmux lookup (which yields a misleading
+    // "not in project scope"). Surface the real condition — unknown/unclaimed
+    // session — so the caller re-claims or retries instead of hunting for a
+    // project boundary. session_id is unique by construction, so >1 can't occur.
+    return {
+      inScope: false,
+      canonicalName: null,
+      sessionPath: null,
+      registryEntry: null,
+      unknownSession: true,
+    };
   }
 
   const regs = findByTmuxSession(name);
@@ -441,7 +455,9 @@ function resolveSessionInScope(name: string, resolvedRoot: string): ScopeResolut
       canonicalName: null,
       sessionPath: null,
       registryEntry: null,
-      ambiguousCandidates: regs.map((e) => e.client.session_id ?? `pid:${e.server_pid}`),
+      ambiguousCandidates: regs
+        .map((e) => e.client.session_id)
+        .filter((s): s is string => s != null),
     };
   }
   const reg = regs[0];
@@ -519,11 +535,23 @@ function readSession(input: {
 
   const scope = resolveSessionInScope(input.name, resolvedRoot);
   if (scope.ambiguousCandidates) {
+    const cands = scope.ambiguousCandidates;
+    const detail = cands.length
+      ? `pass a client_session_id (UUID) instead. candidates: ${cands.join(", ")}`
+      : `all agents sharing it are unclaimed — have them run claim_session so they're addressable by UUID`;
     return makeReadResult({
       session: input.name,
       project_root: resolvedRoot,
       inferred: !explicit,
-      error: `ambiguous-target: multiple agents share tmux session '${input.name}'; pass a client_session_id (UUID) instead. candidates: ${scope.ambiguousCandidates.join(", ")}`,
+      error: `ambiguous-target: multiple agents share tmux session '${input.name}'; ${detail}`,
+    });
+  }
+  if (scope.unknownSession) {
+    return makeReadResult({
+      session: input.name,
+      project_root: resolvedRoot,
+      inferred: !explicit,
+      error: `unknown-or-unclaimed-session: '${input.name}' is not a currently claimed session in this project. If it is a peer that restarted its MCP server, it must re-run claim_session; if it just rotated, retry shortly.`,
     });
   }
   if (!scope.inScope) {
@@ -1111,7 +1139,7 @@ server.registerTool(
 type ResolveOk = { ok: true; entry: RegistryEntry };
 type ResolveErr =
   | { ok: false; error: "target-not-found" }
-  | { ok: false; error: "ambiguous-target"; candidates: string[] }
+  | { ok: false; error: "ambiguous-target"; candidates: string[]; note?: string }
   | { ok: false; error: "cross-project" }
   | { ok: false; error: "self-send" };
 
@@ -1191,10 +1219,24 @@ function resolveTarget(target: string, caller: RegistryEntry): ResolveOk | Resol
 
   if (candidates.length === 0) return { ok: false, error: "target-not-found" };
   if (candidates.length > 1) {
+    // Only claimed session_ids are addressable; an unclaimed peer has no UUID to
+    // hand back. Don't emit a `pid:<n>` pseudo-handle — it isn't a routable
+    // target (resolveTarget accepts only UUIDs / tmux names) and advertising it
+    // fights the session_id identity invariant. Note the unclaimed count so the
+    // caller knows to have those peers run claim_session.
+    const uuids = candidates
+      .map((c) => c.client.session_id)
+      .filter((s): s is string => s != null);
+    const unclaimed = candidates.length - uuids.length;
     return {
       ok: false,
       error: "ambiguous-target",
-      candidates: candidates.map((c) => c.client.session_id ?? `pid:${c.server_pid}`),
+      candidates: uuids,
+      ...(unclaimed > 0
+        ? {
+            note: `${unclaimed} peer(s) sharing tmux session '${target}' have not claimed a session_id and cannot be addressed by UUID; have them run claim_session.`,
+          }
+        : {}),
     };
   }
   const peer = candidates[0];
@@ -1275,21 +1317,89 @@ server.registerTool(
   },
 );
 
+// read_my_messages budget. A session's union drain can return a backlog; cap
+// how much one call hands back so a flood (or a peer spamming near-8KB bodies)
+// can't blow the caller's context in a single drain. Overflow is NOT dropped or
+// body-truncated — whole messages beyond the budget are re-queued to the
+// caller's own mailbox and delivered on the next call/hook (lossless). At least
+// one message is always returned so the queue makes progress.
+const READ_MAX_MESSAGES = (() => {
+  const n = Number(process.env.OXTAIL_READ_MAX_MESSAGES);
+  return Number.isFinite(n) && n > 0 ? n : 50;
+})();
+const READ_MAX_BODY_BYTES = (() => {
+  const n = Number(process.env.OXTAIL_READ_MAX_BODY_BYTES);
+  return Number.isFinite(n) && n > 0 ? n : 65_536;
+})();
+
+function budgetMessages(all: mailbox.Mailbox[]): {
+  messages: mailbox.Mailbox[];
+  deferred: mailbox.Mailbox[];
+} {
+  const messages: mailbox.Mailbox[] = [];
+  const deferred: mailbox.Mailbox[] = [];
+  let bytes = 0;
+  for (const m of all) {
+    const b = m.body_bytes ?? Buffer.byteLength(m.body, "utf8");
+    const wouldOverflow =
+      messages.length >= READ_MAX_MESSAGES ||
+      (messages.length > 0 && bytes + b > READ_MAX_BODY_BYTES);
+    if (wouldOverflow) {
+      deferred.push(m);
+    } else {
+      messages.push(m);
+      bytes += b;
+    }
+  }
+  return { messages, deferred };
+}
+
 server.registerTool(
   "read_my_messages",
   {
     description:
-      "Drain this session's mailbox and return any messages peers have sent via send_message. Codex peers and any Claude Code peer without the PreToolUse hook installed must poll this tool explicitly; Claude Code peers with the hooks installed will see messages mid-turn or at turn end instead. After hook delivery, this tool may return count:0 because the hook already drained and injected those messages. Always safe to call — returns an empty list when the mailbox is empty.",
+      "Drain this session's mailbox and return any messages peers have sent via send_message. Codex peers and any Claude Code peer without the PreToolUse hook installed must poll this tool explicitly; Claude Code peers with the hooks installed will see messages mid-turn or at turn end instead. After hook delivery, this tool may return count:0 because the hook already drained and injected those messages. Drains the UNION of this session's sibling/previous MCP-child mailboxes (keyed by session_id, mirroring the hook) so a message sent to a prior pid survives a restart. Budgeted: a large backlog is returned in chunks (overflow is re-queued losslessly, never dropped), reported via deferred_count. Always safe to call — returns an empty list when the mailbox is empty.",
     inputSchema: {},
   },
   async () => {
-    const messages = mailbox.drain(entry.server_pid);
+    const sid = entry.client.session_id;
+    let pids: number[];
+    if (sid) {
+      // Union by identity: every sibling/previous pid that registered under our
+      // session_id, plus our own pid as a guaranteed floor. Mirrors the hook.
+      pids = sessionPidsForId(sid);
+      if (!pids.includes(entry.server_pid)) pids.push(entry.server_pid);
+    } else {
+      // Unclaimed child: no identity to union by — drain only our own pid.
+      pids = [entry.server_pid];
+    }
+    const { messages: drained, skipped } = mailbox.drainMany(pids);
+    // Merge chronologically; stable sort keeps drainMany's oldest-pid-first
+    // order for same-second ties.
+    drained.sort((a, b) => a.enqueued_at - b.enqueued_at);
+    const { messages: budgeted, deferred } = budgetMessages(drained);
+    // Lossless overflow: re-home deferred whole messages to our own mailbox for
+    // the next drain/hook in one atomic append. If THAT fails (the originals are
+    // already drained off disk), fall back to returning the overflow inline this
+    // once — exceeding the budget beats dropping messages. Bodies never truncated.
+    let messages = budgeted;
+    let deferredCount = deferred.length;
+    if (deferred.length > 0) {
+      try {
+        mailbox.requeueMany(entry.server_pid, deferred);
+      } catch {
+        messages = [...budgeted, ...deferred];
+        deferredCount = 0;
+      }
+    }
     return jsonResult({
       schema_version: 1,
       ok: true,
       drained: true,
       count: messages.length,
       messages,
+      ...(deferredCount ? { deferred_count: deferredCount, budget_truncated: true } : {}),
+      ...(skipped ? { mailboxes_skipped: skipped } : {}),
     });
   },
 );
@@ -1347,7 +1457,7 @@ export type WakeStatus =
   | "fired"             // wake keystrokes were sent (peer should enter a turn)
   | "skipped_unsupported" // client_type cannot be woken externally (reserved — no client currently returns this in auto mode)
   | "skipped_no_target" // no tmux pane/session resolved, or send-keys failed everywhere
-  | "skipped_busy"      // peer is mid-turn (send_message wake:auto) — its hooks will deliver
+  | "skipped_busy"      // peer is mid-turn — skipped the keystroke; hooks/poll deliver (send_message wake:auto + ask_peer)
   | "disabled";         // OXTAIL_ASK_PEER_WAKE_STRATEGY=off — caller turned wake off
 
 // OXTAIL_ASK_PEER_WAKE_STRATEGY = "auto" | "legacy" | "off"
@@ -1605,7 +1715,7 @@ server.registerTool(
   {
     description: [
       "Delegate-and-wait: enqueue a message to a peer in the same project root, wake them, and block until they reply (via send_message) or the timeout elapses. Use this for back-and-forth; use send_message for fire-and-forget.",
-      "Wakes the peer via per-client tmux send-keys (Codex gets a paste-burst-aware gap, Claude Code doesn't), then polls for a reply. For reply_to-capable peers, only from_session_id + reply_to == request_id satisfies the wait; legacy peers fall back to best-effort from_session_id matching and the response reports correlation:\"uncorrelated\". Response carries wake_status: \"fired\" | \"skipped_no_target\" | \"disabled\" (skipped_unsupported is reserved). Returns reply: null, timed_out: true on timeout (default 45000ms, override per call with timeout_ms, or set OXTAIL_ASK_PEER_TIMEOUT_MS at startup). timeout_ms is clamped to a safe ceiling (default 100000ms, env OXTAIL_ASK_PEER_MAX_TIMEOUT_MS) so the wait can't outlast the client's tool-call abort window — exceeding it makes the client hard-fail the call instead of returning graceful timed_out; the response reports timeout_clamped_from_ms when clamped. Late replies still arrive via read_my_messages / the hook.",
+      "Wakes the peer via per-client tmux send-keys (Codex gets a paste-burst-aware gap, Claude Code doesn't), then polls for a reply. For reply_to-capable peers, only from_session_id + reply_to == request_id satisfies the wait; legacy peers fall back to best-effort from_session_id matching and the response reports correlation:\"uncorrelated\". Response carries wake_status: \"fired\" | \"skipped_busy\" | \"skipped_no_target\" | \"disabled\" (skipped_unsupported is reserved). A peer that is mid-turn is NOT keystroke-woken (skipped_busy) — its hook/poll delivers the enqueued message and we still poll for the reply. Returns reply: null, timed_out: true on timeout (default 45000ms, override per call with timeout_ms, or set OXTAIL_ASK_PEER_TIMEOUT_MS at startup). timeout_ms is clamped to a safe ceiling (default 100000ms, env OXTAIL_ASK_PEER_MAX_TIMEOUT_MS) so the wait can't outlast the client's tool-call abort window — exceeding it makes the client hard-fail the call instead of returning graceful timed_out; the response reports timeout_clamped_from_ms when clamped. Late replies still arrive via read_my_messages / the hook.",
       "Target must have a registered client.session_id (Codex peers call claim_session first). Body is verbatim — frame it as an assignment (objective + requested action) so it reads as delegation, not chat. Wake overridable via OXTAIL_ASK_PEER_WAKE_STRATEGY=auto|legacy|off.",
     ].join(" "),
     inputSchema: {
@@ -1693,8 +1803,13 @@ server.registerTool(
       );
 
       if (!reply) {
-        // Common path: peer was idle. Route the wake per client_type.
-        wakeStatus = await wakePeer(peer);
+        // Common path: peer was idle. Route the wake per client_type, but skip
+        // the keystroke if the peer is FRESHLY busy (mid-turn): typing into a
+        // busy composer is noise — its hook/poll will deliver the message we
+        // already enqueued, and we still poll for the reply below. Mirrors
+        // send_message wake:auto. (Codex has no activity file, so it is never
+        // detected busy and still fires — unchanged for that client.)
+        wakeStatus = await wakeForSend(peer);
         if (wakeStatus === "skipped_unsupported") {
           // Reserved branch. No client currently returns skipped_unsupported
           // in auto mode (Codex and Claude Code both wake via send-keys).
