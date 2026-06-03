@@ -18,10 +18,15 @@ export const HOOK_MARKER_KEY = "_oxtailHook";
 //       (v0.10.x correlated ask/reply). A stale pre-v4 pretooluse.sh silently
 //       breaks Codex→Claude correlation by stripping request_id from the
 //       delivered envelope, so the receiver can't reply_to=request_id.
+//   v5: token-efficiency pass on the delivered envelope — pretooluse + stop
+//       collapse the 4-line preamble to one line, inline the per-message header,
+//       and drop the redundant single-valued `origin` field. message_id +
+//       from_session_id are still rendered (correlation/debug unaffected); a
+//       stale pre-v5 hook is only larger, never wrong.
 // INVARIANT: any change to an assets/*.sh script MUST bump this version, so
 // existing installs are forced to re-install. scripts/check-hook-version.mjs
 // enforces this in CI.
-export const HOOK_MARKER_VERSION = 4;
+export const HOOK_MARKER_VERSION = 5;
 
 const HOOKS_DIR = path.join(os.homedir(), ".oxtail", "hooks");
 
