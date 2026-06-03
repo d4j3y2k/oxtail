@@ -694,6 +694,8 @@ type SendOk = {
   message_id: string;
   target_session_id: string | null;
   target_server_pid: number;
+  wake_status?: string;
+  wake_reason?: string;
 };
 
 type SendErr = {
@@ -1105,6 +1107,276 @@ test("messaging: from_session_id present when sender has resolved id, absent whe
     } finally {
       process.env.HOME = prev;
     }
+  } finally {
+    await server.cleanup();
+  }
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Slice 1 — wake-on-reply (reply_to default auto-wake)
+// ────────────────────────────────────────────────────────────────────────────
+
+// Write a fresh activity marker into the spawned server's HOME so its
+// readActivity() sees the seeded peer as idle/busy with mtime≈now.
+function seedActivity(home: string, sessionId: string, status: "idle" | "busy"): void {
+  const dir = join(home, ".oxtail", "activity");
+  mkdirSync(dir, { recursive: true });
+  const key = sessionId.replace(/[^A-Za-z0-9_-]/g, "_");
+  writeFileSync(join(dir, key), status);
+}
+
+// The seeded peer has no tmux pane/session, so when the reply-default GATE
+// passes the subsequent send-keys has nowhere to fire and surfaces
+// "skipped_no_target". That is the integration-visible proof the gate let the
+// wake through (vs. the gate's own skip statuses). Real send-keys is covered by
+// the OXTAIL_TMUX_TESTS path in wake-tmux.test.ts.
+test("reply-default: reply_to to a freshly-idle peer triggers the gate (wake_reason set)", async () => {
+  const server = await spawnServer();
+  try {
+    const peerSessionId = "aaaa1111-2222-3333-4444-555555555555";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: peerSessionId,
+      tmux_session: "reply-default-idle",
+      cwd: server.home,
+      replyToCapable: true,
+    });
+    seedActivity(server.home, peerSessionId, "idle");
+    await callTool(server.client, "claim_session", {
+      session_id: "bbbb1111-2222-3333-4444-555555555555",
+    });
+
+    const sent = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: "reply-default-idle",
+      body: "here is your answer",
+      reply_to: "req-xyz",
+    });
+    assert.equal(sent.ok, true);
+    const ok = sent as SendOk;
+    assert.equal(ok.wake_reason, "reply_to_default", "reply path is flagged");
+    // Gate passed → tried to fire → no tmux target. NOT a gate-skip status.
+    assert.equal(ok.wake_status, "skipped_no_target");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("reply-default: a NON-fresh-idle (busy) peer is not woken — skipped_no_fresh_idle", async () => {
+  const server = await spawnServer();
+  try {
+    const peerSessionId = "aaaa2222-2222-3333-4444-555555555555";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: peerSessionId,
+      tmux_session: "reply-default-busy",
+      cwd: server.home,
+      replyToCapable: true,
+    });
+    seedActivity(server.home, peerSessionId, "busy");
+
+    const sent = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: "reply-default-busy",
+      body: "answer for a busy peer",
+      reply_to: "req-busy",
+    });
+    const ok = sent as SendOk;
+    assert.equal(ok.wake_reason, "reply_to_default");
+    assert.equal(ok.wake_status, "skipped_no_fresh_idle");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("reply-default: a peer with no activity marker is not woken — skipped_no_fresh_idle", async () => {
+  const server = await spawnServer();
+  try {
+    const peerSessionId = "aaaa3333-2222-3333-4444-555555555555";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: peerSessionId,
+      tmux_session: "reply-default-unknown",
+      cwd: server.home,
+      replyToCapable: true,
+    });
+    // No seedActivity → hooks-not-installed / unknown.
+
+    const sent = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: "reply-default-unknown",
+      body: "answer for an unknown-state peer",
+      reply_to: "req-unknown",
+    });
+    const ok = sent as SendOk;
+    assert.equal(ok.wake_status, "skipped_no_fresh_idle", "missing activity ⇒ no best-effort wake");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("reply-default: explicit wake:'off' suppresses the reply auto-wake entirely", async () => {
+  const server = await spawnServer();
+  try {
+    const peerSessionId = "aaaa4444-2222-3333-4444-555555555555";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: peerSessionId,
+      tmux_session: "reply-default-off",
+      cwd: server.home,
+      replyToCapable: true,
+    });
+    seedActivity(server.home, peerSessionId, "idle"); // fresh idle — would otherwise fire
+
+    const sent = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: "reply-default-off",
+      body: "answer but stay quiet",
+      reply_to: "req-quiet",
+      wake: "off",
+    });
+    const ok = sent as SendOk;
+    assert.equal(ok.wake_status, undefined, "explicit off → no wake attempted");
+    assert.equal(ok.wake_reason, undefined, "explicit off → not the reply-default path");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("reply-default: OXTAIL_AUTOWAKE=off kill-switch disables the reply auto-wake", async () => {
+  const server = await spawnServer({ extraEnv: { OXTAIL_AUTOWAKE: "off" } });
+  try {
+    const peerSessionId = "aaaa5555-2222-3333-4444-555555555555";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: peerSessionId,
+      tmux_session: "reply-default-killswitch",
+      cwd: server.home,
+      replyToCapable: true,
+    });
+    seedActivity(server.home, peerSessionId, "idle");
+
+    const sent = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: "reply-default-killswitch",
+      body: "answer with kill switch on",
+      reply_to: "req-killed",
+    });
+    const ok = sent as SendOk;
+    assert.equal(ok.wake_status, "disabled");
+    assert.equal(ok.wake_reason, "reply_to_default");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("reply-default: one-wake dedupe — same reply_to twice does not re-fire the gate", async () => {
+  const server = await spawnServer();
+  try {
+    const peerSessionId = "aaaa6666-2222-3333-4444-555555555555";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: peerSessionId,
+      tmux_session: "reply-default-dedupe",
+      cwd: server.home,
+      replyToCapable: true,
+    });
+    seedActivity(server.home, peerSessionId, "idle");
+
+    // INTENTIONAL: the dedupe slot is claimed when the gate PASSES, before the
+    // send-keys fires. So even though the first wake could not fire here (no
+    // tmux target → skipped_no_target), the (session_id, reply_to) slot is now
+    // taken and a retry of the same reply_to is deduped rather than re-attempted.
+    const first = (await callTool<SendOk>(server.client, "send_message", {
+      target: "reply-default-dedupe",
+      body: "first reply",
+      reply_to: "req-dupe",
+    }));
+    assert.equal(first.wake_status, "skipped_no_target", "gate passed on first (no tmux to fire)");
+
+    const second = (await callTool<SendOk>(server.client, "send_message", {
+      target: "reply-default-dedupe",
+      body: "duplicate of the same reply",
+      reply_to: "req-dupe",
+    }));
+    assert.equal(second.wake_status, "skipped_deduped", "same (session_id, reply_to) is deduped");
+    assert.equal(second.wake_reason, "reply_to_default");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("reply-default: a plain message (no reply_to) still does not wake", async () => {
+  const server = await spawnServer();
+  try {
+    const peerSessionId = "aaaa7777-2222-3333-4444-555555555555";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: peerSessionId,
+      tmux_session: "reply-default-plain",
+      cwd: server.home,
+      replyToCapable: true,
+    });
+    seedActivity(server.home, peerSessionId, "idle");
+
+    const sent = await callTool<SendOk>(server.client, "send_message", {
+      target: "reply-default-plain",
+      body: "just an FYI, no reply expected",
+    });
+    assert.equal(sent.wake_status, undefined, "no reply_to, no wake:auto → no wake");
+    assert.equal(sent.wake_reason, undefined);
+  } finally {
+    await server.cleanup();
+  }
+});
+
+// Escape hatch: explicit wake:"auto" on a REPLY bypasses the strict fresh-idle
+// gate and takes the lenient wakeForSend path — so a requester with no idle
+// marker (Codex / hookless Claude) can still be reached, which the round-2 docs
+// promise. Without this, reply_to + wake:"auto" would hit skipped_no_fresh_idle.
+test("reply-default: explicit wake:'auto' on a reply uses the LENIENT path (unknown-state peer)", async () => {
+  const server = await spawnServer();
+  try {
+    const peerSessionId = "aaaa8888-2222-3333-4444-555555555555";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: peerSessionId,
+      tmux_session: "reply-default-auto-unknown",
+      cwd: server.home,
+      replyToCapable: true,
+    });
+    // No activity marker → strict gate would say skipped_no_fresh_idle. The
+    // lenient path instead attempts the wake (no tmux target → skipped_no_target).
+
+    const sent = await callTool<SendOk>(server.client, "send_message", {
+      target: "reply-default-auto-unknown",
+      body: "explicit nudge for a Codex-like requester",
+      reply_to: "req-codexlike",
+      wake: "auto",
+    });
+    assert.equal(sent.wake_status, "skipped_no_target", "lenient path tried to wake (not gated out)");
+    assert.equal(sent.wake_reason, undefined, "explicit auto is not the reply_to_default path");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("reply-default: explicit wake:'auto' on a reply still respects the busy gate (skipped_busy)", async () => {
+  const server = await spawnServer();
+  try {
+    const peerSessionId = "aaaa9999-2222-3333-4444-555555555555";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: peerSessionId,
+      tmux_session: "reply-default-auto-busy",
+      cwd: server.home,
+      replyToCapable: true,
+    });
+    seedActivity(server.home, peerSessionId, "busy"); // fresh busy → lenient path skips
+
+    const sent = await callTool<SendOk>(server.client, "send_message", {
+      target: "reply-default-auto-busy",
+      body: "explicit nudge while busy",
+      reply_to: "req-busy-auto",
+      wake: "auto",
+    });
+    assert.equal(sent.wake_status, "skipped_busy", "lenient wakeForSend still skips a fresh-busy peer");
+    assert.equal(sent.wake_reason, undefined);
   } finally {
     await server.cleanup();
   }

@@ -32,6 +32,7 @@ import {
 } from "./registry.js";
 import * as mailbox from "./mailbox.js";
 import { recoverClaim, resolveAncestors, writeClaim } from "./claims.js";
+import { decideReplyAutoWake, defaultAutowakeDir } from "./autowake.js";
 
 // CLI subcommand dispatch must run before any MCP setup so that
 // `npx oxtail install-hook` doesn't open an MCP transport or register a
@@ -1256,7 +1257,7 @@ server.registerTool(
   {
     description: [
       "Fire-and-forget message to a peer in the same project root. Target: a tmux session name OR a client_session_id (UUID). Async via the peer's mailbox — delivered mid-turn (PreToolUse hook) or next-turn (read_my_messages); cross-project targets are rejected.",
-      "By default does NOT wake an idle peer. Pass wake:\"auto\" to nudge one via per-client send-keys, state-gated (skipped if the peer is mid-turn). Response then carries wake_status: \"fired\" | \"skipped_busy\" | \"skipped_no_target\" | \"disabled\".",
+      "A plain message does NOT wake an idle peer. Pass wake:\"auto\" to nudge one via per-client send-keys, state-gated (skipped if the peer is mid-turn). EXCEPTION (wake-on-reply): when you set reply_to, this auto-wakes the requester by default so your answer doesn't strand them idle — pass wake:\"off\" to suppress. The reply-default wake is strictly gated: it fires only for a FRESHLY-IDLE requester (one whose Claude Code hooks maintain a fresh idle marker), with a per-target rate limit and a one-wake dedupe; env kill-switch OXTAIL_AUTOWAKE=off. A requester with no idle marker (Codex, or Claude without the hooks) returns skipped_no_fresh_idle and is NOT auto-woken — use explicit wake:\"auto\" for those. Response carries wake_status (\"fired\" | \"skipped_busy\" | \"skipped_no_fresh_idle\" | \"skipped_rate_limited\" | \"skipped_deduped\" | \"skipped_store_error\" | \"skipped_no_target\" | \"disabled\") and, on the reply path, wake_reason:\"reply_to_default\".",
       "Body is verbatim — wrap in <system-reminder>...</system-reminder> yourself if you want that framing. When replying to ask_peer, include reply_to: request_id from the inbound message. For a blocking send-and-wait, use ask_peer instead.",
     ].join(" "),
     inputSchema: {
@@ -1275,7 +1276,7 @@ server.registerTool(
         .enum(["off", "auto"])
         .optional()
         .describe(
-          'Wake strategy. "off" (default): pure fire-and-forget, no nudge. "auto": nudge an idle peer via per-client send-keys, state-gated (skipped if the peer is mid-turn). Response carries wake_status when set.',
+          'Wake strategy. Default (unset): no nudge for a plain message, but a reply (reply_to set) auto-wakes a freshly-idle requester. "off": pure fire-and-forget, no nudge even for a reply. "auto": nudge an idle peer via per-client send-keys, state-gated (skipped if the peer is mid-turn). Response carries wake_status when set.',
         ),
       reply_to: z
         .string()
@@ -1292,11 +1293,14 @@ server.registerTool(
   async ({ target, body, wake, reply_to, source_message_id }) => {
     const resolved = resolveTarget(target, entry);
     if (!resolved.ok) {
-      const wake_status = wake === "auto" ? resolveErrorWakeStatus(resolved.error) : undefined;
+      const replyDefault = replyAutoWakeTriggered(wake, reply_to);
+      const wakeIntended = wake === "auto" || replyDefault;
+      const wake_status = wakeIntended ? resolveErrorWakeStatus(resolved.error) : undefined;
       return jsonResult({
         schema_version: 1,
         ...resolved,
         ...(wake_status ? { wake_status } : {}),
+        ...(replyDefault ? { wake_reason: "reply_to_default" } : {}),
       });
     }
     const peer = resolved.entry;
@@ -1305,7 +1309,7 @@ server.registerTool(
       reply_to,
       source_message_id,
     });
-    const wake_status = wake === "auto" ? await wakeForSend(peer) : undefined;
+    const { wake_status, wake_reason } = await resolveSendWake(peer, wake, reply_to);
     return jsonResult({
       schema_version: 1,
       ok: true,
@@ -1313,6 +1317,7 @@ server.registerTool(
       target_session_id: peer.client.session_id,
       target_server_pid: peer.server_pid,
       ...(wake_status ? { wake_status } : {}),
+      ...(wake_reason ? { wake_reason } : {}),
     });
   },
 );
@@ -1458,7 +1463,11 @@ export type WakeStatus =
   | "skipped_unsupported" // client_type cannot be woken externally (reserved — no client currently returns this in auto mode)
   | "skipped_no_target" // no tmux pane/session resolved, or send-keys failed everywhere
   | "skipped_busy"      // peer is mid-turn — skipped the keystroke; hooks/poll deliver (send_message wake:auto + ask_peer)
-  | "disabled";         // OXTAIL_ASK_PEER_WAKE_STRATEGY=off — caller turned wake off
+  | "skipped_no_fresh_idle"  // reply-default wake: target not freshly idle (stale/unknown/busy/unclaimed) — Slice 1
+  | "skipped_rate_limited"   // reply-default wake: this target was auto-woken too recently — Slice 1
+  | "skipped_deduped"        // reply-default wake: already auto-woke for this (session_id, reply_to) — Slice 1
+  | "skipped_store_error"    // reply-default wake: dedupe/rate store unusable — best-effort degrade, message still enqueued — Slice 1
+  | "disabled";         // OXTAIL_ASK_PEER_WAKE_STRATEGY=off, or reply-default wake with OXTAIL_AUTOWAKE=off
 
 // OXTAIL_ASK_PEER_WAKE_STRATEGY = "auto" | "legacy" | "off"
 //   auto    — per-client routing: Codex gets paste-burst-aware wake (500ms gap
@@ -1660,6 +1669,70 @@ async function wakeForSend(peer: RegistryEntry): Promise<WakeStatus> {
     return "skipped_busy";
   }
   return wakePeer(peer);
+}
+
+// --- Slice 1: wake-on-reply (reply_to default) -------------------------------
+// A send_message that carries a reply_to is answering an earlier ask. The wake
+// arg is a three-way for a reply:
+//   unset  → the STRICT reply-default auto-wake (fresh-idle only, rate limit,
+//            one-wake dedupe, env kill-switch — autowake.ts). wake_reason:
+//            "reply_to_default".
+//   "auto" → the caller explicitly opts into the LENIENT wakeForSend path
+//            (idle/unknown/stale all wake; only fresh-busy is skipped). This is
+//            the escape hatch for a requester with no idle marker — a Codex or
+//            hookless-Claude requester that the strict gate skips as
+//            skipped_no_fresh_idle. Not flagged reply_to_default: the caller
+//            asked for it explicitly.
+//   "off"  → no wake at all.
+// Here we just wire identity/activity/time into the strict gate and fire the
+// existing send-keys path when it says go.
+//
+// Note (per Codex's slice-1 correction): the fresh-idle gate makes an explicit
+// "is the requester actively blocked in ask_peer?" suppression unnecessary —
+// an active waiter is mid-turn and therefore marked busy, so it never reads as
+// fresh-idle. That holds only as long as the busy/idle freshness is correct;
+// it is not an independent proof.
+//
+// Triggers the STRICT reply-default path: a reply (reply_to set) with wake
+// UNSET. Explicit "auto"/"off" opt out of the strict path (auto → lenient,
+// off → none), so this is false for them.
+function replyAutoWakeTriggered(wake: "off" | "auto" | undefined, replyTo?: string): boolean {
+  return !!replyTo && wake === undefined;
+}
+
+async function autoWakeOnReply(peer: RegistryEntry, replyTo: string): Promise<WakeStatus> {
+  const sid = peer.client.session_id;
+  const decision = decideReplyAutoWake({
+    dir: defaultAutowakeDir(),
+    sessionId: sid ?? null,
+    replyTo,
+    activity: readActivity(sid),
+    nowMs: Date.now(),
+  });
+  if (!decision.fire) {
+    trace("autowake_reply_skipped", { target_session_id: sid, status: decision.status });
+    return decision.status;
+  }
+  trace("autowake_reply_fire", { target_session_id: sid });
+  return wakePeer(peer);
+}
+
+// Resolve the wake for a send_message. The strict reply-default path engages
+// only for a reply with wake UNSET; an explicit wake:"auto" always means the
+// lenient wakeForSend path (even for a reply — the Codex/hookless escape hatch),
+// and wake:"off" means no wake. Returns the status + reason to surface.
+async function resolveSendWake(
+  peer: RegistryEntry,
+  wake: "off" | "auto" | undefined,
+  replyTo: string | undefined,
+): Promise<{ wake_status?: WakeStatus; wake_reason?: string }> {
+  if (replyAutoWakeTriggered(wake, replyTo)) {
+    return { wake_status: await autoWakeOnReply(peer, replyTo!), wake_reason: "reply_to_default" };
+  }
+  if (wake === "auto") {
+    return { wake_status: await wakeForSend(peer) };
+  }
+  return {};
 }
 
 // Poll my mailbox at ASK_PEER_POLL_MS until a matching reply lands or the
