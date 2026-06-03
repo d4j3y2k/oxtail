@@ -14,10 +14,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  chooseVerifiedWakePane,
   dedupeBySessionId,
+  filenamePid,
   findTmuxPaneByAncestry,
+  isValidTmuxPane,
+  isValidTmuxSession,
   readAll,
+  readEntryFile,
   register,
+  resolveTmuxPane,
   sessionPidsForId,
   type RegistryEntry,
 } from "./registry.js";
@@ -249,6 +255,123 @@ test("askPeerWakeImpl: awaits async fire callback", async () => {
   const result = await promise;
   assert.equal(result, true);
   assert.deepEqual(calls, ["%good:start", "%good:end"], "fire fully awaited before return");
+});
+
+// --- #6: tmux target validation + verified-pane wake targeting ---------------
+
+test("isValidTmuxPane: accepts %N pane ids, rejects everything else", () => {
+  assert.equal(isValidTmuxPane("%0"), true);
+  assert.equal(isValidTmuxPane("%42"), true);
+  assert.equal(isValidTmuxPane("%1; rm -rf /"), false, "no command tails");
+  assert.equal(isValidTmuxPane("1"), false, "missing %");
+  assert.equal(isValidTmuxPane("%"), false, "needs digits");
+  assert.equal(isValidTmuxPane("%1.2"), false, "no pane.window syntax");
+  assert.equal(isValidTmuxPane("victim-session"), false);
+});
+
+test("isValidTmuxSession: accepts tmux name chars, rejects separators/specials", () => {
+  assert.equal(isValidTmuxSession("oxtail"), true);
+  assert.equal(isValidTmuxSession("oxtail-codex_2"), true);
+  assert.equal(isValidTmuxSession("has space"), false);
+  assert.equal(isValidTmuxSession("a:b"), false, "colon is a tmux target separator");
+  assert.equal(isValidTmuxSession("a.b"), false, "dot is a tmux target separator");
+  assert.equal(isValidTmuxSession("%1"), false);
+  assert.equal(isValidTmuxSession(""), false);
+});
+
+test("resolveTmuxPane: trusts a well-formed TMUX_PANE, ignores a spoofed one", () => {
+  assert.equal(resolveTmuxPane({ TMUX_PANE: "%7" }), "%7", "well-formed env pane is trusted");
+  // A spoofed/malformed TMUX_PANE must NOT be returned verbatim; it falls through
+  // to ancestry resolution (which, with no tmux panes available here, is null).
+  assert.equal(
+    resolveTmuxPane({ TMUX_PANE: "%1; tmux kill-server" }, 999999),
+    null,
+    "malformed env pane is not trusted",
+  );
+});
+
+test("chooseVerifiedWakePane: only ever returns the process-tree-resolved pane, never the cached self-written value", () => {
+  // A malicious peer self-writes a cached pane pointing at a victim. The verified
+  // resolver (process tree) is the source of truth.
+  const spoofed = { tmux_pane: "%999", server_pid: 4242 };
+
+  // Resolver can't bind server_pid to any pane → refuse, do NOT leak the spoof.
+  assert.equal(chooseVerifiedWakePane(spoofed, () => null), null);
+
+  // Resolver finds the REAL pane hosting server_pid → use that, not the spoof.
+  assert.equal(chooseVerifiedWakePane(spoofed, () => "%3"), "%3");
+
+  // Peer never registered a pane → never fish for one (test-runner-pid safety).
+  assert.equal(
+    chooseVerifiedWakePane({ tmux_pane: null, server_pid: 4242 }, () => "%3"),
+    null,
+    "pane-less/session-only entries are never blind-fired",
+  );
+
+  // Resolver returns a malformed pane (tmux output anomaly) → refuse.
+  assert.equal(chooseVerifiedWakePane(spoofed, () => "%3; evil"), null);
+});
+
+// --- #6 (provenance): server_pid is also self-written, so a registry file's
+// server_pid must match the pid in its filename. Otherwise a forged
+// <ownPid>.json with server_pid:<victimPid> would make chooseVerifiedWakePane →
+// currentPaneForServerPid resolve (and wake) the victim's pane.
+
+test("filenamePid: parses <pid>.json, rejects anything else", () => {
+  assert.equal(filenamePid("12345.json"), 12345);
+  assert.equal(filenamePid("1.json"), 1);
+  assert.equal(filenamePid("0.json"), null, "pid must be > 0");
+  assert.equal(filenamePid("12a.json"), null);
+  assert.equal(filenamePid("12345.json.bak"), null);
+  assert.equal(filenamePid("foo.json"), null);
+  assert.equal(filenamePid("12345"), null);
+});
+
+test("readEntryFile: rejects an entry whose server_pid != the filename pid", () => {
+  withTempHome((home) => {
+    const dir = join(home, ".oxtail", "sessions");
+    mkdirSync(dir, { recursive: true });
+    // Legit: filename pid matches server_pid.
+    writeFileSync(
+      join(dir, "111.json"),
+      JSON.stringify(makeRegistryEntry({ pid: 111, session_id: "ok", started_at: 1 })),
+    );
+    // Forged: file named 222.json but the entry claims server_pid 111 (borrowing
+    // 111's pane). makeRegistryEntry sets server_pid from `pid`.
+    writeFileSync(
+      join(dir, "222.json"),
+      JSON.stringify(makeRegistryEntry({ pid: 111, session_id: "forged", started_at: 1 })),
+    );
+    assert.ok(readEntryFile(dir, "111.json"), "matching entry is accepted");
+    assert.equal(readEntryFile(dir, "222.json"), null, "server_pid != filename pid is rejected");
+    assert.equal(readEntryFile(dir, "notpid.json"), null, "non-<pid>.json is rejected");
+  });
+});
+
+test("readAll / sessionPidsForId: a forged file borrowing another pid is unaddressable (the #6 server_pid redirect)", () => {
+  withTempHome((home) => {
+    const dir = join(home, ".oxtail", "sessions");
+    mkdirSync(dir, { recursive: true });
+    const real = process.pid; // alive, legit owner
+    const other = process.ppid; // alive — stands in for a victim pane owner
+    // Legit entry: filename matches server_pid.
+    writeFileSync(
+      join(dir, `${real}.json`),
+      JSON.stringify(makeRegistryEntry({ pid: real, session_id: "uuid-legit", started_at: 1000 })),
+    );
+    // Forged entry: file named `${other}.json` but server_pid points at `real`
+    // so currentPaneForServerPid(real) would resolve real's pane.
+    writeFileSync(
+      join(dir, `${other}.json`),
+      JSON.stringify(makeRegistryEntry({ pid: real, session_id: "uuid-forged", started_at: 2000 })),
+    );
+
+    const all = readAll();
+    assert.equal(all.length, 1, "only the legit entry survives");
+    assert.equal(all[0].client.session_id, "uuid-legit");
+    assert.deepEqual(sessionPidsForId("uuid-forged"), [], "forged session is not addressable");
+    assert.deepEqual(sessionPidsForId("uuid-legit"), [real]);
+  });
 });
 
 // Registry dedupe by session_id. One Claude/Codex session can spawn multiple

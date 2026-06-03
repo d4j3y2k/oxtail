@@ -20,7 +20,7 @@ import { diagnoseDetect, isAbstain, type DetectDiagnosis } from "./detect/index.
 import { trace } from "./trace.js";
 import {
   buildEntry,
-  currentPaneForServerPid,
+  chooseVerifiedWakePane,
   findByTmuxSession,
   readAll,
   refreshTmuxBinding,
@@ -33,6 +33,7 @@ import {
 import * as mailbox from "./mailbox.js";
 import { recoverClaim, resolveAncestors, writeClaim } from "./claims.js";
 import { decideReplyAutoWake, defaultAutowakeDir } from "./autowake.js";
+import { markWoke, newWakeDebounceStore, recentlyWoke } from "./wake-debounce.js";
 
 // CLI subcommand dispatch must run before any MCP setup so that
 // `npx oxtail install-hook` doesn't open an MCP transport or register a
@@ -52,6 +53,10 @@ import { decideReplyAutoWake, defaultAutowakeDir } from "./autowake.js";
     const mod = (await import(url)) as { uninstall: () => Promise<void> };
     await mod.uninstall();
     process.exit(0);
+  }
+  if (sub === "diagnose") {
+    const { runDiagnose } = await import("./diagnose.js");
+    process.exit(runDiagnose(process.env.MCP_TRACE_FILE));
   }
 }
 import {
@@ -1257,7 +1262,7 @@ server.registerTool(
   {
     description: [
       "Fire-and-forget message to a peer in the same project root. Target: a tmux session name OR a client_session_id (UUID). Async via the peer's mailbox — delivered mid-turn (PreToolUse hook) or next-turn (read_my_messages); cross-project targets are rejected.",
-      "A plain message does NOT wake an idle peer. Pass wake:\"auto\" to nudge one via per-client send-keys, state-gated (skipped if the peer is mid-turn). EXCEPTION (wake-on-reply): when you set reply_to, this auto-wakes the requester by default so your answer doesn't strand them idle — pass wake:\"off\" to suppress. The reply-default wake is strictly gated: it fires only for a FRESHLY-IDLE requester (one whose Claude Code hooks maintain a fresh idle marker), with a per-target rate limit and a one-wake dedupe; env kill-switch OXTAIL_AUTOWAKE=off. A requester with no idle marker (Codex, or Claude without the hooks) returns skipped_no_fresh_idle and is NOT auto-woken — use explicit wake:\"auto\" for those. Response carries wake_status (\"fired\" | \"skipped_busy\" | \"skipped_no_fresh_idle\" | \"skipped_rate_limited\" | \"skipped_deduped\" | \"skipped_store_error\" | \"skipped_no_target\" | \"disabled\") and, on the reply path, wake_reason:\"reply_to_default\".",
+      "A plain message does NOT wake an idle peer. Pass wake:\"auto\" to nudge one via per-client send-keys, state-gated (skipped if the peer is mid-turn). EXCEPTION (wake-on-reply): when you set reply_to, this auto-wakes the requester by default so your answer doesn't strand them idle — pass wake:\"off\" to suppress. The reply-default wake is strictly gated: it fires only for a FRESHLY-IDLE requester (one whose Claude Code hooks maintain a fresh idle marker), with a per-target rate limit and a one-wake dedupe; env kill-switch OXTAIL_AUTOWAKE=off. A requester with no idle marker (Codex, or Claude without the hooks) returns skipped_no_fresh_idle and is NOT auto-woken — use explicit wake:\"auto\" for those. Response carries wake_status (\"fired\" | \"skipped_busy\" | \"skipped_debounced\" | \"skipped_no_fresh_idle\" | \"skipped_rate_limited\" | \"skipped_deduped\" | \"skipped_store_error\" | \"skipped_no_target\" | \"disabled\") and, on the reply path, wake_reason:\"reply_to_default\".",
       "Body is verbatim — wrap in <system-reminder>...</system-reminder> yourself if you want that framing. When replying to ask_peer, include reply_to: request_id from the inbound message. For a blocking send-and-wait, use ask_peer instead.",
     ].join(" "),
     inputSchema: {
@@ -1310,6 +1315,14 @@ server.registerTool(
       source_message_id,
     });
     const { wake_status, wake_reason } = await resolveSendWake(peer, wake, reply_to);
+    if (wake_status) {
+      trace("wake_outcome", {
+        via: wake_reason === "reply_to_default" ? "reply_default" : "send_message",
+        wake_status,
+        target_session_id: peer.client.session_id,
+        client_type: peer.client.type,
+      });
+    }
     return jsonResult({
       schema_version: 1,
       ok: true,
@@ -1467,6 +1480,7 @@ export type WakeStatus =
   | "skipped_rate_limited"   // reply-default wake: this target was auto-woken too recently — Slice 1
   | "skipped_deduped"        // reply-default wake: already auto-woke for this (session_id, reply_to) — Slice 1
   | "skipped_store_error"    // reply-default wake: dedupe/rate store unusable — best-effort degrade, message still enqueued — Slice 1
+  | "skipped_debounced"      // a wake fired for this peer within the debounce window — coalesced (issue #5)
   | "disabled";         // OXTAIL_ASK_PEER_WAKE_STRATEGY=off, or reply-default wake with OXTAIL_AUTOWAKE=off
 
 // OXTAIL_ASK_PEER_WAKE_STRATEGY = "auto" | "legacy" | "off"
@@ -1531,11 +1545,11 @@ function askPeerDelay(ms: number, signal: AbortSignal): Promise<void> {
 // parsed as a key event. The -l flag neutralizes any tmux keysequences a
 // malicious peer could plant in its registry entry.
 //
-// Pane targeting can go stale: tmux_pane is cached at server startup
-// (registry resolveTmuxPane), but Terminator-style window churn can move or
-// close the pane after registration. send-keys against a dead pane id
-// errors; if pane targeting fails and a sessionName is also available,
-// retry against it (targets the session's currently-active pane).
+// askPeerWakeImpl keeps a generic pane→sessionName retry for its own unit
+// tests, but PRODUCTION wakePeer now passes only the process-tree-verified pane
+// (sessionName = null): a self-written tmux_session is not a trustworthy
+// send-keys target (issue #6), and pane-id churn is handled by re-resolving the
+// pane from server_pid on every wake rather than by a session fallback.
 async function defaultFireWakeKeystrokes(
   target: string,
   clientType: ClientType,
@@ -1589,45 +1603,61 @@ export async function askPeerWakeImpl(
 // peer's client_type. Returns the wake_status that should surface in the
 // ask_peer response so callers can distinguish "we tried, no answer" from
 // "we didn't try because the client can't be woken."
+// In-memory per-process wake-debounce state, keyed by peer session_id. Coalesces
+// rapid repeat wakes to the same peer across all wake paths (issue #5).
+const wakeDebounce = newWakeDebounceStore();
+
 async function wakePeer(peer: RegistryEntry): Promise<WakeStatus> {
   if (ASK_PEER_WAKE_STRATEGY === "off") {
     trace("ask_peer_wake_skipped", { reason: "strategy-off" });
     return "disabled";
   }
   const clientType: ClientType = peer.client.type;
-  if (!peer.tmux_pane && !peer.tmux_session) {
+  // #5: coalesce a rapid repeat wake to the same peer (concurrent/retried
+  // ask_peer, polling loops) so we don't stack a second notification line into
+  // its composer. Keyed on session_id; an unclaimed peer (no id) isn't debounced.
+  const sid = peer.client.session_id;
+  if (sid && recentlyWoke(wakeDebounce, sid, Date.now())) {
+    trace("ask_peer_wake_skipped", { reason: "debounced", target_session_id: sid });
+    return "skipped_debounced";
+  }
+  // Security (#6): tmux_pane / tmux_session come from the peer's OWN registry
+  // file, so a malicious local peer could point them at someone else's pane or
+  // session to redirect our wake keystrokes. The ONLY trustworthy send-keys
+  // target is the pane the live process tree says currently hosts the peer's
+  // server_pid — chooseVerifiedWakePane resolves that and refuses (returns null)
+  // when it can't be verified, instead of falling back to the self-written
+  // cached pane or tmux_session. This also subsumes the old stale-pane re-
+  // resolution race fix: we ALWAYS use the freshly process-tree-resolved pane.
+  const verifiedPane = chooseVerifiedWakePane(peer);
+  if (!verifiedPane) {
+    trace("ask_peer_wake_skipped", {
+      reason: "no-verified-pane",
+      cached: peer.tmux_pane,
+      server_pid: peer.server_pid,
+      target_session_id: peer.client.session_id,
+    });
     return "skipped_no_target";
   }
-  // Race-fix: tmux_pane is cached at registration but pane ids can be reused
-  // by tmux after a pane is killed. If we send-keys against a reused id we
-  // wake the wrong shell. When the peer registered WITH a cached pane,
-  // re-resolve from its server_pid at wake-time and prefer the live value.
-  // If the peer registered without a pane (no TMUX_PANE in env, no ancestry
-  // match), skip the re-resolution entirely — fishing for a pane based on
-  // server_pid alone is unsafe (server_pid may not even still be alive, and
-  // in tests it can coincide with the test runner's process tree).
-  const livePane = peer.tmux_pane
-    ? currentPaneForServerPid(peer.server_pid)
-    : null;
-  if (peer.tmux_pane && livePane && livePane !== peer.tmux_pane) {
+  if (verifiedPane !== peer.tmux_pane) {
     trace("ask_peer_wake_pane_refreshed", {
       cached: peer.tmux_pane,
-      live: livePane,
-      server_pid: peer.server_pid,
-    });
-  } else if (peer.tmux_pane && !livePane) {
-    trace("ask_peer_wake_pane_orphaned", {
-      cached: peer.tmux_pane,
+      live: verifiedPane,
       server_pid: peer.server_pid,
     });
   }
-  const effectivePane = livePane ?? peer.tmux_pane;
   // Legacy mode bypasses per-client routing: every wake is the v0.6 sequence
   // (no inter-keystroke delay). Cast to "unknown" so defaultFireWakeKeystrokes
   // skips the Codex delay branch.
   const fireType: ClientType = ASK_PEER_WAKE_STRATEGY === "legacy" ? "unknown" : clientType;
   const fire = (target: string) => defaultFireWakeKeystrokes(target, fireType);
-  const ok = await askPeerWakeImpl(effectivePane, peer.tmux_session, fire);
+  // #5: stamp the debounce BEFORE the (possibly async, paste-burst-delayed) fire
+  // so a concurrent second wakePeer for this peer — which runs while we're
+  // awaiting send-keys — sees the stamp and coalesces instead of double-firing.
+  if (sid) markWoke(wakeDebounce, sid, Date.now());
+  // No session-name fallback: a self-written tmux_session could target another
+  // session, and the verified pane already handles pane-id churn. Pass null.
+  const ok = await askPeerWakeImpl(verifiedPane, null, fire);
   return ok ? "fired" : "skipped_no_target";
 }
 
@@ -1883,6 +1913,12 @@ server.registerTool(
         // send_message wake:auto. (Codex has no activity file, so it is never
         // detected busy and still fires — unchanged for that client.)
         wakeStatus = await wakeForSend(peer);
+        trace("wake_outcome", {
+          via: "ask_peer",
+          wake_status: wakeStatus,
+          target_session_id: peer.client.session_id,
+          client_type: peer.client.type,
+        });
         if (wakeStatus === "skipped_unsupported") {
           // Reserved branch. No client currently returns skipped_unsupported
           // in auto mode (Codex and Claude Code both wake via send-keys).
