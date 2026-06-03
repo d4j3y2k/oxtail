@@ -1,0 +1,24 @@
+name: codex-paste-burst-drift
+
+# Issue #7: oxtail's Codex wake gap (ASK_PEER_CODEX_SUBMIT_DELAY_MS=500ms) must
+# stay larger than Codex's paste-burst PASTE_ENTER_SUPPRESS_WINDOW (tested at
+# 120ms). This scheduled job fetches the upstream constant and fails if it
+# drifted, so a future Codex release bumping it surfaces as a red job rather than
+# a silent wake regression in the field. Manually runnable via the Actions tab.
+on:
+  schedule:
+    - cron: "0 12 * * 1" # weekly, Mondays 12:00 UTC
+  workflow_dispatch:
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Check Codex paste-burst window for drift
+        run: node scripts/check-codex-paste-burst.mjs

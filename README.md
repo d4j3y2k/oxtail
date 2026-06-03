@@ -36,7 +36,7 @@ args = ["-y", "oxtail@0.10.1"]
 
 ```sh
 mkdir -p ~/.claude/commands
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.10.1/.claude/commands/oxtail-join.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.12.0/.claude/commands/oxtail-join.md \
   -o ~/.claude/commands/oxtail-join.md
 ```
 
@@ -44,9 +44,9 @@ curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.10.1/.claude/command
 
 ```sh
 mkdir -p ~/.codex/skills/oxtail-join/agents
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.10.1/integrations/codex/oxtail-join/SKILL.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.12.0/integrations/codex/oxtail-join/SKILL.md \
   -o ~/.codex/skills/oxtail-join/SKILL.md
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.10.1/integrations/codex/oxtail-join/agents/openai.yaml \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.12.0/integrations/codex/oxtail-join/agents/openai.yaml \
   -o ~/.codex/skills/oxtail-join/agents/openai.yaml
 ```
 
@@ -71,7 +71,7 @@ Contributing? `git clone https://github.com/d4j3y2k/oxtail && cd oxtail && npm i
 - `register_my_session` — pin this MCP server's `session_id` directly. Kept for debugging; prefer `claim_session`.
 - `get_my_session` — return this MCP server's own registry entry plus a per-strategy detection diagnosis. Useful for debugging.
 
-See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.10.1/AGENTS.md) for scope and architecture.
+See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.12.0/AGENTS.md) for scope and architecture.
 
 ## Usage from an agent
 
@@ -172,6 +172,8 @@ If you have a hook installed on a managed event that isn't from Terminator and i
 
 oxtail trusts any process running as the **same local user** to enqueue messages. The mailbox directory is mode `0o700` (private), so other users on the host cannot read or write. **On a shared-tenancy box (containers, multi-user dev hosts, etc.), do not run oxtail-aware agents:** any local process under your user can inject `<system-reminder>` content directly into a Claude session. The threat boundary is the same as `~/.ssh/` — what your user processes do, you trust.
 
+Within that boundary oxtail still *narrows* redirectable side effects, as defense-in-depth rather than a hard boundary: wake keystrokes only go to the pane the process tree confirms hosts the target's `server_pid`, never a self-written `tmux_pane`/`tmux_session` (see [Pane targeting](#pane-targeting-verified)), and an accepted registry entry can't borrow another pid — its `server_pid` must match its own `<pid>.json` filename. So one peer's entry can't masquerade as hosting another agent to redirect that agent's wake. A same-user process can still overwrite any registry file outright (that's the trust boundary above); what it can't do is smuggle a pid mismatch past a reader.
+
 ## Delegate-and-wait (v0.10.1)
 
 `ask_peer` extends v0.5's mailbox transport into a blocking primitive:
@@ -182,7 +184,7 @@ ask_peer({ target, body })
       ok: true,
       message_id,
       request_id,
-      wake_status: "fired" | "skipped_unsupported" | "skipped_no_target" | "disabled",
+      wake_status: "fired" | "skipped_busy" | "skipped_debounced" | "skipped_no_target" | "disabled",
       reply: { id, body, enqueued_at, from_session_id, reply_to, correlation } | null,
       correlation: "correlated" | "uncorrelated" | "none",
       timeout_ms,
@@ -190,7 +192,7 @@ ask_peer({ target, body })
     }
 ```
 
-`wake_status` distinguishes the four outcomes a caller may need to handle differently. `fired` means the wake was attempted (or the reply arrived during the grace window, so no wake was needed). `skipped_unsupported` is reserved — no client currently returns this in auto mode (both Codex and Claude Code wake via send-keys). `skipped_no_target` means no tmux pane/session resolved for the target. `disabled` means `OXTAIL_ASK_PEER_WAKE_STRATEGY=off` is in effect.
+`wake_status` distinguishes the outcomes a caller may need to handle differently. `fired` means the wake was attempted (or the reply arrived during the grace window, so no wake was needed). `skipped_busy` means the peer is mid-turn (its hooks/poll will deliver — we still poll for the reply). `skipped_debounced` means a wake fired for this peer moments ago and this one was coalesced. `skipped_no_target` means no process-tree-verified pane resolved for the target. `disabled` means `OXTAIL_ASK_PEER_WAKE_STRATEGY=off` is in effect. (`skipped_unsupported` is reserved — no client currently returns it.)
 
 `timed_out` is `true` only when the poll loop ran to its deadline without a reply.
 
@@ -220,9 +222,13 @@ ask_peer({ target, body })
 4. Poll the caller's mailbox at 200ms. For reply-to-capable peers, only a message with both `from_session_id == target.session_id` and `reply_to == request_id` satisfies the wait; non-matching messages stay in the mailbox untouched. Legacy/no-capability peers are best-effort and are marked `correlation: "uncorrelated"`; this preserves old peers but can stale-match old same-peer chatter.
 5. Return the reply on match, or `{ reply: null, timed_out: true, wake_status, correlation: "none" }` after the timeout. Late replies fall back to the normal v0.5 hook / `read_my_messages` path — never lost, just delivered out of band.
 
-### Pane staleness
+### Pane targeting (verified)
 
-Pane targeting can go stale: `tmux_pane` is cached at server startup, but tmux can reuse pane ids after a pane is killed. v0.7 re-resolves the pane from the peer's `server_pid` at wake-time (via process-tree ancestry), preferring the live pane id over the cached one. If the peer is no longer in any tmux pane (orphaned), oxtail falls back to the registered tmux session name. If both targeting attempts fail, `wake_status` returns `skipped_no_target`.
+A peer's cached `tmux_pane` / `tmux_session` are written by the peer into its **own** registry file, so they aren't trustworthy targets for keystrokes — a malicious local peer could point them at someone else's pane. The **only** send-keys target oxtail uses is the pane the live process tree says currently hosts the peer's `server_pid` (resolved at wake-time via `ps`/`tmux` ancestry — unforgeable by editing a JSON file). This also handles pane-id churn for free: the pane is always re-resolved fresh. If `server_pid` can't be bound to any live pane, oxtail **refuses** to wake (`wake_status: "skipped_no_target"`) rather than fall back to a self-written value. `server_pid` itself is self-written too, so registry entries whose `server_pid` doesn't match their own `<pid>.json` filename are rejected — a forged entry can't borrow another process's pane. The pane id that does reach `tmux` is shape-validated (`%\d+`); session names are no longer used as a send-keys target at all. (Hardening from issue #6.)
+
+### Wake debouncing
+
+All wake paths funnel through one place, which **coalesces** rapid repeat wakes to the same peer: if a wake fired for a peer within `OXTAIL_WAKE_DEBOUNCE_MS` (default 1s), a follow-up wake is skipped (`wake_status: "skipped_debounced"`) and relies on the still-pending response. This keeps a retried `ask_peer`, two callers racing the same peer, or a polling loop from stacking notification lines into the peer's composer. In-memory and per-process by design. (Issue #5.)
 
 ### Constraints
 
@@ -281,10 +287,24 @@ When a strategy doesn't fire, it returns an abstention with a `reason` (e.g. `"2
 
 If `MCP_TRACE_FILE` is set in the environment, every detection run appends an NDJSON record with trigger, winning strategy, per-strategy outcomes, and `next_step`. Useful for diagnosing unresolved `client_session_id`s in the wild.
 
+### Diagnosing wakes (`oxtail diagnose`)
+
+The same `MCP_TRACE_FILE` also captures a `wake_outcome` record for every wake (which tool drove it and the resulting `wake_status`). Run:
+
+```sh
+oxtail diagnose
+```
+
+to get a summary — counts by `wake_status`, broken down by tool — so "is the wake mechanism working in my environment?" is one command instead of grepping JSONL. With `MCP_TRACE_FILE` unset it just prints how to enable tracing. (Issue #7.)
+
+A scheduled CI job (`.github/workflows/codex-drift.yml`, also runnable on demand) fetches Codex's upstream `PASTE_ENTER_SUPPRESS_WINDOW` and fails if it drifts past oxtail's 500ms Codex wake gap — so a future Codex release that would break the wake surfaces as a red job rather than a silent field regression.
+
 ## Status
 
-v0.10.1. Completes the autonomous peer-messaging matrix and hardens the protocol: a message reaches a Claude Code peer whether it's mid-turn, finishing, or fully idle, and delegate-and-wait replies are correlated by `request_id` / `reply_to` for upgraded peers.
+v0.12.0. Pushes the autonomous peer-messaging matrix toward zero human relay, then hardens the wake path.
 
+- **Wake-on-reply (v0.11.0).** A reply — `send_message` with `reply_to` — auto-wakes a freshly-idle requester by default, so an awaited answer doesn't strand an idle peer. Strictly gated (fresh-idle only, per-target rate limit, one-wake dedupe, `OXTAIL_AUTOWAKE=off` kill-switch). `wake:"off"` opts out; explicit `wake:"auto"` is the escape hatch for a requester without an idle marker (Codex / hookless Claude).
+- **Wake hardening (v0.12.0).** Wake keystrokes only ever target the pane the process tree confirms hosts the peer's `server_pid` — never a self-written `tmux_pane`/`tmux_session`, and registry entries whose `server_pid` doesn't match their filename are rejected. Rapid repeat wakes to one peer are coalesced (`skipped_debounced`). `oxtail diagnose` summarizes wake outcomes from `MCP_TRACE_FILE`, and a scheduled CI job flags drift in Codex's paste-burst window before it can break the wake.
 - **Correlated delegate-and-wait.** `ask_peer` now sends a `request_id`; upgraded peers reply with `send_message({ reply_to })`, and the waiter ignores same-peer chatter that does not match. Legacy peers are still supported, but their replies are marked `correlation: "uncorrelated"`.
 - **Identity monotonicity.** `claim_session` / `register_my_session` and sticky-claim recovery are authoritative after they set a session id; later automatic detection cannot clobber a claimed id with stale env data.
 - **Hook push budgeting and provenance.** PreToolUse/Stop delivery stamps `origin: "peer"`, reminds receivers that peer messages are not user authority, and caps hook-injected body text via `OXTAIL_HOOK_MAX_BODY_CHARS`.

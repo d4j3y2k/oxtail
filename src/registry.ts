@@ -77,6 +77,75 @@ function entryPath(pid: number): string {
   return join(registryDir(), `${pid}.json`);
 }
 
+// tmux's own identifiers, used to sanitize registry-sourced values before they
+// reach a `tmux` command. A pane id is always `%<n>`; a session name, per tmux's
+// rules for names we create, is `[A-Za-z0-9_-]+`. Validating defends against a
+// malicious local peer writing a crafted `tmux_pane`/`tmux_session` into its own
+// registry file to redirect or trick our wake send-keys (issue #6).
+export function isValidTmuxPane(s: string): boolean {
+  return /^%\d+$/.test(s);
+}
+
+export function isValidTmuxSession(s: string): boolean {
+  return /^[A-Za-z0-9_-]+$/.test(s);
+}
+
+// The ONLY trustworthy send-keys target for waking a peer: the pane the live
+// process tree says currently hosts the peer's `server_pid`. This is computed
+// from `ps`/`tmux` state (currentPaneForServerPid), so it cannot be forged by a
+// peer editing its own `~/.oxtail/sessions/<pid>.json` — unlike the cached
+// `tmux_pane`/`tmux_session` fields, which the peer self-writes. Returns null
+// (caller must refuse to wake) when:
+//   - the peer never registered a pane: a legit tmux-hosted peer always does
+//     (its session is derived from the pane), so a pane-less/session-only entry
+//     is hand-written or spoofed and must never be blind-fired; gating on a
+//     registered pane also avoids fishing for a pane from server_pid alone,
+//     which in tests can collide with the test runner's own pane.
+//   - server_pid isn't under any live tmux pane: we can't bind a trustworthy
+//     target, so we refuse rather than fall back to the self-written cached value.
+//   - the resolved pane isn't a well-formed pane id (tmux output anomaly).
+// resolvePane is injected in tests; production uses currentPaneForServerPid.
+export function chooseVerifiedWakePane(
+  peer: { tmux_pane: string | null; server_pid: number },
+  resolvePane: (serverPid: number) => string | null = currentPaneForServerPid,
+): string | null {
+  if (!peer.tmux_pane) return null;
+  const live = resolvePane(peer.server_pid);
+  if (!live || !isValidTmuxPane(live)) return null;
+  return live;
+}
+
+// Extract the pid a registry filename encodes: `<pid>.json` → pid, else null.
+export function filenamePid(file: string): number | null {
+  const m = /^(\d+)\.json$/.exec(file);
+  if (!m) return null;
+  const pid = Number(m[1]);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+// Read + parse a registry file, enforcing the provenance invariant that a
+// process only ever writes its OWN `<pid>.json`: the parsed `server_pid` MUST
+// equal the pid in the filename. register() always writes them in agreement, so
+// a mismatch means the entry was hand-forged to borrow another process's pid —
+// the #6 redirect where a peer self-writes `server_pid: <victimPid>` so that
+// chooseVerifiedWakePane → currentPaneForServerPid resolves (and wakes) the
+// victim's pane. Such entries, plus non-`<pid>.json` names and parse failures,
+// are rejected (returns null) so no raw-registry reader trusts them. The
+// local-user trust boundary still holds (a same-user process can overwrite any
+// file), but this stops one peer's entry from impersonating another pid.
+export function readEntryFile(dir: string, file: string): RegistryEntry | null {
+  const fnamePid = filenamePid(file);
+  if (fnamePid === null) return null;
+  let entry: RegistryEntry;
+  try {
+    entry = JSON.parse(readFileSync(join(dir, file), "utf8")) as RegistryEntry;
+  } catch {
+    return null;
+  }
+  if (entry.server_pid !== fnamePid) return null;
+  return entry;
+}
+
 function resolveTmuxSessionFromPane(pane: string | null): string | null {
   if (!pane) return null;
   try {
@@ -152,7 +221,10 @@ export function findTmuxPaneByAncestry(
 }
 
 export function resolveTmuxPane(env: NodeJS.ProcessEnv = process.env, pid = process.pid): string | null {
-  if (env.TMUX_PANE) return env.TMUX_PANE;
+  // TMUX_PANE is a peer-controllable env var: only trust it if it has tmux's
+  // pane-id shape (%N). A spoofed/malformed value falls through to process-tree
+  // ancestry, which can't be forged by editing the environment (issue #6).
+  if (env.TMUX_PANE && isValidTmuxPane(env.TMUX_PANE)) return env.TMUX_PANE;
   return findTmuxPaneByAncestry(pid, listTmuxPanePids(), listAllPpids());
 }
 
@@ -226,14 +298,9 @@ function gcDeadSiblings(entry: RegistryEntry): void {
   const dir = registryDir();
   if (!existsSync(dir)) return;
   for (const file of readdirSync(dir)) {
-    if (!file.endsWith(".json")) continue;
+    const other = readEntryFile(dir, file);
+    if (!other) continue; // skip non-<pid>.json, parse errors, and forged entries
     const full = join(dir, file);
-    let other: RegistryEntry;
-    try {
-      other = JSON.parse(readFileSync(full, "utf8")) as RegistryEntry;
-    } catch {
-      continue;
-    }
     if (other.server_pid === entry.server_pid) continue;
     if (other.client.session_id !== sid) continue;
     if (isAlive(other.server_pid)) continue;
@@ -291,14 +358,9 @@ export function readAll(): RegistryEntry[] {
   if (!existsSync(dir)) return [];
   const live: RegistryEntry[] = [];
   for (const file of readdirSync(dir)) {
-    if (!file.endsWith(".json")) continue;
+    const entry = readEntryFile(dir, file);
+    if (!entry) continue; // non-<pid>.json, parse error, or forged server_pid
     const full = join(dir, file);
-    let entry: RegistryEntry;
-    try {
-      entry = JSON.parse(readFileSync(full, "utf8")) as RegistryEntry;
-    } catch {
-      continue;
-    }
     if (!isAlive(entry.server_pid)) {
       // Reap-deferral: a dead child's mailbox may still hold undrained mail
       // that the session's union-drain (PreToolUse hook + read_my_messages)
@@ -366,13 +428,8 @@ export function sessionPidsForId(sessionId: string): number[] {
   if (!existsSync(dir)) return [];
   const entries: RegistryEntry[] = [];
   for (const file of readdirSync(dir)) {
-    if (!file.endsWith(".json")) continue;
-    let e: RegistryEntry;
-    try {
-      e = JSON.parse(readFileSync(join(dir, file), "utf8")) as RegistryEntry;
-    } catch {
-      continue;
-    }
+    const e = readEntryFile(dir, file);
+    if (!e) continue; // skip non-<pid>.json, parse errors, and forged entries
     if (e.client.session_id === sessionId) entries.push(e);
   }
   entries.sort((a, b) => a.started_at - b.started_at);
