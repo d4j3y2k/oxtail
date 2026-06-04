@@ -137,13 +137,16 @@ export function serializeMailboxLine(msg: Mailbox): string {
   return line;
 }
 
-export function enqueue(
-  target_pid: number,
+// Mint a message envelope WITHOUT writing it anywhere. Split out from enqueue so
+// a higher layer (delivery.ts) can record the durable received-ledger entry
+// BEFORE the mailbox line becomes visible — the ordering that guarantees any
+// message_id a receiver can drain/render already has a ledger entry behind it.
+export function buildMessage(
   body: string,
   from_session_id?: string,
   options: EnqueueOptions = {},
 ): Mailbox {
-  const msg: Mailbox = {
+  return {
     schema_version: 1,
     id: randomBytes(8).toString("hex"),
     body,
@@ -155,10 +158,18 @@ export function enqueue(
     ...(options.reply_to ? { reply_to: options.reply_to } : {}),
     ...(options.source_message_id ? { source_message_id: options.source_message_id } : {}),
   };
-  const line = serializeMailboxLine(msg);
+}
+
+export function enqueue(
+  target_pid: number,
+  body: string,
+  from_session_id?: string,
+  options: EnqueueOptions = {},
+): Mailbox {
+  const msg = buildMessage(body, from_session_id, options);
   acquireLock(target_pid);
   try {
-    appendFileSync(mailboxPath(target_pid), line);
+    appendFileSync(mailboxPath(target_pid), serializeMailboxLine(msg));
   } finally {
     releaseLock(target_pid);
   }

@@ -31,6 +31,8 @@ import {
   type StateCard,
 } from "./registry.js";
 import * as mailbox from "./mailbox.js";
+import * as received from "./received.js";
+import { deliverToPeer } from "./delivery.js";
 import { recoverClaim, resolveAncestors, writeClaim } from "./claims.js";
 import { decideReplyAutoWake, defaultAutowakeDir } from "./autowake.js";
 import { markWoke, newWakeDebounceStore, recentlyWoke } from "./wake-debounce.js";
@@ -1310,7 +1312,11 @@ server.registerTool(
     }
     const peer = resolved.entry;
     const fromSessionId = entry.client.session_id ?? undefined;
-    const msg = mailbox.enqueue(peer.server_pid, body, fromSessionId, {
+    // deliverToPeer records the durable reply-handle in the recipient's ledger
+    // BEFORE the mailbox line is visible, so a later reply_to_message(message_id)
+    // resolves even after the destructive mailbox/hook drain — and never sees a
+    // displayed-but-unrecorded handle (record precedes append).
+    const msg = deliverToPeer(peer.client.session_id, peer.server_pid, body, fromSessionId, {
       reply_to,
       source_message_id,
     });
@@ -1329,6 +1335,110 @@ server.registerTool(
       message_id: msg.id,
       target_session_id: peer.client.session_id,
       target_server_pid: peer.server_pid,
+      ...(wake_status ? { wake_status } : {}),
+      ...(wake_reason ? { wake_reason } : {}),
+    });
+  },
+);
+
+server.registerTool(
+  "reply_to_message",
+  {
+    description: [
+      "Reply to a specific inbound peer message by its message_id — the atomic, correlation-safe alternative to hand-wiring send_message's target + reply_to. The server looks the message up in this session's durable received-ledger, so you pass only the message_id the PreToolUse hook or read_my_messages already showed you; it derives the reply target (the original sender), carries reply_to=request_id when the inbound was an ask_peer (keeping the exchange correlated), and sets source_message_id for provenance. Replying to a plain send_message works too — it just omits reply_to. Ownership is structural: you can only reply to a message delivered to you.",
+      "Delivery + wake match send_message exactly, including the wake-on-reply default: when the inbound carried a request_id and you leave wake unset, a freshly-idle requester is auto-woken; pass wake:\"auto\" to nudge any idle peer, or wake:\"off\" to suppress. Fail-closed: an unknown or aged-out message_id returns error message-not-found instead of guessing a target.",
+    ].join(" "),
+    inputSchema: {
+      message_id: z
+        .string()
+        .min(1)
+        .describe(
+          "The message_id of the inbound peer message you are replying to, as shown by the PreToolUse hook or read_my_messages.",
+        ),
+      body: z
+        .string()
+        .min(1)
+        .refine((s) => Buffer.byteLength(s, "utf8") <= 8192, {
+          message: "body exceeds 8192 UTF-8 bytes",
+        })
+        .describe("Reply body, ≤8KB UTF-8. Verbatim."),
+      wake: z
+        .enum(["off", "auto"])
+        .optional()
+        .describe(
+          'Wake strategy, same semantics as send_message. Unset: wake-on-reply default (auto-wakes a freshly-idle requester when the inbound was an ask_peer). "auto": nudge any idle peer. "off": no nudge.',
+        ),
+    },
+  },
+  async ({ message_id, body, wake }) => {
+    const myId = entry.client.session_id;
+    if (!myId) {
+      return jsonResult({
+        schema_version: 1,
+        ok: false,
+        error: "no-session-id",
+        message:
+          "This session has not claimed a session_id, so it has no received-ledger to reply from. Call claim_session first.",
+      });
+    }
+    const inbound = received.lookupReceived(myId, message_id);
+    if (!inbound) {
+      return jsonResult({
+        schema_version: 1,
+        ok: false,
+        error: "message-not-found",
+        message: `No received message ${message_id} in this session's ledger (it may have aged out of retention, or predates reply_to_message). Fall back to send_message with an explicit target.`,
+      });
+    }
+    const targetSid = inbound.from_session_id;
+    if (!targetSid) {
+      return jsonResult({
+        schema_version: 1,
+        ok: false,
+        error: "no-reply-target",
+        message: `Inbound message ${message_id} has no from_session_id, so there is no peer to reply to.`,
+      });
+    }
+    const replyTo = inbound.request_id; // undefined when the inbound was a plain send_message
+    const resolved = resolveTarget(targetSid, entry);
+    if (!resolved.ok) {
+      const replyDefault = replyAutoWakeTriggered(wake, replyTo);
+      const wakeIntended = wake === "auto" || replyDefault;
+      const wake_status = wakeIntended ? resolveErrorWakeStatus(resolved.error) : undefined;
+      return jsonResult({
+        schema_version: 1,
+        ...resolved,
+        in_reply_to_message_id: message_id,
+        original_from_session_id: targetSid,
+        ...(wake_status ? { wake_status } : {}),
+        ...(replyDefault ? { wake_reason: "reply_to_default" } : {}),
+      });
+    }
+    const peer = resolved.entry;
+    const fromSessionId = entry.client.session_id ?? undefined;
+    // Record the reply itself into the original asker's ledger (record-before-
+    // append) so replies can be replied to in turn — chained correlation.
+    const msg = deliverToPeer(peer.client.session_id, peer.server_pid, body, fromSessionId, {
+      reply_to: replyTo,
+      source_message_id: message_id,
+    });
+    const { wake_status, wake_reason } = await resolveSendWake(peer, wake, replyTo);
+    if (wake_status) {
+      trace("wake_outcome", {
+        via: wake_reason === "reply_to_default" ? "reply_default" : "reply_to_message",
+        wake_status,
+        target_session_id: peer.client.session_id,
+        client_type: peer.client.type,
+      });
+    }
+    return jsonResult({
+      schema_version: 1,
+      ok: true,
+      message_id: msg.id,
+      in_reply_to_message_id: message_id,
+      target_session_id: peer.client.session_id,
+      target_server_pid: peer.server_pid,
+      correlation: replyTo ? "correlated" : "uncorrelated",
       ...(wake_status ? { wake_status } : {}),
       ...(wake_reason ? { wake_reason } : {}),
     });
@@ -1872,7 +1982,9 @@ server.registerTool(
     const requestId = randomBytes(8).toString("hex");
     const requireReplyTo = peerSupportsReplyTo(peer);
     const fromSessionId = entry.client.session_id ?? undefined;
-    const msg = mailbox.enqueue(peer.server_pid, body, fromSessionId, {
+    // Record-before-append (mirrors send_message): lets the peer answer with
+    // reply_to_message(message_id) instead of hand-wiring target + reply_to.
+    const msg = deliverToPeer(expectedSessionId, peer.server_pid, body, fromSessionId, {
       request_id: requestId,
     });
     const startedAt = Date.now();
