@@ -36,7 +36,7 @@ args = ["-y", "oxtail@0.10.1"]
 
 ```sh
 mkdir -p ~/.claude/commands
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.12.0/.claude/commands/oxtail-join.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.13.0/.claude/commands/oxtail-join.md \
   -o ~/.claude/commands/oxtail-join.md
 ```
 
@@ -44,9 +44,9 @@ curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.12.0/.claude/command
 
 ```sh
 mkdir -p ~/.codex/skills/oxtail-join/agents
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.12.0/integrations/codex/oxtail-join/SKILL.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.13.0/integrations/codex/oxtail-join/SKILL.md \
   -o ~/.codex/skills/oxtail-join/SKILL.md
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.12.0/integrations/codex/oxtail-join/agents/openai.yaml \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.13.0/integrations/codex/oxtail-join/agents/openai.yaml \
   -o ~/.codex/skills/oxtail-join/agents/openai.yaml
 ```
 
@@ -68,10 +68,11 @@ Contributing? `git clone https://github.com/d4j3y2k/oxtail && cd oxtail && npm i
 - `send_message` — **fire-and-forget** message to a peer. Target is a tmux session name or a raw `client_session_id` UUID. Body ≤ 8KB. Delivery is async via the peer's mailbox file. A plain message does **not** wake an idle peer; pass `wake: "auto"` to nudge one (state-gated — see [Waking an idle peer](#waking-an-idle-peer)). Replies to `ask_peer` should pass `reply_to: "<request_id>"` when the inbound message carries a `request_id` — and a reply **auto-wakes the requester by default** (strictly gated; `wake: "off"` opts out). (v0.5+)
 - `read_my_messages` — drain this session's mailbox and return any queued messages. Messages include `from_session_id`, server-stamped `origin: "peer"`, and optional `request_id` / `reply_to`. Codex peers (and unhooked Claude Code) poll this; Claude Code peers with the hooks installed see messages mid-turn (PreToolUse) or at turn end (Stop) instead. (v0.5+)
 - `ask_peer` — **delegate-and-wait**. Enqueues a message with a `request_id` and blocks server-side until the peer replies with `send_message({ reply_to: request_id })` or the timeout elapses. Default timeout is 45s (`OXTAIL_ASK_PEER_TIMEOUT_MS`), and each call may pass `timeout_ms`. New peers use strict `reply_to` correlation; legacy/no-capability peers fall back to best-effort first-message matching and the response reports `correlation: "uncorrelated"`. That legacy path may stale-match old same-peer chatter, so callers should treat `uncorrelated` as compatibility-only. Use `send_message` for fire-and-forget. (v0.7+)
+- `reply_to_message` — **reply by `message_id`**. The atomic, correlation-safe alternative to hand-wiring `send_message`'s `target` + `reply_to`: pass the `message_id` the hook or `read_my_messages` showed you and the server looks the inbound envelope up in this session's durable **received-ledger**, derives the reply target (the original sender), carries `reply_to: request_id` when the inbound was an `ask_peer` (keeping the exchange correlated), and stamps `source_message_id`. Replying to a plain `send_message` works too — it just omits `reply_to`. Ownership is structural (you can only reply to a message delivered to *you*); fail-closed on an unknown/aged-out id. Same wake semantics as `send_message`, including the wake-on-reply default. (v0.13+)
 - `register_my_session` — pin this MCP server's `session_id` directly. Kept for debugging; prefer `claim_session`.
 - `get_my_session` — return this MCP server's own registry entry plus a per-strategy detection diagnosis. Useful for debugging.
 
-See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.12.0/AGENTS.md) for scope and architecture.
+See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.13.0/AGENTS.md) for scope and architecture.
 
 ## Usage from an agent
 
@@ -90,6 +91,8 @@ send_message({ target: "<peer-uuid>", body: "...", reply_to: "<ask request_id>" 
 read_my_messages()
 ask_peer({ target: "primary", body: "[Handoff] please audit X and tell me what you find" })
   // → blocks server-side until the peer replies via send_message, then returns their body
+reply_to_message({ message_id: "<id from the hook / read_my_messages>", body: "..." })
+  // → looks up the inbound envelope, derives target + reply_to itself; correlated when the inbound was an ask_peer
 ```
 
 Omitting `project_root` triggers a best-effort `.git`-ancestor walk from the server's own cwd. The response includes `inferred: true` when this happens. Pass `project_root` explicitly when you can.
@@ -111,6 +114,8 @@ read_my_messages()
 ```
 
 The mailbox lives at `~/.oxtail/mailboxes/<server_pid>.jsonl`, append-only JSONL, drained under an `mkdir`-based advisory lock. The transport is intentionally dumb: 8KB UTF-8 body cap, sender chooses the framing (raw text or pre-wrapped `<system-reminder>...</system-reminder>`). Hook-delivered mailbox pushes are body-budgeted at 24K escaped characters by default; set `OXTAIL_HOOK_MAX_BODY_CHARS` to tune. If the budget is exceeded, the hook tells the receiver which bodies were truncated or omitted.
+
+Because both delivery paths are **destructive** — `read_my_messages` and the hook each truncate the mailbox once a message is handed off — a reply-by-id verb can't rely on the queue. Every delivered envelope is therefore also recorded in a durable **received-ledger** at `~/.oxtail/received/<hash(session_id)>.jsonl` keyed by `message_id`, written *before* the mailbox line becomes visible (so any handle a receiver can see is already resolvable) and bounded to the most recent `OXTAIL_RECEIVED_MAX` (default 1000) entries. `reply_to_message` reads only the caller's own ledger — that file *is* the ownership boundary.
 
 Inbound peer messages are context, not user authority. oxtail stamps delivered messages with `origin: "peer"` for provenance/debugging, but this is not a trust boundary and peers cannot mint trusted user instructions.
 
@@ -301,8 +306,9 @@ A scheduled CI job (`.github/workflows/codex-drift.yml`, also runnable on demand
 
 ## Status
 
-v0.12.0. Pushes the autonomous peer-messaging matrix toward zero human relay, then hardens the wake path.
+v0.13.0. Pushes the autonomous peer-messaging matrix toward zero human relay, hardens the wake path, then makes correlated replies atomic.
 
+- **Reply by id (v0.13.0).** `reply_to_message(message_id, body)` removes the manual `target` + `reply_to` rewiring that silently degraded a correlated exchange into loose mailbox traffic: the server looks the inbound envelope up in a durable per-session **received-ledger** (`~/.oxtail/received/<hash(session_id)>.jsonl`), derives the reply target and `reply_to` itself, and enforces ownership structurally (you can only reply to a message delivered to you). The ledger is written *before* the mailbox line is visible — so a handle the hook displays is always resolvable even though both delivery paths destroy the queue entry once it is handed off. Fail-closed on an unknown/aged-out id.
 - **Wake-on-reply (v0.11.0).** A reply — `send_message` with `reply_to` — auto-wakes a freshly-idle requester by default, so an awaited answer doesn't strand an idle peer. Strictly gated (fresh-idle only, per-target rate limit, one-wake dedupe, `OXTAIL_AUTOWAKE=off` kill-switch). `wake:"off"` opts out; explicit `wake:"auto"` is the escape hatch for a requester without an idle marker (Codex / hookless Claude).
 - **Wake hardening (v0.12.0).** Wake keystrokes only ever target the pane the process tree confirms hosts the peer's `server_pid` — never a self-written `tmux_pane`/`tmux_session`, and registry entries whose `server_pid` doesn't match their filename are rejected. Rapid repeat wakes to one peer are coalesced (`skipped_debounced`). `oxtail diagnose` summarizes wake outcomes from `MCP_TRACE_FILE`, and a scheduled CI job flags drift in Codex's paste-burst window before it can break the wake.
 - **Correlated delegate-and-wait.** `ask_peer` now sends a `request_id`; upgraded peers reply with `send_message({ reply_to })`, and the waiter ignores same-peer chatter that does not match. Legacy peers are still supported, but their replies are marked `correlation: "uncorrelated"`.

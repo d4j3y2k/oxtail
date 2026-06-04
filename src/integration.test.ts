@@ -8,6 +8,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { readAll, register, type RegistryEntry } from "./registry.js";
 import { drain, enqueue } from "./mailbox.js";
+import { recordReceived } from "./received.js";
 
 const SERVER_ENTRY = resolve(import.meta.dirname, "server.ts");
 const TSX_BIN = resolve(import.meta.dirname, "..", "node_modules", ".bin", "tsx");
@@ -833,6 +834,148 @@ test("messaging: send_message by session_id (UUID) resolves to the same peer", a
     } finally {
       process.env.HOME = prev;
     }
+  } finally {
+    await server.cleanup();
+  }
+});
+
+type ReplyOk = {
+  schema_version: 1;
+  ok: true;
+  message_id: string;
+  in_reply_to_message_id: string;
+  target_session_id: string | null;
+  target_server_pid: number;
+  correlation: "correlated" | "uncorrelated";
+  wake_status?: string;
+  wake_reason?: string;
+};
+
+type ReplyErr = {
+  schema_version: 1;
+  ok: false;
+  error: string;
+  message?: string;
+};
+
+// Seed an inbound envelope into a receiver's ledger the way production does:
+// at enqueue time. Returns the minted message_id the receiver would later pass
+// to reply_to_message. HOME-swapped so both the mailbox and ledger resolve into
+// the spawned server's HOME.
+function seedInbound(
+  home: string,
+  receiverSid: string,
+  fromSid: string,
+  body: string,
+  opts: { request_id?: string } = {},
+): string {
+  const prev = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const msg = enqueue(99999, body, fromSid, opts);
+    recordReceived(receiverSid, msg);
+    return msg.id;
+  } finally {
+    process.env.HOME = prev;
+  }
+}
+
+test("reply_to_message: correlated — derives target + carries reply_to=request_id", async () => {
+  const server = await spawnServer();
+  try {
+    const callerSid = "ca11e700-0000-0000-0000-000000000001";
+    const senderSid = "5e0de700-0000-0000-0000-000000000002";
+    await callTool(server.client, "register_my_session", { session_id: callerSid });
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: senderSid,
+      tmux_session: "the-asker",
+      cwd: server.home,
+    });
+
+    const inboundId = seedInbound(server.home, callerSid, senderSid, "original ask", {
+      request_id: "req-correlated-1",
+    });
+
+    const reply = await callTool<ReplyOk | ReplyErr>(server.client, "reply_to_message", {
+      message_id: inboundId,
+      body: "here is my answer",
+    });
+    assert.equal(reply.ok, true, `reply must succeed: ${JSON.stringify(reply)}`);
+    const ok = reply as ReplyOk;
+    assert.equal(ok.target_session_id, senderSid, "target derived from from_session_id");
+    assert.equal(ok.in_reply_to_message_id, inboundId);
+    assert.equal(ok.correlation, "correlated");
+
+    // The reply must land in the original asker's mailbox, correlated.
+    const prev = process.env.HOME;
+    process.env.HOME = server.home;
+    try {
+      const drained = drain(process.pid);
+      assert.equal(drained.length, 1);
+      assert.equal(drained[0].body, "here is my answer");
+      assert.equal(drained[0].reply_to, "req-correlated-1", "reply_to derived from request_id");
+      assert.equal(drained[0].from_session_id, callerSid, "from is the replier");
+      assert.equal(drained[0].source_message_id, inboundId, "provenance set");
+    } finally {
+      process.env.HOME = prev;
+    }
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("reply_to_message: uncorrelated — replying to a plain send_message omits reply_to", async () => {
+  const server = await spawnServer();
+  try {
+    const callerSid = "ca11e700-0000-0000-0000-000000000003";
+    const senderSid = "5e0de700-0000-0000-0000-000000000004";
+    await callTool(server.client, "register_my_session", { session_id: callerSid });
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: senderSid,
+      tmux_session: "plain-sender",
+      cwd: server.home,
+    });
+
+    // No request_id → the inbound was a plain send_message.
+    const inboundId = seedInbound(server.home, callerSid, senderSid, "fyi, plain message");
+
+    const reply = await callTool<ReplyOk | ReplyErr>(server.client, "reply_to_message", {
+      message_id: inboundId,
+      body: "got it",
+    });
+    assert.equal(reply.ok, true, `reply must succeed: ${JSON.stringify(reply)}`);
+    assert.equal((reply as ReplyOk).correlation, "uncorrelated");
+
+    const prev = process.env.HOME;
+    process.env.HOME = server.home;
+    try {
+      const drained = drain(process.pid);
+      assert.equal(drained.length, 1);
+      assert.equal(drained[0].body, "got it");
+      assert.equal(drained[0].reply_to, undefined, "no reply_to for a plain inbound");
+      assert.equal(drained[0].source_message_id, inboundId);
+    } finally {
+      process.env.HOME = prev;
+    }
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("reply_to_message: fail-closed on an unknown message_id", async () => {
+  const server = await spawnServer();
+  try {
+    const callerSid = "ca11e700-0000-0000-0000-000000000005";
+    await callTool(server.client, "register_my_session", { session_id: callerSid });
+
+    const reply = await callTool<ReplyOk | ReplyErr>(server.client, "reply_to_message", {
+      message_id: "ffffffffffffffff",
+      body: "into the void",
+    });
+    assert.equal(reply.ok, false);
+    assert.equal((reply as ReplyErr).error, "message-not-found");
   } finally {
     await server.cleanup();
   }
