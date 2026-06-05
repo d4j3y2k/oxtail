@@ -53,6 +53,118 @@ test("mailbox: enqueue then drain returns one message; file empty after", () => 
   });
 });
 
+// --- drainMatchingReplyMany (ask_peer union reply drain) ---------------------
+
+test("drainMatchingReplyMany: reaches a correlated reply enqueued to a SIBLING pid", () => {
+  withHome(() => {
+    const ownPid = 50001;
+    const siblingPid = 50002;
+    const peerSid = "ffffffff-1111-2222-3333-444444444444";
+    // The reply landed in the sibling mailbox, NOT own — a single-pid drain on
+    // ownPid would miss it and strand the requester.
+    mailbox.enqueue(siblingPid, "the answer", peerSid, { reply_to: "req-1" });
+
+    assert.equal(
+      mailbox.drainMatchingReply(ownPid, peerSid, "req-1"),
+      null,
+      "own pid alone misses it",
+    );
+    const got = mailbox.drainMatchingReplyMany([ownPid, siblingPid], peerSid, "req-1");
+    assert.ok(got, "union drain reaches the sibling");
+    assert.equal(got!.body, "the answer");
+    // Consumed from the sibling mailbox.
+    assert.equal(readFileSync(mailbox.mailboxFilePath(siblingPid), "utf8"), "");
+  });
+});
+
+test("drainMatchingReplyMany: returns the FIRST match and leaves a distinct second reply", () => {
+  withHome(() => {
+    const ownPid = 51001;
+    const siblingPid = 51002;
+    const peerSid = "ffffffff-aaaa-bbbb-cccc-444444444444";
+    // Two DISTINCT replies to the same request_id (answer + correction) — the
+    // second must NOT be silently dropped.
+    mailbox.enqueue(ownPid, "first answer", peerSid, { reply_to: "req-2" });
+    mailbox.enqueue(siblingPid, "follow-up correction", peerSid, { reply_to: "req-2" });
+
+    const first = mailbox.drainMatchingReplyMany([ownPid, siblingPid], peerSid, "req-2");
+    assert.equal(first!.body, "first answer", "own pid checked first");
+    // The sibling's distinct second reply still waits for read_my_messages.
+    const second = mailbox.drainMatchingReplyMany([ownPid, siblingPid], peerSid, "req-2");
+    assert.equal(second!.body, "follow-up correction");
+  });
+});
+
+test("drainMatchingReplyMany: dedups pids and returns null when nothing matches", () => {
+  withHome(() => {
+    const ownPid = 52001;
+    const peerSid = "ffffffff-dddd-eeee-ffff-444444444444";
+    mailbox.enqueue(ownPid, "unrelated", "some-other-session", { reply_to: "nope" });
+    assert.equal(
+      mailbox.drainMatchingReplyMany([ownPid, ownPid, ownPid], peerSid, "req-3"),
+      null,
+      "no match across deduped pids",
+    );
+  });
+});
+
+test("drainMatchingReplyMany: sweeps a migrate-crash duplicate so it can't be re-delivered later", () => {
+  withHome(() => {
+    const ownPid = 53001;
+    const siblingPid = 53002;
+    const peerSid = "ffffffff-1212-3434-5656-444444444444";
+    // Same message (same id) in two sibling mailboxes — a migrate-crash dup.
+    const msg = mailbox.enqueue(ownPid, "the answer", peerSid, { reply_to: "req-4" });
+    mailbox.requeue(siblingPid, msg); // preserves msg.id
+
+    const got = mailbox.drainMatchingReplyMany([ownPid, siblingPid], peerSid, "req-4");
+    assert.ok(got);
+    assert.equal(got!.id, msg.id);
+    // BOTH copies gone — a later read_my_messages union drain won't re-deliver it.
+    assert.equal(readFileSync(mailbox.mailboxFilePath(ownPid), "utf8"), "");
+    assert.equal(readFileSync(mailbox.mailboxFilePath(siblingPid), "utf8"), "");
+  });
+});
+
+test("sweepMessageId: removes the exact id from each pid, leaves a distinct reply", () => {
+  withHome(() => {
+    const pidA = 55001;
+    const pidB = 55002;
+    const peerSid = "ffffffff-3434-5656-7878-444444444444";
+    const dup = mailbox.enqueue(pidA, "the answer", peerSid, { reply_to: "req-6" });
+    mailbox.requeue(pidB, dup); // same id in pidB (migrate-crash dup)
+    // A DISTINCT reply (different id, same from+reply_to) also sits in pidB.
+    const distinct = mailbox.enqueue(pidB, "a correction", peerSid, { reply_to: "req-6" });
+
+    mailbox.sweepMessageId([pidA, pidB], dup.id);
+
+    assert.equal(readFileSync(mailbox.mailboxFilePath(pidA), "utf8"), "", "dup gone from pidA");
+    // pidB keeps the distinct reply, loses only the same-id dup.
+    const remaining = mailbox.drain(pidB);
+    assert.equal(remaining.length, 1);
+    assert.equal(remaining[0].id, distinct.id, "distinct reply preserved");
+  });
+});
+
+test("drainMatchingReplyManyChecked: reports a pid it could not inspect as skipped", () => {
+  withHome(() => {
+    const ownPid = 54001;
+    const lockedPid = 54002;
+    const peerSid = "ffffffff-7878-9090-1212-444444444444";
+    mailbox.enqueue(ownPid, "unrelated", "other", { reply_to: "x" });
+    // Hold lockedPid's lock so its drain attempt fails the acquire-retry budget.
+    // (mkdir-based lock dir — create it directly to simulate a stuck holder.)
+    mkdirSync(mailbox.mailboxLockPath(lockedPid), { recursive: true });
+    const { reply, skipped } = mailbox.drainMatchingReplyManyChecked(
+      [ownPid, lockedPid],
+      peerSid,
+      "req-5",
+    );
+    assert.equal(reply, null);
+    assert.deepEqual(skipped, [lockedPid], "the locked pid is reported, not silently dropped");
+  });
+});
+
 test("mailbox: three enqueues drain in append order; ids unique", () => {
   withHome(() => {
     const pid = 22222;

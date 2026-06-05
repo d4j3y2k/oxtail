@@ -180,7 +180,7 @@ test("joinSessionsWithRegistry: registry entries with tmux_session not in matche
 // v0.6 wake-pane staleness retry. When tmux send-keys against the cached
 // pane id errors (Terminator-style window churn invalidates the id),
 // askPeerWake retries against the tmux session name. Without the retry the
-// wake silently no-ops and ask_peer falls back to 45s polling.
+// wake silently no-ops and ask_peer falls back to default-timeout polling.
 import { askPeerWakeImpl } from "./server.js";
 
 test("askPeerWakeImpl: retries against sessionName when pane send-keys fails", async () => {

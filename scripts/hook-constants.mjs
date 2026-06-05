@@ -33,10 +33,14 @@ export const HOOK_MARKER_KEY = "_oxtailHook";
 //       with no owner check, so during an upgrade window (before re-install) the
 //       old hook can still lose the stall-resume / double-clear races against a
 //       v6 peer. The version bump forces re-install to close that window.
+//   v7: pretooluse re-stamps the "busy" activity marker on every tool call, so a
+//       long ACTIVE turn stays fresh and doesn't invite a spurious wake:auto once
+//       it outruns ACTIVITY_BUSY_TTL_MS. A stale pre-v7 hook just doesn't refresh
+//       (the prior behavior) — never wrong, only less fresh on long turns.
 // INVARIANT: any change to an assets/*.sh script MUST bump this version, so
 // existing installs are forced to re-install. scripts/check-hook-version.mjs
 // enforces this in CI.
-export const HOOK_MARKER_VERSION = 6;
+export const HOOK_MARKER_VERSION = 7;
 
 const HOOKS_DIR = path.join(os.homedir(), ".oxtail", "hooks");
 
