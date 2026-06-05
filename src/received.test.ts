@@ -121,6 +121,18 @@ test("received: lookupReceived returns null for an unknown id", () => {
   });
 });
 
+// L1: a hand-written/torn ledger line with a matching id but no valid envelope
+// (missing schema_version/body) must NOT be returned as a "found" message.
+test("received: lookupReceived rejects a malformed line even if the id matches", () => {
+  withHome(() => {
+    // Seed a valid record so the ledger dir/file exist, then overwrite with a
+    // hand-written id-only line (no schema_version/body).
+    recordReceived(RECEIVER, mailbox.enqueue(4242, "seed", SENDER));
+    writeFileSync(receivedFilePath(RECEIVER), '{"id":"abc123"}\n');
+    assert.equal(lookupReceived(RECEIVER, "abc123"), null, "id-only line is not a valid envelope");
+  });
+});
+
 // Ownership is structural: a session can only resolve handles in its own ledger.
 test("received: ledger is isolated per receiver session", () => {
   withHome(() => {

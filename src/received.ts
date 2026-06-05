@@ -170,6 +170,8 @@ export function lookupReceived(
       if (
         parsed &&
         typeof parsed === "object" &&
+        (parsed as Mailbox).schema_version === 1 &&
+        typeof (parsed as Mailbox).body === "string" &&
         (parsed as Mailbox).id === messageId
       ) {
         return parsed as Mailbox;

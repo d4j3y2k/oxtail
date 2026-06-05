@@ -826,6 +826,11 @@ function refineFromHandshake(trigger: string): ReturnType<typeof diagnoseDetect>
 }
 
 server.server.oninitialized = (): void => {
+  // Sweep pending-ask records orphaned by a prior session (an ask that timed out,
+  // was never answered, and whose owner went away). gcPendingAsk otherwise only
+  // runs on a later ask_peer timeout, so this startup sweep keeps the dir from
+  // accumulating stale records. Best-effort; never throws.
+  gcPendingAsk(defaultPendingAskDir(), Date.now());
   const diagnosis = refineFromHandshake("oninitialized");
   // After type is known via handshake, schedule retries to catch transcript files
   // that don't exist yet at handshake time. No-op if session_id is already set.
@@ -1087,12 +1092,17 @@ server.registerTool(
       // strategy mirrors session_id_source so callers can still see whether
       // env / birth-time / self-register resolved this entry.
       const source = entry.client.session_id_source ?? "self-register";
+      // Report confidence honestly per source: env and explicit self-register
+      // (claim_session) are authoritative ("high"); inferred sources (birth-time,
+      // sticky-claim) are "medium" — matching what the detect strategies return.
+      const confidence: "high" | "medium" =
+        source === "env" || source === "self-register" ? "high" : "medium";
       diagnosis = {
         per_strategy: {},
         winning: {
           session_id: entry.client.session_id,
           source,
-          confidence: "high" as const,
+          confidence,
           strategy: source,
         },
         next_step: null,

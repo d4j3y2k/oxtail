@@ -41,7 +41,13 @@ export function recentlyWoke(
   windowMs: number = WAKE_DEBOUNCE_MS,
 ): boolean {
   const last = store.get(key);
-  return last !== undefined && nowMs - last < windowMs;
+  if (last === undefined) return false;
+  const delta = nowMs - last;
+  // A backwards clock step (NTP correction, laptop resume) makes delta negative
+  // and < windowMs, which would wrongly suppress every wake to this peer until
+  // the clock catches back up. Treat a negative delta as "not recent" (mirrors
+  // the ageMs >= 0 guard in isFreshIdle).
+  return delta >= 0 && delta < windowMs;
 }
 
 // Record that a wake fired for this key. Opportunistically evicts stale entries
