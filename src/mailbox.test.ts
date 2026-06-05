@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   utimesSync,
   writeFileSync,
@@ -384,6 +385,68 @@ test("mailbox: stale lock (mtime 60s ago) is force-cleared and enqueue proceeds"
   });
 });
 
+// Real multi-process contention on a PRE-STALED lock: every child must steal-
+// recover and enqueue without losing an append or deadlocking. The single-winner
+// steal marker (locks.ts) guarantees only one clearer removes the stale lock, so
+// no child rmdir's another's fresh lock. All N messages must survive, and no
+// lock/steal residue may remain.
+test("mailbox: N processes contend on a stale lock — all survive, no residue", async () => {
+  const home = mkdtempSync(join(tmpdir(), "oxtail-mbox-"));
+  try {
+    const pid = 88001;
+    const N = 20;
+    const dir = join(home, ".oxtail", "mailboxes");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    // Pre-create a STALE lock so every child enters the steal-recovery path.
+    const lock = join(dir, `${pid}.jsonl.lock`);
+    mkdirSync(lock, { mode: 0o700 });
+    const old = Math.floor((Date.now() - 60_000) / 1000);
+    utimesSync(lock, old, old);
+
+    const fixture = resolve(import.meta.dirname, "mailbox.stale-contention-fixture.ts");
+    writeFileSync(
+      fixture,
+      [
+        `import { enqueue } from "./mailbox.ts";`,
+        `const msg = enqueue(Number(process.argv[2]), process.argv[3]);`,
+        `process.stdout.write(msg.id + "\\n");`,
+        ``,
+      ].join("\n"),
+    );
+    try {
+      const children = Array.from({ length: N }, (_, i) =>
+        new Promise<{ code: number; stderr: string }>((resolveChild) => {
+          const child = spawn(TSX_BIN, [fixture, String(pid), `msg-${i}`], {
+            env: { ...process.env, HOME: home, PATH: process.env.PATH ?? "" },
+          });
+          let stderr = "";
+          child.stderr.on("data", (c) => { stderr += c; });
+          child.on("close", (code) => resolveChild({ code: code ?? 0, stderr }));
+        }),
+      );
+      const results = await Promise.all(children);
+      for (const r of results) assert.equal(r.code, 0, `child failed: ${r.stderr}`);
+
+      const prev = process.env.HOME;
+      process.env.HOME = home;
+      try {
+        const drained = mailbox.drain(pid);
+        assert.equal(drained.length, N, `expected ${N} survivors, got ${drained.length}`);
+        const bodies = new Set(drained.map((m) => m.body));
+        for (let i = 0; i < N; i++) assert.ok(bodies.has(`msg-${i}`), `missing msg-${i}`);
+      } finally {
+        process.env.HOME = prev;
+      }
+      assert.equal(existsSync(lock), false, "stale lock fully cleared");
+      assert.equal(existsSync(`${lock}.steal`), false, "no steal-marker residue");
+    } finally {
+      try { rmSync(fixture); } catch { /* best effort */ }
+    }
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // ────────────────────────────────────────────────────────────────────────────
 // drainMany / mailboxHasMessages / requeue / migrateMailbox
 // (session_id union drain + dead-sibling consolidation)
@@ -501,5 +564,87 @@ test("migrateMailbox: a re-migrate of an already-drained source delivers exactly
       ["x"],
       "delivered exactly once, no duplicate",
     );
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Crash-consistency: torn appends must not glue records; rewrites are atomic
+// (compile-sim Finding 2 + Codex round-1 NEW findings)
+// ────────────────────────────────────────────────────────────────────────────
+
+// appendFileSync of a buffer is not atomic; a crash mid-write can leave a file
+// ending in a partial line with NO trailing "\n". The next append must not
+// concatenate onto that partial line — doing so glues two JSONL records into one
+// unparseable line and drain() then drops BOTH. Every append path heals this.
+test("mailbox: enqueue after a torn line (no trailing newline) does not glue/eat it", () => {
+  withHome((home) => {
+    const pid = 70001;
+    const dir = join(home, ".oxtail", "mailboxes");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    // A crash-torn append: a partial JSONL record, no trailing newline.
+    writeFileSync(
+      join(dir, `${pid}.jsonl`),
+      '{"schema_version":1,"id":"deadbeefdeadbeef","body":"tor',
+    );
+    mailbox.enqueue(pid, "survivor");
+    const drained = mailbox.drain(pid);
+    // The torn record is unrecoverable, but the new message must survive intact.
+    assert.equal(drained.length, 1, "new message survives; not glued into the torn line");
+    assert.equal(drained[0].body, "survivor");
+  });
+});
+
+test("requeue: re-append onto a torn tail does not glue", () => {
+  withHome((home) => {
+    const pid = 70004;
+    const dir = join(home, ".oxtail", "mailboxes");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(
+      join(dir, `${pid}.jsonl`),
+      '{"schema_version":1,"id":"aaaaaaaaaaaaaaaa","body":"tor',
+    );
+    const msg = mailbox.buildMessage("requeued", "peer-q");
+    mailbox.requeue(pid, msg);
+    const drained = mailbox.drain(pid);
+    assert.equal(drained.length, 1);
+    assert.equal(drained[0].id, msg.id, "id preserved");
+    assert.equal(drained[0].body, "requeued");
+  });
+});
+
+test("migrateMailbox: append onto a torn dest tail does not glue", () => {
+  withHome((home) => {
+    const to = 70002;
+    const from = 70003;
+    const dir = join(home, ".oxtail", "mailboxes");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(
+      join(dir, `${to}.jsonl`),
+      '{"schema_version":1,"id":"bbbbbbbbbbbbbbbb","body":"tor',
+    );
+    mailbox.enqueue(from, "moved");
+    mailbox.migrateMailbox(from, to);
+    const drained = mailbox.drain(to);
+    assert.equal(drained.length, 1, "migrated message survives the torn dest tail");
+    assert.equal(drained[0].body, "moved");
+  });
+});
+
+// drainFirstMatching rewrites the surviving lines; a torn writeFileSync there can
+// lose unrelated messages. The atomic tmp+rename rewrite leaves no temp residue.
+test("drainFirstMatching: atomic rewrite leaves no .tmp residue", () => {
+  withHome((home) => {
+    const pid = 70005;
+    mailbox.enqueue(pid, "first", "peer-a");
+    mailbox.enqueue(pid, "target", "peer-b");
+    mailbox.enqueue(pid, "third", "peer-c");
+    const matched = mailbox.drainMatchingSession(pid, "peer-b");
+    assert.ok(matched);
+    assert.equal(matched!.body, "target");
+    const dir = join(home, ".oxtail", "mailboxes");
+    const leftover = readdirSync(dir).filter((f) => f.includes(".tmp"));
+    assert.deepEqual(leftover, [], "no temp files left behind after atomic rewrite");
+    // Survivors intact and in order.
+    assert.deepEqual(mailbox.drain(pid).map((m) => m.body), ["first", "third"]);
   });
 });

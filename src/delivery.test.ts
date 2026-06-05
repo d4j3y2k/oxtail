@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import * as mailbox from "./mailbox.js";
-import { deliverToPeer } from "./delivery.js";
+import { deliverExistingToPeer, deliverToPeer } from "./delivery.js";
 import { lookupReceived, receivedFilePath, recordReceived } from "./received.js";
 
 function withHome<T>(fn: (home: string) => T): T {
@@ -26,6 +26,44 @@ function withHome<T>(fn: (home: string) => T): T {
 const RECEIVER = "11111111-1111-1111-1111-111111111111";
 const SENDER = "22222222-2222-2222-2222-222222222222";
 const PID = 4242;
+
+// Abort-recovery path: an ALREADY-BUILT reply must be re-delivered without
+// minting a new id, and must (re)write the requester's ledger so the displayed
+// message_id stays resolvable. The old path used mailbox.enqueue, which minted a
+// fresh id and skipped the ledger — breaking reply_to_message on abort.
+test("delivery: deliverExistingToPeer preserves the id AND records the ledger handle", () => {
+  withHome(() => {
+    const original = mailbox.buildMessage("the answer", SENDER, {
+      request_id: "ask-7",
+      reply_to: "ask-7",
+      source_message_id: "q-1",
+    });
+
+    deliverExistingToPeer(RECEIVER, PID, original);
+
+    const drained = mailbox.drain(PID);
+    assert.equal(drained.length, 1, "reply re-delivered to the mailbox");
+    assert.equal(drained[0].id, original.id, "id preserved — NOT re-minted");
+    assert.equal(drained[0].body, "the answer");
+    assert.equal(drained[0].request_id, "ask-7");
+
+    const found = lookupReceived(RECEIVER, original.id);
+    assert.ok(found, "displayed message_id stays resolvable for reply_to_message");
+    assert.equal(found!.id, original.id);
+    assert.equal(found!.source_message_id, "q-1");
+  });
+});
+
+test("delivery: deliverExistingToPeer to an unclaimed receiver still delivers (no ledger)", () => {
+  withHome(() => {
+    const original = mailbox.buildMessage("for unclaimed", SENDER);
+    deliverExistingToPeer(null, PID, original);
+    const drained = mailbox.drain(PID);
+    assert.equal(drained.length, 1);
+    assert.equal(drained[0].id, original.id, "id preserved even without a ledger");
+    assert.equal(lookupReceived(SENDER, original.id), null);
+  });
+});
 
 test("delivery: deliverToPeer makes the line drainable AND the handle resolvable", () => {
   withHome(() => {

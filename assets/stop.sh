@@ -90,16 +90,72 @@ if [ "${#mboxes[@]}" -eq 0 ]; then
   exit 0
 fi
 
-# 5. Lock each non-empty mailbox (best-effort; 30s staleness window).
-locked=()
-for m in "${mboxes[@]}"; do
+# ── Advisory lock: owner-token mkdir lock — mirror of src/locks.ts ────────────
+# Lock is a mkdir dir; owner token lives in the SIDECAR "<lock>.owner" (beside,
+# not inside, so the dir stays empty and a plain rmdir still removes it). Stale
+# removal is gated behind a single-winner mkdir "<lock>.steal" marker plus
+# compare-and-clear; release removes the lock only if we still own it. Keep in
+# sync with src/locks.ts (identical block in assets/pretooluse.sh).
+OXL_STALE=30        # seconds; mirror src/mailbox.ts LOCK_STALE_MS — also the
+                    # marker-staleness window (same SIGSTOP-class threshold)
+oxl_now() { date +%s 2>/dev/null || echo 0; }
+oxl_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
+oxl_token() { # pid.random; tolerate a missing /dev/urandom without degrading to bare pid
+  local r
+  r=$(od -An -N6 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+  [ -n "$r" ] || r="${RANDOM}${RANDOM}${RANDOM}"
+  echo "$$.$r"
+}
+oxl_owner() { cat "$1.owner" 2>/dev/null || true; }
+oxl_clear_stale() { # $1=lock dir; returns 0 if it did clearing work (retry mkdir)
+  local lock="$1" n mt obs smt
+  n=$(oxl_now); mt=$(oxl_mtime "$lock")
+  [ "$mt" -gt 0 ] || return 1
+  [ $((n - mt)) -gt "$OXL_STALE" ] || return 1
+  obs=$(oxl_owner "$lock")
+  if mkdir "$lock.steal" 2>/dev/null; then
+    if [ "x$(oxl_owner "$lock")" = "x$obs" ]; then
+      rm -f "$lock.owner" 2>/dev/null
+      rmdir "$lock" 2>/dev/null || rm -rf "$lock" 2>/dev/null
+    fi
+    rmdir "$lock.steal" 2>/dev/null
+    return 0
+  fi
+  smt=$(oxl_mtime "$lock.steal")
+  if [ "$smt" -gt 0 ] && [ $((n - smt)) -gt "$OXL_STALE" ]; then rmdir "$lock.steal" 2>/dev/null; fi
+  return 1
+}
+oxl_acquire() { # $1=lock dir; prints owner token on success, returns 0/1
+  local lock="$1" t i
+  t=$(oxl_token)
   for i in $(seq 1 50); do
-    if mkdir "$m.lock" 2>/dev/null; then locked+=("$m"); break; fi
-    now=$(date +%s 2>/dev/null || echo 0)
-    mt=$(stat -c %Y "$m.lock" 2>/dev/null || stat -f %m "$m.lock" 2>/dev/null || echo 0)
-    if [ "$mt" -gt 0 ] && [ $((now - mt)) -gt 30 ]; then rmdir "$m.lock" 2>/dev/null; fi
+    if mkdir "$lock" 2>/dev/null; then
+      printf '%s' "$t" > "$lock.owner" 2>/dev/null || true
+      printf '%s' "$t"
+      return 0
+    fi
+    oxl_clear_stale "$lock" && continue
     sleep 0.01
   done
+  return 1
+}
+oxl_release() { # $1=lock dir, $2=our token — remove only if we PROVABLY own it
+  local lock="$1" t="$2" o
+  o=$(oxl_owner "$lock")
+  if [ -z "$t" ] || [ "x$o" = "x$t" ]; then
+    rm -f "$lock.owner" 2>/dev/null
+    rmdir "$lock" 2>/dev/null || true
+  fi
+  # owner differs or absent → not provably ours; leave it (it ages into a stale
+  # lock and is reclaimed by oxl_clear_stale) rather than stomp a successor.
+}
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 5. Lock each non-empty mailbox (best-effort; 30s staleness window).
+locked=()
+locked_tokens=()
+for m in "${mboxes[@]}"; do
+  tok=$(oxl_acquire "$m.lock") && { locked+=("$m"); locked_tokens+=("$tok"); }
 done
 # Couldn't lock anything → leave messages for next time. This still allows the
 # turn to stop, so mark idle; otherwise wake:auto will suppress a wake for a
@@ -215,5 +271,9 @@ else
   mark_idle
 fi
 
-for m in "${locked[@]}"; do rmdir "$m.lock" 2>/dev/null || true; done
+ri=0
+for m in "${locked[@]}"; do
+  oxl_release "$m.lock" "${locked_tokens[$ri]:-}"
+  ri=$((ri + 1))
+done
 exit 0

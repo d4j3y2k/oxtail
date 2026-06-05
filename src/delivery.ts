@@ -36,3 +36,28 @@ export function deliverToPeer(
   mailbox.requeue(targetPid, msg);
   return msg;
 }
+
+// Re-deliver an ALREADY-BUILT message to a peer, preserving its message_id and
+// (re)recording the receiver's ledger handle BEFORE the mailbox line becomes
+// visible — same record-before-append ordering as deliverToPeer. Used by the
+// ask_peer abort-recovery path: the reply was drained into memory but the client
+// aborted before it was returned, so it must be re-enqueued WITHOUT minting a new
+// id. (mailbox.enqueue would mint a fresh id and skip the ledger, so the
+// redelivered reply's displayed id resolves to message-not-found on
+// reply_to_message.) The ledger write is best-effort — a failure must never drop
+// the redelivery; worst case the handle is missing and the peer falls back to
+// send_message.
+export function deliverExistingToPeer(
+  receiverSessionId: string | null | undefined,
+  targetPid: number,
+  msg: mailbox.Mailbox,
+): void {
+  if (receiverSessionId) {
+    try {
+      recordReceived(receiverSessionId, msg);
+    } catch (e) {
+      trace("received_ledger_write_failed", { message_id: msg.id, error: String(e) });
+    }
+  }
+  mailbox.requeue(targetPid, msg);
+}

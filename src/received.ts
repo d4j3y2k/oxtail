@@ -1,13 +1,8 @@
-import { createHash } from "node:crypto";
-import {
-  mkdirSync,
-  readFileSync,
-  rmdirSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { acquireDirLock, releaseDirLock } from "./locks.js";
 import type { Mailbox } from "./mailbox.js";
 import { trace } from "./trace.js";
 
@@ -51,12 +46,10 @@ function lockPath(sessionId: string): string {
   return `${ledgerPath(sessionId)}.lock`;
 }
 
-// Lock idiom mirrors mailbox.ts (mkdir-based, staleness-cleared). The ledger
-// read-modify-write is small (bounded by receivedMax() lines) so the lock
+// Lock idiom mirrors mailbox.ts (owner-token mkdir lock — see locks.ts). The
+// ledger read-modify-write is small (bounded by receivedMax() lines) so the lock
 // window is short.
 const LOCK_STALE_MS = 30_000;
-const LOCK_RETRY_LIMIT = 50;
-const LOCK_RETRY_DELAY_MS = 10;
 
 // Bounded retention: keep at most this many of the most-recent inbound messages
 // per session. Read lazily so tests can tune it per-case. Generous by default so
@@ -68,46 +61,33 @@ export function receivedMax(): number {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 1000;
 }
 
-function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
+// Owner tokens for held ledger locks (see mailbox.ts for the rationale).
+const lockTokens = new Map<string, string>();
 
 function acquireLock(sessionId: string): void {
   mkdirSync(receivedDir(), { recursive: true, mode: 0o700 });
-  const lock = lockPath(sessionId);
-  for (let i = 0; i < LOCK_RETRY_LIMIT; i++) {
-    try {
-      mkdirSync(lock, { mode: 0o700 });
-      return;
-    } catch (e) {
-      const err = e as NodeJS.ErrnoException;
-      if (err.code !== "EEXIST") throw err;
-      try {
-        const st = statSync(lock);
-        if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
-          try {
-            rmdirSync(lock);
-            trace("received_lock_stale_clear", { session_id: sessionId });
-          } catch {
-            // raced with another clearer; fall through to retry
-          }
-          continue;
-        }
-      } catch {
-        // stat may race; just retry
-      }
-      sleepSync(LOCK_RETRY_DELAY_MS);
-    }
-  }
-  throw new Error(`could not acquire received-ledger lock for ${sessionId}`);
+  lockTokens.set(
+    sessionId,
+    acquireDirLock(lockPath(sessionId), LOCK_STALE_MS, "received_lock_stale_clear", {
+      session_id: sessionId,
+    }),
+  );
 }
 
 function releaseLock(sessionId: string): void {
-  try {
-    rmdirSync(lockPath(sessionId));
-  } catch {
-    // ignore ENOENT / not-empty / EPERM
-  }
+  const token = lockTokens.get(sessionId);
+  lockTokens.delete(sessionId);
+  releaseDirLock(lockPath(sessionId), token ?? "");
+}
+
+// Atomically replace the ledger: write a unique temp file, then renameSync over
+// the target. rename(2) is atomic on POSIX, so a crash/torn write can't leave a
+// half-rewritten ledger that loses older reply handles — unlike a direct
+// writeFileSync, which issues multiple write() syscalls.
+function atomicWrite(path: string, data: string): void {
+  const tmp = `${path}.tmp.${process.pid}.${randomBytes(6).toString("hex")}`;
+  writeFileSync(tmp, data, { mode: 0o600 });
+  renameSync(tmp, path);
 }
 
 function readLines(sessionId: string): string[] {
@@ -142,9 +122,7 @@ export function recordReceived(receiverSessionId: string, msg: Mailbox): void {
         kept: max,
       });
     }
-    writeFileSync(ledgerPath(receiverSessionId), pruned.join("\n") + "\n", {
-      mode: 0o600,
-    });
+    atomicWrite(ledgerPath(receiverSessionId), pruned.join("\n") + "\n");
   } finally {
     releaseLock(receiverSessionId);
   }

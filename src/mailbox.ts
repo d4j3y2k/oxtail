@@ -1,15 +1,19 @@
 import { randomBytes } from "node:crypto";
 import {
   appendFileSync,
+  closeSync,
   mkdirSync,
+  openSync,
   readFileSync,
-  rmdirSync,
+  readSync,
+  renameSync,
   statSync,
   truncateSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { acquireDirLock, releaseDirLock } from "./locks.js";
 import { trace } from "./trace.js";
 
 export type Mailbox = {
@@ -46,8 +50,6 @@ function mailboxesDir(): string {
 //
 // Sync this value with assets/pretooluse.sh (find -mmin +0.5 ≈ 30s).
 const LOCK_STALE_MS = 30_000;
-const LOCK_RETRY_LIMIT = 50;
-const LOCK_RETRY_DELAY_MS = 10;
 
 function mailboxPath(pid: number): string {
   return join(mailboxesDir(), `${pid}.jsonl`);
@@ -57,47 +59,23 @@ function lockPath(pid: number): string {
   return `${mailboxPath(pid)}.lock`;
 }
 
-function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
+// Owner tokens for held locks, so releaseLock can prove ownership (a lock stolen
+// out from under a stalled holder is not removed on its late release). Keyed by
+// pid; never two concurrent acquisitions of the same pid within one process.
+const lockTokens = new Map<number, string>();
 
 export function acquireLock(pid: number): void {
   mkdirSync(mailboxesDir(), { recursive: true, mode: 0o700 });
-  const lock = lockPath(pid);
-  for (let i = 0; i < LOCK_RETRY_LIMIT; i++) {
-    try {
-      mkdirSync(lock, { mode: 0o700 });
-      return;
-    } catch (e) {
-      const err = e as NodeJS.ErrnoException;
-      if (err.code !== "EEXIST") throw err;
-      // Check staleness. If older than LOCK_STALE_MS, force-clear and retry.
-      try {
-        const st = statSync(lock);
-        if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
-          try {
-            rmdirSync(lock);
-            trace("mailbox_lock_stale_clear", { pid });
-          } catch {
-            // raced with another clearer; fall through to retry
-          }
-          continue;
-        }
-      } catch {
-        // stat may race; just retry
-      }
-      sleepSync(LOCK_RETRY_DELAY_MS);
-    }
-  }
-  throw new Error(`could not acquire mailbox lock for pid ${pid}`);
+  lockTokens.set(
+    pid,
+    acquireDirLock(lockPath(pid), LOCK_STALE_MS, "mailbox_lock_stale_clear", { pid }),
+  );
 }
 
 export function releaseLock(pid: number): void {
-  try {
-    rmdirSync(lockPath(pid));
-  } catch {
-    // ignore ENOENT / not-empty / EPERM
-  }
+  const token = lockTokens.get(pid);
+  lockTokens.delete(pid);
+  releaseDirLock(lockPath(pid), token ?? "");
 }
 
 // Critical: the serialized JSONL line must always begin
@@ -137,6 +115,45 @@ export function serializeMailboxLine(msg: Mailbox): string {
   return line;
 }
 
+// Append JSONL bytes to a mailbox, healing a missing record boundary first.
+// appendFileSync of a buffer is NOT a single atomic syscall, so a crash/torn
+// write can leave a file ending in a partial line with no trailing "\n". A later
+// append would then concatenate onto that partial line, gluing two records into
+// one line that fails JSON.parse in BOTH drain() and the awk hook — silently
+// dropping both messages. If the file is non-empty and its last byte isn't "\n",
+// prepend one so the boundary is restored (the already-torn record is still lost,
+// but it can no longer eat its neighbor). Every append path routes through here.
+function appendLines(path: string, buf: string): void {
+  let heal = false;
+  let fd: number | undefined;
+  try {
+    const st = statSync(path);
+    if (st.size > 0) {
+      fd = openSync(path, "r");
+      const last = Buffer.alloc(1);
+      readSync(fd, last, 0, 1, st.size - 1);
+      heal = last[0] !== 0x0a; // 0x0a === "\n"
+    }
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException;
+    if (err.code !== "ENOENT") throw err;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  appendFileSync(path, heal ? "\n" + buf : buf);
+}
+
+// Atomically replace a file's contents: write to a unique temp file in the same
+// directory, then renameSync over the target. rename(2) is atomic on POSIX, so a
+// concurrent reader/crasher never observes a torn file — unlike writeFileSync,
+// which issues multiple write() syscalls and can leave a half-written line on
+// crash, dropping unrelated surviving records.
+function atomicWrite(path: string, data: string): void {
+  const tmp = `${path}.tmp.${process.pid}.${randomBytes(6).toString("hex")}`;
+  writeFileSync(tmp, data, { mode: 0o600 });
+  renameSync(tmp, path);
+}
+
 // Mint a message envelope WITHOUT writing it anywhere. Split out from enqueue so
 // a higher layer (delivery.ts) can record the durable received-ledger entry
 // BEFORE the mailbox line becomes visible — the ordering that guarantees any
@@ -169,7 +186,7 @@ export function enqueue(
   const msg = buildMessage(body, from_session_id, options);
   acquireLock(target_pid);
   try {
-    appendFileSync(mailboxPath(target_pid), serializeMailboxLine(msg));
+    appendLines(mailboxPath(target_pid), serializeMailboxLine(msg));
   } finally {
     releaseLock(target_pid);
   }
@@ -184,7 +201,7 @@ export function requeue(target_pid: number, msg: Mailbox): void {
   const line = serializeMailboxLine(msg);
   acquireLock(target_pid);
   try {
-    appendFileSync(mailboxPath(target_pid), line);
+    appendLines(mailboxPath(target_pid), line);
   } finally {
     releaseLock(target_pid);
   }
@@ -199,7 +216,7 @@ export function requeueMany(target_pid: number, msgs: Mailbox[]): void {
   for (const m of msgs) buf += serializeMailboxLine(m);
   acquireLock(target_pid);
   try {
-    appendFileSync(mailboxPath(target_pid), buf);
+    appendLines(mailboxPath(target_pid), buf);
   } finally {
     releaseLock(target_pid);
   }
@@ -282,7 +299,7 @@ export function migrateMailbox(fromPid: number, toPid: number): number {
 
     acquireLock(toPid);
     try {
-      appendFileSync(mailboxPath(toPid), block);
+      appendLines(mailboxPath(toPid), block);
     } finally {
       releaseLock(toPid);
     }
@@ -416,7 +433,7 @@ function drainFirstMatching(
         if (err.code !== "ENOENT") throw err;
       }
     } else {
-      writeFileSync(mailboxPath(my_pid), surviving.join("\n") + "\n");
+      atomicWrite(mailboxPath(my_pid), surviving.join("\n") + "\n");
     }
     return matchedMsg;
   } finally {

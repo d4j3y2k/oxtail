@@ -32,7 +32,7 @@ import {
 } from "./registry.js";
 import * as mailbox from "./mailbox.js";
 import * as received from "./received.js";
-import { deliverToPeer } from "./delivery.js";
+import { deliverExistingToPeer, deliverToPeer } from "./delivery.js";
 import { recoverClaim, resolveAncestors, writeClaim } from "./claims.js";
 import { decideReplyAutoWake, defaultAutowakeDir } from "./autowake.js";
 import { markWoke, newWakeDebounceStore, recentlyWoke } from "./wake-debounce.js";
@@ -2065,11 +2065,11 @@ server.registerTool(
     // Re-enqueue so it's not lost.
     if (aborted && reply) {
       try {
-        mailbox.enqueue(entry.server_pid, reply.body, reply.from_session_id, {
-          request_id: reply.request_id,
-          reply_to: reply.reply_to,
-          source_message_id: reply.source_message_id,
-        });
+        // Re-deliver the EXISTING reply: preserve reply.id and (re)write the
+        // requester's received-ledger entry so reply_to_message against the
+        // displayed id still resolves. mailbox.enqueue would mint a NEW id and
+        // skip the ledger, breaking the reply handle on the abort path.
+        deliverExistingToPeer(entry.client.session_id, entry.server_pid, reply);
         trace("ask_peer_abort_reenqueue", { message_id: reply.id });
       } catch (e) {
         trace("ask_peer_abort_reenqueue_failed", {
