@@ -473,6 +473,33 @@ test("drainMany: duplicate pids are drained once", () => {
   });
 });
 
+// A migrate crash-window (dest append done, source not yet truncated) can leave
+// the SAME message_id in two sibling mailboxes. drainMany delivers it once but
+// drains both copies so none lingers.
+test("drainMany: dedups the same message_id across unioned mailboxes", () => {
+  withHome(() => {
+    const msg = mailbox.buildMessage("dup-body", "peer-s", { request_id: "r-dup" });
+    mailbox.requeue(501, msg);
+    mailbox.requeue(502, msg); // same id in two siblings (migrate crash dup)
+    const { messages, skipped } = mailbox.drainMany([501, 502]);
+    assert.equal(skipped, 0);
+    assert.equal(messages.length, 1, "duplicate message_id delivered once");
+    assert.equal(messages[0].id, msg.id);
+    assert.equal(messages[0].body, "dup-body");
+    assert.equal(mailbox.mailboxHasMessages(501), false, "no lingering copy");
+    assert.equal(mailbox.mailboxHasMessages(502), false, "no lingering copy");
+  });
+});
+
+test("drainMany: two DISTINCT messages are both kept (dedup collapses only true dups)", () => {
+  withHome(() => {
+    mailbox.enqueue(503, "a");
+    mailbox.enqueue(504, "b");
+    const { messages } = mailbox.drainMany([503, 504]);
+    assert.deepEqual(messages.map((m) => m.body).sort(), ["a", "b"]);
+  });
+});
+
 test("drainMany: a contended mailbox lock is skipped, not fatal", () => {
   withHome(() => {
     mailbox.enqueue(204, "readable");
