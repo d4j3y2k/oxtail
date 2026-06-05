@@ -42,6 +42,18 @@ if [ ! -t 0 ]; then
 fi
 [ -z "$sid" ] && exit 0
 
+# Re-stamp "busy" on EVERY tool call (before any early-exit below) so a long,
+# ACTIVE turn keeps a fresh marker and never reads as stale-busy (>TTL) to a
+# peer's wake:auto. UserPromptSubmit sets "busy" once at turn start; without this
+# a turn outrunning the TTL would invite a spurious keystroke wake into a working
+# agent. The Stop hook flips this back to "idle" on a real stop. Keyed by
+# session_id; sanitization MUST match the server's activitySessionKey().
+safe_sid=$(printf '%s' "$sid" | tr -c 'A-Za-z0-9_-' '_')
+[ -n "$safe_sid" ] && {
+  mkdir -p "$HOME/.oxtail/activity" 2>/dev/null || true
+  printf 'busy' > "$HOME/.oxtail/activity/$safe_sid" 2>/dev/null || true
+}
+
 sessions_dir="$HOME/.oxtail/sessions"
 mailboxes_dir="$HOME/.oxtail/mailboxes"
 [ -d "$sessions_dir" ] || exit 0

@@ -395,6 +395,84 @@ export function drainMatchingReply(
   );
 }
 
+// Union variant of drainMatchingReply across a session's sibling/previous MCP
+// child pids. ask_peer waits on the requester's OWN pid, but the reply is
+// addressed by client.session_id and resolveTarget(readAll) enqueues it to the
+// session's freshest sibling — which, in a dual-scope / pid-rotation setup, may
+// NOT be the pid blocked in ask_peer. A single-pid drain would then miss a reply
+// that already landed in a sibling mailbox and strand it. Mirrors the session
+// union read_my_messages / the PreToolUse hook already use.
+//
+// Returns the FIRST matching reply across the (deduped) pids. It does NOT pull
+// every match: two DISTINCT replies to the same request_id (an answer + a
+// follow-up correction) must not both be drained with one silently dropped — the
+// second stays for read_my_messages. But once the first match is found, it DOES
+// sweep an exact same-message_id duplicate out of the remaining pids: a
+// migrate-crash can leave the SAME message in two siblings, and if we returned
+// one copy and left the other, a later union drain would see only the lone
+// survivor and re-deliver it as a "new" message. Sweeping by message_id removes
+// the duplicate while leaving any distinct reply intact.
+//
+// `skipped` reports pids that could not be inspected (lock contention after the
+// internal acquire-retry budget). The poll tolerates this (it retries next tick);
+// the authoritative final drain in ask_peer retries the skipped pids so a
+// transiently-locked sibling holding the reply isn't mistaken for "no reply".
+export function drainMatchingReplyManyChecked(
+  pids: number[],
+  from_session_id: string,
+  reply_to: string,
+): { reply: Mailbox | null; skipped: number[] } {
+  const seen = new Set<number>();
+  const skipped: number[] = [];
+  let found: Mailbox | null = null;
+  for (const pid of pids) {
+    if (seen.has(pid)) continue;
+    seen.add(pid);
+    try {
+      if (!found) {
+        const m = drainMatchingReply(pid, from_session_id, reply_to);
+        if (m) found = m;
+      } else {
+        // Sweep an exact-message_id duplicate (migrate-crash) from this sibling;
+        // a distinct reply (different id) is left untouched.
+        const dupId = found.id;
+        drainFirstMatching(pid, (msg) => msg.id === dupId);
+      }
+    } catch {
+      skipped.push(pid);
+    }
+  }
+  return { reply: found, skipped };
+}
+
+export function drainMatchingReplyMany(
+  pids: number[],
+  from_session_id: string,
+  reply_to: string,
+): Mailbox | null {
+  return drainMatchingReplyManyChecked(pids, from_session_id, reply_to).reply;
+}
+
+// Best-effort removal of an EXACT message_id from each of `pids`. Used to clean
+// up a migrate-crash duplicate that was left in a pid the union drain couldn't
+// inspect (lock contention) at the time the reply was pulled from another pid —
+// otherwise a later read_my_messages would re-deliver the lone survivor as a
+// "new" message. Matches by message_id only, so a DISTINCT reply (different id)
+// in the same pid is never touched. Per-pid errors are skipped.
+export function sweepMessageId(pids: number[], messageId: string): void {
+  const seen = new Set<number>();
+  for (const pid of pids) {
+    if (seen.has(pid)) continue;
+    seen.add(pid);
+    try {
+      drainFirstMatching(pid, (msg) => msg.id === messageId);
+    } catch {
+      // best effort — a still-locked pid is left; the dup is a rare crash-window
+      // artifact and the cost is at most one re-delivered (same-id) message.
+    }
+  }
+}
+
 function drainFirstMatching(
   my_pid: number,
   matches: (msg: Mailbox) => boolean,

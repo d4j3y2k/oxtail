@@ -9,6 +9,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { readAll, register, type RegistryEntry } from "./registry.js";
 import { drain, enqueue } from "./mailbox.js";
 import { recordReceived } from "./received.js";
+import { recordPendingAsk } from "./pending-ask.js";
 
 const SERVER_ENTRY = resolve(import.meta.dirname, "server.ts");
 const TSX_BIN = resolve(import.meta.dirname, "..", "node_modules", ".bin", "tsx");
@@ -1268,6 +1269,26 @@ function seedActivity(home: string, sessionId: string, status: "idle" | "busy"):
   writeFileSync(join(dir, key), status);
 }
 
+// Simulate a prior ask_peer (by `requesterSessionId`) that timed out and left a
+// durable pending-ask. HOME-swapped so it lands in the spawned server's store.
+function seedPendingAsk(home: string, requesterSessionId: string, requestId: string): void {
+  const prev = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    recordPendingAsk(join(home, ".oxtail", "pending-ask"), requesterSessionId, requestId, Date.now());
+  } finally {
+    process.env.HOME = prev;
+  }
+}
+
+function pendingAskFiles(home: string): string[] {
+  try {
+    return readdirSync(join(home, ".oxtail", "pending-ask")).filter((n) => n[0] === "p");
+  } catch {
+    return [];
+  }
+}
+
 // The seeded peer has no tmux pane/session, so when the reply-default GATE
 // passes the subsequent send-keys has nowhere to fire and surfaces
 // "skipped_no_target". That is the integration-visible proof the gate let the
@@ -1672,6 +1693,184 @@ test("ask_peer: no reply within timeout — returns timed_out: true, no error", 
     assert.equal(ok.reply, null);
     assert.ok(elapsed >= 1400, `should wait ~1.5s, took ${elapsed}ms`);
     assert.ok(elapsed < 4000, `should not over-wait, took ${elapsed}ms`);
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("ask_peer: timeout records a durable pending-ask for a correlated peer + claimed requester", async () => {
+  const server = await spawnServer({ extraEnv: { OXTAIL_ASK_PEER_TIMEOUT_MS: "1200" } });
+  try {
+    const peerSid = "aaaaffff-1111-2222-3333-444444444444";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: peerSid,
+      tmux_session: "ask-timeout-pending",
+      cwd: server.home,
+      replyToCapable: true,
+    });
+    await callTool(server.client, "claim_session", {
+      session_id: "cccc1111-2222-3333-4444-555555555555",
+    });
+
+    const result = await callTool<AskPeerOk | AskPeerErr>(server.client, "ask_peer", {
+      target: "ask-timeout-pending",
+      body: "a task that will take a while",
+    });
+    const ok = result as AskPeerOk;
+    assert.equal(ok.timed_out, true, "no reply within the window");
+    // The durable pending obligation is recorded so a late reply can wake us.
+    assert.equal(pendingAskFiles(server.home).length, 1, "one pending-ask record written");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+// NOTE: the ask_peer reply UNION-drain across sibling pids (drainMatchingReplyMany)
+// is proven deterministically in mailbox.test.ts. Simulating it at the ask_peer
+// integration level needs a SECOND LIVE MCP child sharing the requester's
+// session_id — a fake dead-pid sibling is reaped/migrated by readAll's reap path
+// before a late reply lands — which the single-process test harness can't spawn.
+
+test("late reply: consumes the pending-ask and wakes even a MARKERLESS (Codex-like) idle requester", async () => {
+  const server = await spawnServer();
+  try {
+    const reqSid = "dddd1111-2222-3333-4444-555555555555";
+    // The requester whose ask timed out — markerless (no activity file), the
+    // exact case the strict fresh-idle reply-default skips as skipped_no_fresh_idle.
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: reqSid,
+      tmux_session: "late-reply-requester",
+      cwd: server.home,
+      type: "codex",
+    });
+    seedPendingAsk(server.home, reqSid, "req-late");
+    await callTool(server.client, "claim_session", {
+      session_id: "eeee1111-2222-3333-4444-555555555555",
+    });
+
+    const sent = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: "late-reply-requester",
+      body: "done — here is the result",
+      reply_to: "req-late",
+    });
+    const ok = sent as SendOk;
+    assert.equal(ok.wake_reason, "late_reply_to_pending", "took the durable pending path");
+    // Lenient gate fired for the markerless requester (no tmux in tests).
+    assert.equal(ok.wake_status, "skipped_no_target");
+    assert.equal(pendingAskFiles(server.home).length, 0, "pending-ask consumed");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("late reply: wake:\"off\" consumes the pending-ask but does NOT wake (suppressed)", async () => {
+  const server = await spawnServer();
+  try {
+    const reqSid = "dddd2222-2222-3333-4444-555555555555";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: reqSid,
+      tmux_session: "late-reply-off",
+      cwd: server.home,
+      type: "codex",
+    });
+    seedPendingAsk(server.home, reqSid, "req-off");
+    await callTool(server.client, "claim_session", {
+      session_id: "eeee2222-2222-3333-4444-555555555555",
+    });
+
+    const sent = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: "late-reply-off",
+      body: "fyi, done",
+      reply_to: "req-off",
+      wake: "off",
+    });
+    const ok = sent as SendOk;
+    assert.equal(ok.wake_reason, "late_reply_to_pending_suppressed");
+    assert.equal(ok.wake_status, undefined, "no wake under explicit off");
+    assert.equal(pendingAskFiles(server.home).length, 0, "still consumed — obligation satisfied");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("late reply: OXTAIL_AUTOWAKE=off disables the automatic late wake but explicit wake:\"auto\" still fires", async () => {
+  const server = await spawnServer({ extraEnv: { OXTAIL_AUTOWAKE: "off" } });
+  try {
+    const reqSid = "dddd3333-2222-3333-4444-555555555555";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: reqSid,
+      tmux_session: "late-reply-killswitch",
+      cwd: server.home,
+      type: "codex",
+    });
+    await callTool(server.client, "claim_session", {
+      session_id: "eeee3333-2222-3333-4444-555555555555",
+    });
+
+    // Default (wake unset): kill-switch disables the automatic late wake.
+    seedPendingAsk(server.home, reqSid, "req-ks");
+    const auto = (await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: "late-reply-killswitch",
+      body: "done (default)",
+      reply_to: "req-ks",
+    })) as SendOk;
+    assert.equal(auto.wake_reason, "late_reply_to_pending");
+    assert.equal(auto.wake_status, "disabled", "kill-switch disables the automatic late wake");
+    assert.equal(pendingAskFiles(server.home).length, 0, "still consumed");
+
+    // Explicit wake:"auto" intentionally bypasses the kill-switch.
+    seedPendingAsk(server.home, reqSid, "req-ks-explicit");
+    const explicit = (await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: "late-reply-killswitch",
+      body: "done (explicit auto)",
+      reply_to: "req-ks-explicit",
+      wake: "auto",
+    })) as SendOk;
+    assert.equal(explicit.wake_reason, "late_reply_to_pending");
+    assert.equal(explicit.wake_status, "skipped_no_target", "explicit auto still fires");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("late reply: stamps the autowake dedupe so a re-delivered duplicate can't strict-wake again", async () => {
+  const server = await spawnServer();
+  try {
+    const reqSid = "dddd4444-2222-3333-4444-555555555555";
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: reqSid,
+      tmux_session: "late-reply-dedupe",
+      cwd: server.home,
+      replyToCapable: true,
+    });
+    // Fresh-idle so the strict reply-default WOULD fire on the duplicate if not deduped.
+    seedActivity(server.home, reqSid, "idle");
+    seedPendingAsk(server.home, reqSid, "req-dup");
+    await callTool(server.client, "claim_session", {
+      session_id: "eeee4444-2222-3333-4444-555555555555",
+    });
+
+    const first = (await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: "late-reply-dedupe",
+      body: "the answer",
+      reply_to: "req-dup",
+    })) as SendOk;
+    assert.equal(first.wake_reason, "late_reply_to_pending", "pending path consumed + stamped dedupe");
+
+    // A re-delivered copy of the SAME reply: pending gone → strict reply-default
+    // path, but the dedupe stamp makes it skip rather than wake again.
+    const second = (await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: "late-reply-dedupe",
+      body: "the answer (re-delivered)",
+      reply_to: "req-dup",
+    })) as SendOk;
+    assert.equal(second.wake_reason, "reply_to_default", "no pending record left → strict path");
+    assert.equal(second.wake_status, "skipped_deduped", "dedupe stamp prevents a second wake");
   } finally {
     await server.cleanup();
   }

@@ -34,7 +34,18 @@ import * as mailbox from "./mailbox.js";
 import * as received from "./received.js";
 import { deliverExistingToPeer, deliverToPeer } from "./delivery.js";
 import { recoverClaim, resolveAncestors, writeClaim } from "./claims.js";
-import { decideReplyAutoWake, defaultAutowakeDir } from "./autowake.js";
+import {
+  autowakeKillSwitchOff,
+  claimWake,
+  decideReplyAutoWake,
+  defaultAutowakeDir,
+} from "./autowake.js";
+import {
+  consumePendingAsk,
+  defaultPendingAskDir,
+  gcPendingAsk,
+  recordPendingAsk,
+} from "./pending-ask.js";
 import { markWoke, newWakeDebounceStore, recentlyWoke } from "./wake-debounce.js";
 
 // CLI subcommand dispatch must run before any MCP setup so that
@@ -1264,7 +1275,7 @@ server.registerTool(
   {
     description: [
       "Fire-and-forget message to a peer in the same project root. Target: a tmux session name OR a client_session_id (UUID). Async via the peer's mailbox — delivered mid-turn (PreToolUse hook) or next-turn (read_my_messages); cross-project targets are rejected.",
-      "A plain message does NOT wake an idle peer. Pass wake:\"auto\" to nudge one via per-client send-keys, state-gated (skipped if the peer is mid-turn). EXCEPTION (wake-on-reply): when you set reply_to, this auto-wakes the requester by default so your answer doesn't strand them idle — pass wake:\"off\" to suppress. The reply-default wake is strictly gated: it fires only for a FRESHLY-IDLE requester (one whose Claude Code hooks maintain a fresh idle marker), with a per-target rate limit and a one-wake dedupe; env kill-switch OXTAIL_AUTOWAKE=off. A requester with no idle marker (Codex, or Claude without the hooks) returns skipped_no_fresh_idle and is NOT auto-woken — use explicit wake:\"auto\" for those. Response carries wake_status (\"fired\" | \"skipped_busy\" | \"skipped_debounced\" | \"skipped_no_fresh_idle\" | \"skipped_rate_limited\" | \"skipped_deduped\" | \"skipped_store_error\" | \"skipped_no_target\" | \"disabled\") and, on the reply path, wake_reason:\"reply_to_default\".",
+      "A plain message does NOT wake an idle peer. Pass wake:\"auto\" to nudge one via per-client send-keys, state-gated (skipped if the peer is mid-turn). EXCEPTION (wake-on-reply): when you set reply_to, this auto-wakes the requester by default so your answer doesn't strand them idle — pass wake:\"off\" to suppress. The reply-default wake is strictly gated: it fires only for a FRESHLY-IDLE requester (one whose Claude Code hooks maintain a fresh idle marker), with a per-target rate limit and a one-wake dedupe; env kill-switch OXTAIL_AUTOWAKE=off. A requester with no idle marker (Codex, or Claude without the hooks) returns skipped_no_fresh_idle and is NOT auto-woken — use explicit wake:\"auto\" for those. Response carries wake_status (\"fired\" | \"skipped_busy\" | \"skipped_debounced\" | \"skipped_no_fresh_idle\" | \"skipped_rate_limited\" | \"skipped_deduped\" | \"skipped_store_error\" | \"skipped_no_target\" | \"disabled\") and, on the reply path, wake_reason:\"reply_to_default\" — or wake_reason:\"late_reply_to_pending\" when this reply answers an ask_peer that had timed out (durably pulls the requester back regardless of the fresh-idle window; \"late_reply_to_pending_suppressed\" if you passed wake:\"off\").",
       "Body is verbatim — wrap in <system-reminder>...</system-reminder> yourself if you want that framing. When replying to ask_peer, include reply_to: request_id from the inbound message. For a blocking send-and-wait, use ask_peer instead.",
     ].join(" "),
     inputSchema: {
@@ -1346,7 +1357,7 @@ server.registerTool(
   {
     description: [
       "Reply to a specific inbound peer message by its message_id — the atomic, correlation-safe alternative to hand-wiring send_message's target + reply_to. The server looks the message up in this session's durable received-ledger, so you pass only the message_id the PreToolUse hook or read_my_messages already showed you; it derives the reply target (the original sender), carries reply_to=request_id when the inbound was an ask_peer (keeping the exchange correlated), and sets source_message_id for provenance. Replying to a plain send_message works too — it just omits reply_to. Ownership is structural: you can only reply to a message delivered to you.",
-      "Delivery + wake match send_message exactly, including the wake-on-reply default: when the inbound carried a request_id and you leave wake unset, a freshly-idle requester is auto-woken; pass wake:\"auto\" to nudge any idle peer, or wake:\"off\" to suppress. Fail-closed: an unknown or aged-out message_id returns error message-not-found instead of guessing a target.",
+      "Delivery + wake match send_message exactly, including the wake-on-reply default: when the inbound carried a request_id and you leave wake unset, a freshly-idle requester is auto-woken; pass wake:\"auto\" to nudge any idle peer, or wake:\"off\" to suppress. If the inbound ask_peer had since timed out, this reply durably pulls the requester back (wake_reason late_reply_to_pending) regardless of the fresh-idle window. Fail-closed: an unknown or aged-out message_id returns error message-not-found instead of guessing a target.",
     ].join(" "),
     inputSchema: {
       message_id: z
@@ -1538,14 +1549,17 @@ server.registerTool(
 // elapses. Reply-to-capable peers must reply with reply_to=request_id; legacy
 // peers fall back to the original from_session_id-only matching.
 //
-// User-tunable override via OXTAIL_ASK_PEER_TIMEOUT_MS; defaults to 45000ms
-// (conservative under typical MCP-client tool-call abort windows). Set to a
-// lower value if your client aborts before our timeout fires.
+// User-tunable override via OXTAIL_ASK_PEER_TIMEOUT_MS; defaults to 60000ms.
+// 60s covers a slower multi-tool-call peer reply (a Codex peer composing
+// set_my_state + reply_to_message + a report was observed at ~46s and falsely
+// timed out under the old 45s default) while staying under both known callers'
+// tool-call abort windows: Claude Code is clean to ~60s, Codex aborts ~120s.
+// Set to a lower value if your client aborts before our timeout fires.
 const ASK_PEER_TIMEOUT_MS = (() => {
   const env = process.env.OXTAIL_ASK_PEER_TIMEOUT_MS;
-  if (!env) return 45_000;
+  if (!env) return 60_000;
   const n = Number(env);
-  return Number.isFinite(n) && n > 0 ? n : 45_000;
+  return Number.isFinite(n) && n > 0 ? n : 60_000;
 })();
 const ASK_PEER_GRACE_MS = 500;
 const ASK_PEER_POLL_MS = 200;
@@ -1779,7 +1793,18 @@ async function wakePeer(peer: RegistryEntry): Promise<WakeStatus> {
 // Keyed by session_id (the agent identity), NOT server_pid: a dual-scope agent
 // has several MCP children sharing one session_id, and the hooks/sender must
 // agree on the key (see AGENTS.md). Must match the sanitization in the hooks.
-const ACTIVITY_BUSY_TTL_MS = 10 * 60 * 1000;
+// How long a "busy" marker is trusted before a peer treats the turn as stale and
+// wakes anyway. The PreToolUse hook now re-stamps "busy" on every tool call, so
+// a long ACTIVE turn stays fresh; this TTL only governs a turn that stops making
+// tool calls (one giant single tool call, or a crash without a clean Stop) — the
+// latter is exactly the stale-busy→wake recovery we want. Configurable for
+// deployments with very long single-tool-call turns.
+const ACTIVITY_BUSY_TTL_MS = (() => {
+  const env = process.env.OXTAIL_ACTIVITY_BUSY_TTL_MS;
+  if (!env) return 10 * 60 * 1000;
+  const n = Number(env);
+  return Number.isFinite(n) && n > 0 ? n : 10 * 60 * 1000;
+})();
 
 function activitySessionKey(sessionId: string): string {
   return sessionId.replace(/[^A-Za-z0-9_-]/g, "_");
@@ -1857,15 +1882,67 @@ async function autoWakeOnReply(peer: RegistryEntry, replyTo: string): Promise<Wa
   return wakePeer(peer);
 }
 
-// Resolve the wake for a send_message. The strict reply-default path engages
-// only for a reply with wake UNSET; an explicit wake:"auto" always means the
-// lenient wakeForSend path (even for a reply — the Codex/hookless escape hatch),
-// and wake:"off" means no wake. Returns the status + reason to surface.
+// Stamp the autowake dedupe record for (sessionId, replyTo) when the durable
+// pending-ask path fires, so a re-delivered / duplicate copy of the SAME reply
+// can't separately strict-wake the requester via the fresh-idle reply-default
+// (the in-memory wakePeer debounce is per-process and not reply_to-keyed, so it
+// doesn't cover a restart or a >1s gap). Best-effort; we're stamping, not gating.
+//
+// Like the existing reply-default path (decideReplyAutoWake → claimWake), this is
+// stamped on the wake ATTEMPT — before wakeForSend's keystroke outcome is known —
+// and claimWake also stamps the per-target RATE record. Intentional and
+// consistent with that path: one wake pulls the requester in to drain its whole
+// mailbox, so a second reply within the rate window doesn't need its own wake.
+// (It is NOT stamped on the wake:"off" / kill-switch-disabled paths, where no
+// wake is intended — see resolveSendWake.)
+function stampReplyWakeDedupe(sessionId: string | null, replyTo: string): void {
+  if (!sessionId) return;
+  try {
+    claimWake(defaultAutowakeDir(), sessionId, replyTo, Date.now());
+  } catch {
+    // best effort — a failure only means a duplicate could still strict-wake,
+    // which is harmless (debounced, and the requester drains an empty mailbox).
+  }
+}
+
+// Resolve the wake for a send_message / reply_to_message. Order matters:
+//   1. DURABLE pending-ask: if this reply satisfies an ask_peer that timed out
+//      and recorded a pending obligation, consume it (regardless of wake mode —
+//      a late reply satisfies the obligation even under wake:"off", and leaving
+//      the record would let a later duplicate wake and violate the explicit off)
+//      and fire the LENIENT wakeForSend so even a long-idle / markerless-Codex
+//      requester is pulled back. The automatic (wake unset) variant honors the
+//      OXTAIL_AUTOWAKE kill-switch; an explicit wake:"auto" intentionally does
+//      not (it's the caller's explicit ask, matching existing semantics).
+//   2. STRICT reply-default: a reply with wake UNSET and no pending record →
+//      fresh-idle-only auto-wake (autowake.ts), wake_reason "reply_to_default".
+//   3. Explicit wake:"auto" → lenient wakeForSend. wake:"off" → no wake.
 async function resolveSendWake(
   peer: RegistryEntry,
   wake: "off" | "auto" | undefined,
   replyTo: string | undefined,
 ): Promise<{ wake_status?: WakeStatus; wake_reason?: string }> {
+  if (replyTo) {
+    const sid = peer.client.session_id ?? "";
+    if (consumePendingAsk(defaultPendingAskDir(), sid, replyTo, Date.now())) {
+      // wake:"off" and the kill-switch path do NOT wake — so they must NOT stamp
+      // the wake-dedupe: stamping there would later suppress the strict wake for a
+      // genuine, distinct second reply to the same request_id (no wake happened,
+      // so there is nothing to dedupe against). Only stamp on the path that fires.
+      if (wake === "off") {
+        trace("late_reply_pending_suppressed", { target_session_id: sid });
+        return { wake_reason: "late_reply_to_pending_suppressed" };
+      }
+      if (wake === undefined && autowakeKillSwitchOff()) {
+        return { wake_status: "disabled", wake_reason: "late_reply_to_pending" };
+      }
+      // About to actually wake → stamp so a re-delivered copy of THIS reply can't
+      // strict-wake again via the fresh-idle fallback.
+      stampReplyWakeDedupe(peer.client.session_id, replyTo);
+      trace("late_reply_pending_wake", { target_session_id: sid });
+      return { wake_status: await wakeForSend(peer), wake_reason: "late_reply_to_pending" };
+    }
+  }
   if (replyAutoWakeTriggered(wake, replyTo)) {
     return { wake_status: await autoWakeOnReply(peer, replyTo!), wake_reason: "reply_to_default" };
   }
@@ -1880,29 +1957,43 @@ async function resolveSendWake(
 // mailbox lock when there's a probable hit. The lock is held only inside
 // drainMatchingSession (sub-10ms) — never across the poll interval, so the
 // PreToolUse hook on subsequent caller tool calls is never starved.
+// The requester's mailbox pid union: own pid first (fast-path locality), then
+// any sibling/previous MCP child sharing the session_id. Recomputed at the final
+// drain so a sibling that appeared DURING the wait is still covered.
+function requesterPids(ownPid: number, sessionId: string | undefined): number[] {
+  return sessionId
+    ? [ownPid, ...sessionPidsForId(sessionId).filter((p) => p !== ownPid)]
+    : [ownPid];
+}
+
 async function askPeerPoll(
-  my_pid: number,
+  pids: number[],
   from_session_id: string,
   request_id: string,
   require_reply_to: boolean,
   deadlineMs: number,
   signal: AbortSignal,
 ): Promise<mailbox.Mailbox | null> {
-  let lastMtime = -1;
-  const path = mailbox.mailboxFilePath(my_pid);
+  // Watch the mtime of EVERY sibling pid's mailbox (a dual-scope requester's
+  // reply may land in a pid other than the one blocked here), draining only when
+  // a file that exists has changed — so the lock is acquired on a probable hit,
+  // never every tick. Mirrors the single-pid optimization, widened to the union.
+  const lastMtimes = new Map<number, number>();
   while (Date.now() < deadlineMs) {
     if (signal.aborted) throw new Error("aborted");
-    let stat: { mtimeMs: number } | null = null;
-    try {
-      stat = statSync(path);
-    } catch {
-      // ENOENT: mailbox file not created yet; treat as no change
+    let changed = false;
+    for (const pid of pids) {
+      let m = -1;
+      try {
+        m = statSync(mailbox.mailboxFilePath(pid)).mtimeMs;
+      } catch {
+        // ENOENT: mailbox file not created yet
+      }
+      if (m !== -1 && lastMtimes.get(pid) !== m) changed = true;
+      lastMtimes.set(pid, m);
     }
-    if (stat && stat.mtimeMs !== lastMtime) {
-      lastMtime = stat.mtimeMs;
-      const reply = require_reply_to
-        ? mailbox.drainMatchingReply(my_pid, from_session_id, request_id)
-        : mailbox.drainMatchingSession(my_pid, from_session_id);
+    if (changed) {
+      const reply = drainAskPeerReply(pids, from_session_id, request_id, require_reply_to);
       if (reply) return reply;
     }
     const remaining = deadlineMs - Date.now();
@@ -1913,14 +2004,17 @@ async function askPeerPoll(
 }
 
 function drainAskPeerReply(
-  my_pid: number,
+  pids: number[],
   from_session_id: string,
   request_id: string,
   require_reply_to: boolean,
 ): mailbox.Mailbox | null {
+  // Correlated peers: union-drain by reply_to across the requester's siblings.
+  // Legacy/uncorrelated peers: keep the best-effort own-pid session match (no
+  // request_id to correlate the union safely).
   return require_reply_to
-    ? mailbox.drainMatchingReply(my_pid, from_session_id, request_id)
-    : mailbox.drainMatchingSession(my_pid, from_session_id);
+    ? mailbox.drainMatchingReplyMany(pids, from_session_id, request_id)
+    : mailbox.drainMatchingSession(pids[0], from_session_id);
 }
 
 server.registerTool(
@@ -1928,7 +2022,7 @@ server.registerTool(
   {
     description: [
       "Delegate-and-wait: enqueue a message to a peer in the same project root, wake them, and block until they reply (via send_message) or the timeout elapses. Use this for back-and-forth; use send_message for fire-and-forget.",
-      "Wakes the peer via per-client tmux send-keys (Codex gets a paste-burst-aware gap, Claude Code doesn't), then polls for a reply. For reply_to-capable peers, only from_session_id + reply_to == request_id satisfies the wait; legacy peers fall back to best-effort from_session_id matching and the response reports correlation:\"uncorrelated\". Response carries wake_status: \"fired\" | \"skipped_busy\" | \"skipped_no_target\" | \"disabled\" (skipped_unsupported is reserved). A peer that is mid-turn is NOT keystroke-woken (skipped_busy) — its hook/poll delivers the enqueued message and we still poll for the reply. Returns reply: null, timed_out: true on timeout (default 45000ms, override per call with timeout_ms, or set OXTAIL_ASK_PEER_TIMEOUT_MS at startup). timeout_ms is clamped to a safe ceiling (default 100000ms, env OXTAIL_ASK_PEER_MAX_TIMEOUT_MS) so the wait can't outlast the client's tool-call abort window — exceeding it makes the client hard-fail the call instead of returning graceful timed_out; the response reports timeout_clamped_from_ms when clamped. Late replies still arrive via read_my_messages / the hook.",
+      "Wakes the peer via per-client tmux send-keys (Codex gets a paste-burst-aware gap, Claude Code doesn't), then polls for a reply. For reply_to-capable peers, only from_session_id + reply_to == request_id satisfies the wait; legacy peers fall back to best-effort from_session_id matching and the response reports correlation:\"uncorrelated\". Response carries wake_status: \"fired\" | \"skipped_busy\" | \"skipped_no_target\" | \"disabled\" (skipped_unsupported is reserved). A peer that is mid-turn is NOT keystroke-woken (skipped_busy) — its hook/poll delivers the enqueued message and we still poll for the reply. Returns reply: null, timed_out: true on timeout (default 60000ms, override per call with timeout_ms, or set OXTAIL_ASK_PEER_TIMEOUT_MS at startup). timeout_ms is clamped to a safe ceiling (default 100000ms, env OXTAIL_ASK_PEER_MAX_TIMEOUT_MS) so the wait can't outlast the client's tool-call abort window — exceeding it makes the client hard-fail the call instead of returning graceful timed_out; the response reports timeout_clamped_from_ms when clamped. DURABLE DELEGATION: on timeout (correlated peers, claimed requester), the request is recorded as a pending obligation, so when the peer's reply finally arrives — minutes or hours later — it WAKES you back (wake_reason late_reply_to_pending), not just landing silently in read_my_messages. So ask_peer is safe for long tasks: let it time out, end your turn, get pulled back when the work is done.",
       "Target must have a registered client.session_id (Codex peers call claim_session first). Body is verbatim — frame it as an assignment (objective + requested action) so it reads as delegation, not chat. Wake overridable via OXTAIL_ASK_PEER_WAKE_STRATEGY=auto|legacy|off.",
     ].join(" "),
     inputSchema: {
@@ -1982,6 +2076,10 @@ server.registerTool(
     const requestId = randomBytes(8).toString("hex");
     const requireReplyTo = peerSupportsReplyTo(peer);
     const fromSessionId = entry.client.session_id ?? undefined;
+    // The reply is addressed to OUR session_id; resolveTarget enqueues it to the
+    // session's freshest sibling, which may not be entry.server_pid. Drain the
+    // union (own pid first for fast-path locality), mirroring read_my_messages.
+    const myPids: number[] = requesterPids(entry.server_pid, fromSessionId);
     // Record-before-append (mirrors send_message): lets the peer answer with
     // reply_to_message(message_id) instead of hand-wiring target + reply_to.
     const msg = deliverToPeer(expectedSessionId, peer.server_pid, body, fromSessionId, {
@@ -2011,7 +2109,7 @@ server.registerTool(
       // their response may already be in our mailbox.
       await askPeerDelay(ASK_PEER_GRACE_MS, extra.signal);
       reply = drainAskPeerReply(
-        entry.server_pid,
+        myPids,
         expectedSessionId,
         requestId,
         requireReplyTo,
@@ -2039,7 +2137,7 @@ server.registerTool(
           // return this and the caller fail-fasts instead of polling.
         } else {
           reply = await askPeerPoll(
-            entry.server_pid,
+            myPids,
             expectedSessionId,
             requestId,
             requireReplyTo,
@@ -2086,6 +2184,80 @@ server.registerTool(
     // attempted) is NOT a timeout; the message has been enqueued and will be
     // delivered when the peer next enters a turn.
     const polled = wakeStatus !== "skipped_unsupported";
+
+    // Durable delegation: we polled to the deadline with no reply. Record a
+    // pending obligation FIRST, then do one final authoritative UNION drain —
+    // write-before-final-drain closes the poll-vs-deadline TOCTOU. A reply that
+    // landed in the gap is caught here and returned now; a reply that arrives
+    // AFTER finds the persisted record and pulls us back via resolveSendWake's
+    // late_reply_to_pending path — even minutes/hours later, and even for a
+    // markerless idle Codex requester. Correlated peers + claimed requester only.
+    if (polled && reply === null && !aborted && requireReplyTo) {
+      if (fromSessionId) {
+        const dir = defaultPendingAskDir();
+        // Opportunistic sweep so abandoned records (a reply that never came)
+        // can't accumulate — mirrors gcAutowake inside decideReplyAutoWake.
+        gcPendingAsk(dir, Date.now());
+        // Write the pending obligation BEFORE the final drain (write-before-
+        // final-drain): a reply that lands after the drain finds this record and
+        // wakes us via resolveSendWake; one that landed before is caught below.
+        if (!recordPendingAsk(dir, fromSessionId, requestId, Date.now())) {
+          // Store unwritable → silently degrades to the read_my_messages path
+          // (no durable pull-back). Surface it so the degradation is observable.
+          trace("ask_peer_pending_record_failed", { request_id: requestId });
+        }
+        // Authoritative final drain. Recompute the pid union NOW — a sibling MCP
+        // child may have appeared during the wait. Use the CHECKED variant and
+        // retry any pid we couldn't inspect (transient lock): silently treating
+        // "couldn't read" as "no reply" would leave the record with no later
+        // event to consume it → a stranded pull-back.
+        const finalPids = requesterPids(entry.server_pid, fromSessionId);
+        let drained = mailbox.drainMatchingReplyManyChecked(finalPids, expectedSessionId, requestId);
+        if (drained.skipped.length > 0) {
+          // A pid we couldn't inspect might hold either the already-landed reply
+          // (if we have none yet) OR a migrate-crash duplicate of the reply we DID
+          // pull (which a later read_my_messages would re-deliver). Retry once
+          // after a brief delay for the lock to clear.
+          try {
+            await askPeerDelay(ASK_PEER_POLL_MS, extra.signal);
+            if (!drained.reply) {
+              drained = mailbox.drainMatchingReplyManyChecked(
+                drained.skipped,
+                expectedSessionId,
+                requestId,
+              );
+              if (!drained.reply && drained.skipped.length > 0) {
+                // Still un-inspectable after the retry: a lock held past the
+                // acquire budget + retry (SIGSTOP-class / long holder). diagnose
+                // can use this to tell "no reply" from "a reply may sit behind a
+                // locked pid" — the record persists, so a later send still wakes.
+                trace("ask_peer_skipped_after_final_retry", {
+                  request_id: requestId,
+                  skipped: drained.skipped,
+                });
+              }
+            } else {
+              // We have the reply — sweep only its exact id from the skipped pids
+              // (a distinct second reply, different id, is left for read_my_messages).
+              mailbox.sweepMessageId(drained.skipped, drained.reply.id);
+            }
+          } catch {
+            // aborted during the brief retry delay — leave the record; we return
+            // timed_out and the reply still delivers via read_my_messages.
+          }
+        }
+        if (drained.reply) {
+          consumePendingAsk(dir, fromSessionId, requestId);
+          reply = drained.reply;
+          trace("ask_peer_late_catch", { request_id: requestId, message_id: drained.reply.id });
+        }
+      } else {
+        // Unclaimed requester: a peer can't correlate/reply_to_message back to
+        // us, so there's nothing to durably wake — surface it rather than guess.
+        trace("ask_peer_pending_skipped_unclaimed", { request_id: requestId });
+      }
+    }
+
     const timedOut = polled && reply === null;
     trace("ask_peer_end", {
       target_session_id: expectedSessionId,
