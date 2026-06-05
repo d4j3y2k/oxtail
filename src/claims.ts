@@ -219,7 +219,14 @@ export type WriteClaimInput = {
 // Atomic temp+rename so a concurrent reader never sees a torn write.
 export function writeClaim(input: WriteClaimInput): void {
   ensureClaimsDir();
-  gcStaleClaims();
+  // Age-only sweep on this hot path. writeClaim can run concurrently with another
+  // agent's writeClaim (dual-scope, or two sessions in one project); the
+  // transcript-existence check is racy — a transcript that momentarily fails to
+  // stat would unlink a sibling's just-written claim (M6). Age is monotonic and
+  // race-free, so reclaim only by age here. recoverClaim already skips records
+  // whose transcript is gone, and the full (transcript-aware) sweep remains
+  // available via a direct gcStaleClaims() call.
+  gcStaleClaims(Date.now(), { ageOnly: true });
   const rec: ClaimRecord = {
     schema_version: 1,
     client_type: input.client_type,
@@ -318,7 +325,10 @@ export function recoverClaim(
 // Drop records that are clearly dead: transcript gone, or older than the max
 // age. Best-effort; never throws. A dead process pid alone is NOT grounds for
 // removal — that's exactly the restart case recovery exists to serve.
-export function gcStaleClaims(nowMs: number = Date.now()): void {
+export function gcStaleClaims(
+  nowMs: number = Date.now(),
+  opts: { ageOnly?: boolean } = {},
+): void {
   const dir = claimsDir();
   if (!existsSync(dir)) return;
   let files: string[];
@@ -336,7 +346,8 @@ export function gcStaleClaims(nowMs: number = Date.now()): void {
     } catch {
       continue;
     }
-    const transcriptGone = !rec.transcript_path || !existsSync(rec.transcript_path);
+    const transcriptGone =
+      !opts.ageOnly && (!rec.transcript_path || !existsSync(rec.transcript_path));
     const tooOld = nowMs - rec.claimed_at * 1000 > CLAIM_MAX_AGE_MS;
     if (transcriptGone || tooOld) {
       try {

@@ -22,6 +22,11 @@ export type StateCard = {
 export type RegistryEntry = {
   server_pid: number;
   started_at: number;
+  // The server process's OS start-time signature, captured at register time.
+  // Lets a reader detect pid reuse: a recycled pid (now an unrelated process)
+  // has a different start time even though the stale on-disk entry is unchanged.
+  // Optional for backward compat with entries written before this field existed.
+  proc_sig?: string;
   client: ClientInfo;
   tmux_pane: string | null;
   tmux_session: string | null;
@@ -106,10 +111,22 @@ export function isValidTmuxSession(s: string): boolean {
 //   - the resolved pane isn't a well-formed pane id (tmux output anomaly).
 // resolvePane is injected in tests; production uses currentPaneForServerPid.
 export function chooseVerifiedWakePane(
-  peer: { tmux_pane: string | null; server_pid: number },
+  peer: { tmux_pane: string | null; server_pid: number; proc_sig?: string },
   resolvePane: (serverPid: number) => string | null = currentPaneForServerPid,
+  resolveSig: (pid: number) => string = processStartSig,
 ): string | null {
   if (!peer.tmux_pane) return null;
+  // PID-reuse guard: if the entry recorded the server process's start-time
+  // signature, confirm the live pid is STILL that process before resolving and
+  // waking its pane. Otherwise an OS-recycled pid — now an unrelated process
+  // that happens to sit under a different tmux pane — would resolve to, and get
+  // our wake keystrokes typed into, a stranger's pane (M3). Only refuse on a
+  // positively-different signature; an empty reading (transient ps failure)
+  // falls through to pane resolution, which fails closed for a truly dead pid.
+  if (peer.proc_sig) {
+    const liveSig = resolveSig(peer.server_pid);
+    if (liveSig && liveSig !== peer.proc_sig) return null;
+  }
   const live = resolvePane(peer.server_pid);
   if (!live || !isValidTmuxPane(live)) return null;
   return live;
@@ -238,11 +255,36 @@ export function currentPaneForServerPid(serverPid: number): string | null {
   return findTmuxPaneByAncestry(serverPid, listTmuxPanePids(), listAllPpids());
 }
 
+// The OS start-time signature (lstart) of a process, or "" if it can't be read
+// (dead pid, or ps unavailable). Same provenance signal claims.ts uses on
+// ancestor pids: an OS-recycled pid yields a DIFFERENT start time, so comparing
+// a live pid's signature against one captured at register time detects pid reuse
+// — distinguishing "our process is still alive" from "the pid now belongs to an
+// unrelated process."
+export function processStartSig(pid: number): string {
+  try {
+    return execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+
+// A process's start time never changes, so capture our own once and reuse it.
+let cachedSelfProcSig: string | undefined;
+function selfProcSig(): string {
+  if (cachedSelfProcSig === undefined) cachedSelfProcSig = processStartSig(process.pid);
+  return cachedSelfProcSig;
+}
+
 export function buildEntry(client: ClientInfo, env = process.env): RegistryEntry {
   const tmux_pane = resolveTmuxPane(env);
   return {
     server_pid: process.pid,
     started_at: Math.floor(Date.now() / 1000),
+    proc_sig: selfProcSig(),
     client,
     tmux_pane,
     tmux_session: resolveTmuxSessionFromPane(tmux_pane),

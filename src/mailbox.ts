@@ -235,6 +235,13 @@ export function requeueMany(target_pid: number, msgs: Mailbox[]): void {
 // two unioned sibling mailboxes. Both copies are drained (so neither lingers) but
 // the message is returned ONCE. message_id is a unique per-message nonce, so this
 // only ever collapses true duplicates, never two distinct messages.
+// Union-drain a session's mailboxes (one per server_pid it has used), deduping
+// by message_id so a migrate crash-window duplicate (same id in two sibling
+// mailboxes) is delivered once. INVARIANT: every unioned pid is drained (and so
+// truncated) before returning — do NOT add a budget/early-exit short-circuit
+// here. The dedup is per-call only, so a duplicate left in an un-drained sibling
+// would re-surface on a later call with no cross-call dedup (M5). Budgeting
+// belongs in the caller, applied to the already-fully-drained result.
 export function drainMany(pids: number[]): { messages: Mailbox[]; skipped: number } {
   const out: Mailbox[] = [];
   const seenPids = new Set<number>();

@@ -312,6 +312,38 @@ test("chooseVerifiedWakePane: only ever returns the process-tree-resolved pane, 
   assert.equal(chooseVerifiedWakePane(spoofed, () => "%3; evil"), null);
 });
 
+test("chooseVerifiedWakePane: refuses when the live pid's start signature differs (PID reuse, M3)", () => {
+  // The entry recorded the server process's start-time signature. A pane
+  // resolves, but the live pid now reports a DIFFERENT start time → the pid was
+  // recycled for an unrelated process; refuse rather than type into a stranger's
+  // pane.
+  const peer = { tmux_pane: "%5", server_pid: 4242, proc_sig: "Mon Jan  1 00:00:00 2026" };
+  assert.equal(
+    chooseVerifiedWakePane(peer, () => "%9", () => "Tue Feb  2 11:11:11 2026"),
+    null,
+    "recycled pid (different start sig) is refused",
+  );
+  // Matching signature → proceed with the resolved pane.
+  assert.equal(
+    chooseVerifiedWakePane(peer, () => "%9", () => "Mon Jan  1 00:00:00 2026"),
+    "%9",
+    "same process (matching sig) wakes normally",
+  );
+  // Indeterminate signature ("" — transient ps failure) → fall through to pane
+  // resolution rather than a false refusal.
+  assert.equal(
+    chooseVerifiedWakePane(peer, () => "%9", () => ""),
+    "%9",
+    "empty sig reading does not cause a false refusal",
+  );
+  // Entry without a recorded sig (older version) → skip the check (back-compat).
+  assert.equal(
+    chooseVerifiedWakePane({ tmux_pane: "%5", server_pid: 4242 }, () => "%9", () => "whatever"),
+    "%9",
+    "sig-less entry preserves prior behavior",
+  );
+});
+
 // --- #6 (provenance): server_pid is also self-written, so a registry file's
 // server_pid must match the pid in its filename. Otherwise a forged
 // <ownPid>.json with server_pid:<victimPid> would make chooseVerifiedWakePane →

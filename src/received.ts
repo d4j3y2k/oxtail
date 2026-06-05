@@ -102,23 +102,42 @@ function readLines(sessionId: string): string[] {
   }
 }
 
+// The message_id of a serialized ledger line, or null if unparseable. Used to
+// keep recordReceived idempotent without fully deserializing every envelope.
+function lineMessageId(line: string): string | null {
+  try {
+    const parsed = JSON.parse(line) as { id?: unknown };
+    return typeof parsed.id === "string" ? parsed.id : null;
+  } catch {
+    return null;
+  }
+}
+
 // Append an inbound envelope to the receiver's ledger and prune to receivedMax()
 // (oldest dropped first). Called by delivery.ts BEFORE the mailbox append.
+// Idempotent by message_id: re-recording an id replaces its prior line.
 export function recordReceived(receiverSessionId: string, msg: Mailbox): void {
   if (!receiverSessionId) return;
   acquireLock(receiverSessionId);
   try {
     const lines = readLines(receiverSessionId);
-    lines.push(JSON.stringify(msg));
+    // Idempotent by message_id: a re-record (ask_peer abort recovery, chained
+    // re-delivery) must not append a duplicate ledger line. Duplicates waste the
+    // receivedMax prune budget and can evict still-needed handles early,
+    // surfacing as spurious reply_to_message "message-not-found" (M4). Drop any
+    // prior line for this id, then append the latest. lookupReceived already
+    // returns first-match newest-first, so behavior is unchanged for callers.
+    const deduped = msg.id ? lines.filter((l) => lineMessageId(l) !== msg.id) : lines;
+    deduped.push(JSON.stringify(msg));
     const max = receivedMax();
-    let pruned = lines;
-    if (lines.length > max) {
-      pruned = lines.slice(lines.length - max);
+    let pruned = deduped;
+    if (deduped.length > max) {
+      pruned = deduped.slice(deduped.length - max);
       // No silent caps: a dropped handle becomes reply_to_message
       // "message-not-found", so surface that the bound bit.
       trace("received_ledger_pruned", {
         session_id: receiverSessionId,
-        dropped: lines.length - max,
+        dropped: deduped.length - max,
         kept: max,
       });
     }

@@ -22,6 +22,7 @@ import {
   buildEntry,
   chooseVerifiedWakePane,
   findByTmuxSession,
+  processStartSig,
   readAll,
   refreshTmuxBinding,
   register,
@@ -1233,7 +1234,18 @@ function resolveTarget(target: string, caller: RegistryEntry): ResolveOk | Resol
     if (!isAliveLocal(e.server_pid)) return false;
     const fresh = reReadRegistryEntry(e.server_pid);
     if (!fresh) return false;
-    return fresh.started_at === e.started_at;
+    if (fresh.started_at !== e.started_at) return false;
+    // PID-reuse: started_at is the original registration time and lives on the
+    // stale on-disk entry, so a recycled pid (alive, file untouched) passes the
+    // check above. If the entry recorded the process start-time signature,
+    // confirm the live pid is still that same process; a recycled pid reads a
+    // different signature and is rejected (M3). Empty reading → indeterminate,
+    // leave it to downstream (the pane wake gate re-verifies before keystrokes).
+    if (fresh.proc_sig) {
+      const liveSig = processStartSig(e.server_pid);
+      if (liveSig && liveSig !== fresh.proc_sig) return false;
+    }
+    return true;
   });
 
   if (candidates.length === 0) return { ok: false, error: "target-not-found" };
