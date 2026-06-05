@@ -229,15 +229,26 @@ export function requeueMany(target_pid: number, msgs: Mailbox[]): void {
 // of silently stranding it. Best-effort per pid: a contended/unreadable mailbox
 // is skipped (counted) and left for the next poll rather than failing the whole
 // drain — one stuck lock must not block a session's entire inbox.
+//
+// Deduped by message_id: a migrateMailbox crash-window (append to dest done, but
+// the process died before truncating the source) can leave the SAME message in
+// two unioned sibling mailboxes. Both copies are drained (so neither lingers) but
+// the message is returned ONCE. message_id is a unique per-message nonce, so this
+// only ever collapses true duplicates, never two distinct messages.
 export function drainMany(pids: number[]): { messages: Mailbox[]; skipped: number } {
   const out: Mailbox[] = [];
-  const seen = new Set<number>();
+  const seenPids = new Set<number>();
+  const seenIds = new Set<string>();
   let skipped = 0;
   for (const pid of pids) {
-    if (seen.has(pid)) continue;
-    seen.add(pid);
+    if (seenPids.has(pid)) continue;
+    seenPids.add(pid);
     try {
-      for (const m of drain(pid)) out.push(m);
+      for (const m of drain(pid)) {
+        if (seenIds.has(m.id)) continue;
+        seenIds.add(m.id);
+        out.push(m);
+      }
     } catch {
       skipped++;
     }
