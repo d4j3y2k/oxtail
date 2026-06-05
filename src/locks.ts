@@ -51,8 +51,13 @@ import { trace } from "./trace.js";
 //     produce two owners — the worst they do is race to recreate the lock, which
 //     exactly one wins.
 
-const LOCK_RETRY_LIMIT = 50;
 const LOCK_RETRY_DELAY_MS = 10;
+// Total acquire budget is wall-clock, NOT a fixed retry count: a successful
+// stale-clear retries mkdir immediately (no sleep) so it must not consume the
+// budget without time passing — a count-based budget threw "could not acquire
+// lock" spuriously under contention (H2). 2s is ample for the tiny mailbox/
+// ledger critical sections and well under any caller-level timeout.
+const LOCK_ACQUIRE_TIMEOUT_MS = 2_000;
 
 function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -184,7 +189,8 @@ export function acquireDirLock(
   traceCtx: Record<string, unknown>,
 ): string {
   const token = mintToken();
-  for (let i = 0; i < LOCK_RETRY_LIMIT; i++) {
+  const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS;
+  for (;;) {
     try {
       mkdirSync(lock, { mode: 0o700 });
       writeOwner(lock, token);
@@ -192,11 +198,19 @@ export function acquireDirLock(
     } catch (e) {
       const err = e as NodeJS.ErrnoException;
       if (err.code !== "EEXIST") throw err;
-      if (clearStaleLock(lock, staleMs, traceEvent, traceCtx)) continue;
-      sleepSync(LOCK_RETRY_DELAY_MS);
+      // A successful stale-clear means the lock is gone: loop straight back to
+      // mkdir WITHOUT sleeping, to grab it before another contender (this retry
+      // must not consume the budget without time passing). Otherwise — a fresh
+      // holder or a lost steal — back off before retrying.
+      if (!clearStaleLock(lock, staleMs, traceEvent, traceCtx)) {
+        sleepSync(LOCK_RETRY_DELAY_MS);
+      }
+    }
+    // Wall-clock budget so the no-sleep stale-clear path cannot spin forever.
+    if (Date.now() >= deadline) {
+      throw new Error(`could not acquire lock at ${lock}`);
     }
   }
-  throw new Error(`could not acquire lock at ${lock}`);
 }
 
 // Release the lock — but only if we PROVABLY still own it (owner === our token).
@@ -208,7 +222,13 @@ export function acquireDirLock(
 // stale lock and is reclaimed by clearStaleLock, strictly safer than a stomp.
 export function releaseDirLock(lock: string, token: string): void {
   if (!token) {
-    removeLock(lock); // no token to verify (defensive/legacy) — best-effort
+    // No token to prove ownership. An empty token reaches here only from a
+    // lockTokens Map miss (an acquire that threw, or a future same-key nested
+    // release), so removing would stomp whatever lock currently exists —
+    // possibly a DIFFERENT owner's fresh one. Leave it: a genuinely leaked lock
+    // ages into a stale lock and is reclaimed by clearStaleLock, strictly safer
+    // than a stomp (H3).
+    trace("lock_release_skipped_no_token", { lock });
     return;
   }
   const owner = readOwner(lock);

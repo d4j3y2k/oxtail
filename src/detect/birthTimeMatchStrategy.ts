@@ -4,6 +4,12 @@ import { join } from "node:path";
 import type { DetectStrategy, StrategyAbstention } from "./types.js";
 
 const FIVE_MIN_MS = 5 * 60 * 1000;
+// started_at is whole-second granularity (Math.floor(Date.now()/1000)*1000)
+// while a transcript's birth_ms is real-millisecond, so a transcript
+// legitimately created in the same second can land slightly BEFORE started_at
+// (delta in [-1000, 0]). Allow one second of grace below zero so the unique
+// candidate isn't dropped on pure rounding (M7).
+const ONE_SECOND_MS = 1000;
 const UUID_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/;
 
 export type Candidate = { session_id: string; birth_ms: number };
@@ -19,7 +25,7 @@ export function pickByDelta(
 ): Candidate | null {
   const ranked = candidates
     .map((c) => ({ ...c, delta: c.birth_ms - startedAtMs }))
-    .filter((c) => c.delta > 0 && c.delta <= windowMs);
+    .filter((c) => c.delta > -ONE_SECOND_MS && c.delta <= windowMs);
   if (ranked.length !== 1) return null;
   return { session_id: ranked[0].session_id, birth_ms: ranked[0].birth_ms };
 }
@@ -155,7 +161,7 @@ function abstainReason(
   }
   const ranked = candidates
     .map((c) => ({ ...c, delta: c.birth_ms - startedAtMs }))
-    .filter((c) => c.delta > 0 && c.delta <= FIVE_MIN_MS);
+    .filter((c) => c.delta > -ONE_SECOND_MS && c.delta <= FIVE_MIN_MS);
   if (ranked.length === 0) {
     return {
       abstain: true,

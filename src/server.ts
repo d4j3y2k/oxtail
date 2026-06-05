@@ -1782,6 +1782,14 @@ async function wakePeer(peer: RegistryEntry): Promise<WakeStatus> {
   // No session-name fallback: a self-written tmux_session could target another
   // session, and the verified pane already handles pane-id churn. Pass null.
   const ok = await askPeerWakeImpl(verifiedPane, null, fire);
+  if (!ok && sid) {
+    // The fire failed (e.g. the pane vanished between verification and the
+    // send-keys), so no keystroke landed. Clear the debounce stamp set pre-fire
+    // above — otherwise a genuine retry within WAKE_DEBOUNCE_MS is suppressed as
+    // "debounced" even though the peer was never actually woken (M1). The
+    // pre-stamp only needs to survive a SUCCESSFUL fire's async paste gap.
+    wakeDebounce.delete(sid);
+  }
   return ok ? "fired" : "skipped_no_target";
 }
 

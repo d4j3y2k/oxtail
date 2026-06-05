@@ -683,6 +683,29 @@ test("migrateMailbox: appends source lines byte-exact into dest tail; empties so
   });
 });
 
+test("migrateMailbox: a torn final line in the source is dropped, not glued/miscounted (H4)", () => {
+  withHome(() => {
+    const from = 311;
+    const to = 312;
+    mailbox.enqueue(from, "good");
+    // Simulate a crash mid-append: a valid line followed by a torn JSON fragment
+    // with no trailing newline (exactly what appendLines' heal guards against).
+    const srcPath = mailbox.mailboxFilePath(from);
+    const valid = readFileSync(srcPath, "utf8");
+    writeFileSync(srcPath, valid + '{"schema_version":1,"id":"torn","bod');
+
+    const moved = mailbox.migrateMailbox(from, to);
+    // Only the one deliverable record is counted/migrated — NOT 2.
+    assert.equal(moved, 1, "torn fragment is not counted as a message");
+    assert.equal(mailbox.mailboxHasMessages(from), false, "source emptied");
+
+    const drained = mailbox.drain(to);
+    assert.deepEqual(drained.map((m) => m.body), ["good"], "only the valid record migrated");
+    const destRaw = readFileSync(mailbox.mailboxFilePath(to), "utf8");
+    assert.ok(!destRaw.includes('"id":"torn"'), "torn fragment must not be glued into the dest");
+  });
+});
+
 test("migrateMailbox: empty/missing source and same-pid are no-ops (return 0)", () => {
   withHome(() => {
     assert.equal(mailbox.migrateMailbox(303, 304), 0, "missing source");

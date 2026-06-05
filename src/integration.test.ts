@@ -2345,10 +2345,13 @@ test("integration: sticky claim recovered after handshake is written back to reg
       process.env.HOME = prevHome;
     }
     // Keep the transcript birth time clearly before the restarted child's
-    // started_at second. Otherwise second-resolution started_at can make a
-    // same-second transcript look post-start and let birth-time win instead of
-    // exercising sticky recovery.
-    await new Promise((r) => setTimeout(r, 1100));
+    // started_at — far enough that birth-time detection abstains and sticky
+    // recovery is exercised. Birth-time allows a 1s grace below started_at to
+    // absorb second-resolution rounding (worst-case delta is 1000 - wait ms), so
+    // wait > 2000ms to guarantee the transcript reads as genuinely pre-start —
+    // which is what a real restart looks like (its transcript predates the new
+    // child by seconds-to-hours).
+    await new Promise((r) => setTimeout(r, 2100));
 
     s2 = await spawnServer({
       cwd: sharedCwd,

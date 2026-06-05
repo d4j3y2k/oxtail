@@ -193,10 +193,6 @@ function compareClaimScores(a: ClaimScore, b: ClaimScore): number {
   return a.claimed_at - b.claimed_at;
 }
 
-function scoresTie(a: ClaimScore, b: ClaimScore): boolean {
-  return compareClaimScores(a, b) === 0;
-}
-
 function claimKey(clientType: ClientType, cwd: string, sessionId: string): string {
   return createHash("sha256")
     .update(`${clientType} ${cwd} ${sessionId}`)
@@ -296,7 +292,26 @@ export function recoverClaim(
   matches.sort((a, b) => compareClaimScores(b.score, a.score));
   const best = matches[0]!;
   const second = matches[1];
-  if (second && scoresTie(best.score, second.score)) return null;
+  // Abstain on cross-session ambiguity. Two DISTINCT sessions that overlap the
+  // live chain equally (same overlap_count) AND at the same live-chain depth
+  // (same nearest_overlap_current) share liveness only at a common ancestor —
+  // the shared terminal/login-shell. The remaining tiebreakers (record-side
+  // depth, recency) do NOT correlate with which child actually restarted, so
+  // adopting either would risk cross-session misrouting (H1) — the very
+  // split-identity class this store exists to prevent. Return null so the caller
+  // falls back to the explicit claim_session next_step. (This strictly subsumes
+  // the old exact-tie check, which had equal overlap_count and nearest_current
+  // by definition.) A same-session second-best routes to the same identity and
+  // so can never split-route — defensive only, since the per-session claim key
+  // means two records can't share a session_id.
+  if (
+    second &&
+    best.rec.session_id !== second.rec.session_id &&
+    best.score.overlap_count === second.score.overlap_count &&
+    best.score.nearest_overlap_current === second.score.nearest_overlap_current
+  ) {
+    return null;
+  }
   return best.rec;
 }
 
