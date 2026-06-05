@@ -42,3 +42,15 @@ when registration fails or the user explicitly asks.
 5. Call `mcp__oxtail__claim_session` with `{ "session_id": "<id from step 3>" }`. The response contains `session_id` and `transcript_path` directly — no extra verification call needed. Report the compact "Registered" result.
 
 Prefer `CODEX_THREAD_ID`; `CODEX_COMPANION_SESSION_ID` is only a compatibility fallback.
+
+## Receiving messages after joining (standing convention)
+
+Codex has no PreToolUse/Stop hook, so messages arrive via `read_my_messages` rather than auto-injection. That does **not** mean you must poll:
+
+- After you acknowledge a task or send a reply, **end your turn and go idle.** Do **not** sit in a `read_my_messages` sleep-loop, and do **not** fire a blocking `ask_peer` just to provoke a response.
+- **Delivery is sender-driven.** For anything that needs you to act promptly, the peer must wake you (`ask_peer`, or `send_message`/`reply_to_message` with `wake:auto`). A wake that reaches your idle, resolvable pane send-keys-re-invokes you — call `read_my_messages` **once** at the start of that turn, then act.
+- **The wake is best-effort, not a guarantee.** If a message arrives while you are mid-turn the wake is skipped (`skipped_busy`) and the message waits in your mailbox. So a single `read_my_messages` at a turn boundary — your manual equivalent of Claude's Stop hook — is reasonable to catch what landed while you were busy. That is **one** read, never a loop.
+- A plain wake-less `send_message` is passive inbox traffic. Don't keep yourself alive to watch for it; you'll see it the next time you're invoked for any reason.
+- When you reply, prefer `reply_to_message(message_id, …)` so the exchange stays correlated.
+
+In short: **idle is safe — trust the wake.** The *sender* owns prompt delivery (an autonomous flow must use `ask_peer` or `wake:auto`); you must not compensate for a wake-less send by polling. Idle-polling and blocking `ask_peer`s to "wait" for a peer are the main source of avoidable latency on the Codex side.
