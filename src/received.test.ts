@@ -1,7 +1,14 @@
 import { strict as assert } from "node:assert";
-import { mkdtempSync, readFileSync, rmSync, truncateSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  truncateSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 import * as mailbox from "./mailbox.js";
 import {
@@ -155,6 +162,27 @@ test("received: retention bound prunes oldest, keeps newest", () => {
     } finally {
       if (prevMax === undefined) delete process.env.OXTAIL_RECEIVED_MAX;
       else process.env.OXTAIL_RECEIVED_MAX = prevMax;
+    }
+  });
+});
+
+// The ledger is rewritten in full on every record; an in-place writeFileSync can
+// leave a torn file on crash, corrupting older reply handles. The atomic
+// tmp+rename rewrite leaves no temp residue and preserves all entries.
+test("received: atomic ledger rewrite leaves no .tmp residue", () => {
+  withHome(() => {
+    const ids: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const m = mailbox.enqueue(4242, `b${i}`, SENDER, { request_id: `q${i}` });
+      recordReceived(RECEIVER, m);
+      ids.push(m.id);
+    }
+    const dir = dirname(receivedFilePath(RECEIVER));
+    const leftover = readdirSync(dir).filter((f) => f.includes(".tmp"));
+    assert.deepEqual(leftover, [], "no temp files left behind after atomic rewrite");
+    // Every recorded handle still resolves.
+    for (let i = 0; i < ids.length; i++) {
+      assert.ok(lookupReceived(RECEIVER, ids[i]), `id[${i}] still resolvable`);
     }
   });
 });

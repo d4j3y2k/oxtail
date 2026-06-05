@@ -23,10 +23,20 @@ export const HOOK_MARKER_KEY = "_oxtailHook";
 //       and drop the redundant single-valued `origin` field. message_id +
 //       from_session_id are still rendered (correlation/debug unaffected); a
 //       stale pre-v5 hook is only larger, never wrong.
+//   v6: owner-token advisory lock (mirror of src/locks.ts) in pretooluse + stop.
+//       The lock dir gains a sidecar `<lock>.owner` token; stale removal is
+//       gated behind a single-winner `<lock>.steal` marker + compare-and-clear,
+//       and release only removes a lock we still own. The sidecar layout keeps
+//       the lock dir EMPTY so a pre-v6 hook's plain `rmdir` still removes a v6
+//       lock — i.e. mixed versions never WEDGE. They are not fully race-safe,
+//       though: a pre-v6 hook does an unconditional stale-rmdir / release-rmdir
+//       with no owner check, so during an upgrade window (before re-install) the
+//       old hook can still lose the stall-resume / double-clear races against a
+//       v6 peer. The version bump forces re-install to close that window.
 // INVARIANT: any change to an assets/*.sh script MUST bump this version, so
 // existing installs are forced to re-install. scripts/check-hook-version.mjs
 // enforces this in CI.
-export const HOOK_MARKER_VERSION = 5;
+export const HOOK_MARKER_VERSION = 6;
 
 const HOOKS_DIR = path.join(os.homedir(), ".oxtail", "hooks");
 
