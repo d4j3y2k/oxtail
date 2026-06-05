@@ -22,6 +22,7 @@ import {
   buildEntry,
   chooseVerifiedWakePane,
   findByTmuxSession,
+  processStartSig,
   readAll,
   refreshTmuxBinding,
   register,
@@ -825,6 +826,11 @@ function refineFromHandshake(trigger: string): ReturnType<typeof diagnoseDetect>
 }
 
 server.server.oninitialized = (): void => {
+  // Sweep pending-ask records orphaned by a prior session (an ask that timed out,
+  // was never answered, and whose owner went away). gcPendingAsk otherwise only
+  // runs on a later ask_peer timeout, so this startup sweep keeps the dir from
+  // accumulating stale records. Best-effort; never throws.
+  gcPendingAsk(defaultPendingAskDir(), Date.now());
   const diagnosis = refineFromHandshake("oninitialized");
   // After type is known via handshake, schedule retries to catch transcript files
   // that don't exist yet at handshake time. No-op if session_id is already set.
@@ -1086,12 +1092,17 @@ server.registerTool(
       // strategy mirrors session_id_source so callers can still see whether
       // env / birth-time / self-register resolved this entry.
       const source = entry.client.session_id_source ?? "self-register";
+      // Report confidence honestly per source: env and explicit self-register
+      // (claim_session) are authoritative ("high"); inferred sources (birth-time,
+      // sticky-claim) are "medium" — matching what the detect strategies return.
+      const confidence: "high" | "medium" =
+        source === "env" || source === "self-register" ? "high" : "medium";
       diagnosis = {
         per_strategy: {},
         winning: {
           session_id: entry.client.session_id,
           source,
-          confidence: "high" as const,
+          confidence,
           strategy: source,
         },
         next_step: null,
@@ -1233,7 +1244,18 @@ function resolveTarget(target: string, caller: RegistryEntry): ResolveOk | Resol
     if (!isAliveLocal(e.server_pid)) return false;
     const fresh = reReadRegistryEntry(e.server_pid);
     if (!fresh) return false;
-    return fresh.started_at === e.started_at;
+    if (fresh.started_at !== e.started_at) return false;
+    // PID-reuse: started_at is the original registration time and lives on the
+    // stale on-disk entry, so a recycled pid (alive, file untouched) passes the
+    // check above. If the entry recorded the process start-time signature,
+    // confirm the live pid is still that same process; a recycled pid reads a
+    // different signature and is rejected (M3). Empty reading → indeterminate,
+    // leave it to downstream (the pane wake gate re-verifies before keystrokes).
+    if (fresh.proc_sig) {
+      const liveSig = processStartSig(e.server_pid);
+      if (liveSig && liveSig !== fresh.proc_sig) return false;
+    }
+    return true;
   });
 
   if (candidates.length === 0) return { ok: false, error: "target-not-found" };
@@ -1782,6 +1804,14 @@ async function wakePeer(peer: RegistryEntry): Promise<WakeStatus> {
   // No session-name fallback: a self-written tmux_session could target another
   // session, and the verified pane already handles pane-id churn. Pass null.
   const ok = await askPeerWakeImpl(verifiedPane, null, fire);
+  if (!ok && sid) {
+    // The fire failed (e.g. the pane vanished between verification and the
+    // send-keys), so no keystroke landed. Clear the debounce stamp set pre-fire
+    // above — otherwise a genuine retry within WAKE_DEBOUNCE_MS is suppressed as
+    // "debounced" even though the peer was never actually woken (M1). The
+    // pre-stamp only needs to survive a SUCCESSFUL fire's async paste gap.
+    wakeDebounce.delete(sid);
+  }
   return ok ? "fired" : "skipped_no_target";
 }
 

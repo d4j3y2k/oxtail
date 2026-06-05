@@ -235,6 +235,13 @@ export function requeueMany(target_pid: number, msgs: Mailbox[]): void {
 // two unioned sibling mailboxes. Both copies are drained (so neither lingers) but
 // the message is returned ONCE. message_id is a unique per-message nonce, so this
 // only ever collapses true duplicates, never two distinct messages.
+// Union-drain a session's mailboxes (one per server_pid it has used), deduping
+// by message_id so a migrate crash-window duplicate (same id in two sibling
+// mailboxes) is delivered once. INVARIANT: every unioned pid is drained (and so
+// truncated) before returning — do NOT add a budget/early-exit short-circuit
+// here. The dedup is per-call only, so a duplicate left in an un-drained sibling
+// would re-surface on a later call with no cross-call dedup (M5). Budgeting
+// belongs in the caller, applied to the already-fully-drained result.
 export function drainMany(pids: number[]): { messages: Mailbox[]; skipped: number } {
   const out: Mailbox[] = [];
   const seenPids = new Set<number>();
@@ -305,8 +312,41 @@ export function migrateMailbox(fromPid: number, toPid: number): number {
       throw err;
     }
     if (!raw || !raw.trim()) return 0;
-    const block = raw.endsWith("\n") ? raw : raw + "\n";
-    const count = raw.split("\n").filter((l) => l.trim().length > 0).length;
+    // Migrate only VALID records, reserialized canonically. A crash mid-append
+    // into the source can leave a torn final line; copying raw bytes would glue
+    // a synthesized newline onto that fragment, promoting garbage into a
+    // standalone (unparseable) line in the dest AND over-counting it (H4). Parse
+    // each line with the same guard drain uses, drop torn/invalid ones, and
+    // rebuild a clean block so the count reflects real, deliverable messages.
+    const valid: Mailbox[] = [];
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        trace("mailbox_migrate_skip_invalid", { fromPid, toPid, line });
+        continue;
+      }
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        (parsed as Mailbox).schema_version === 1 &&
+        typeof (parsed as Mailbox).id === "string" &&
+        typeof (parsed as Mailbox).body === "string"
+      ) {
+        valid.push(parsed as Mailbox);
+      } else {
+        trace("mailbox_migrate_skip_invalid", { fromPid, toPid, line });
+      }
+    }
+    if (valid.length === 0) {
+      // Only torn/garbage lines — clear the source and report nothing migrated.
+      truncateSync(src, 0);
+      return 0;
+    }
+    // serializeMailboxLine already terminates each line with "\n", so join("").
+    const block = valid.map((m) => serializeMailboxLine(m)).join("");
 
     acquireLock(toPid);
     try {
@@ -316,7 +356,7 @@ export function migrateMailbox(fromPid: number, toPid: number): number {
     }
     // Append succeeded → clear the source (still under the source lock).
     truncateSync(src, 0);
-    return count;
+    return valid.length;
   } finally {
     releaseLock(fromPid);
   }

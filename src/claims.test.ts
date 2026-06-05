@@ -178,21 +178,50 @@ test("claims: nearest current ancestor wins when overlap count ties", () => {
   });
 });
 
-test("claims: newer claim wins when ancestry score ties", () => {
+test("claims: distinct sessions tied on live-overlap abstain (recency is not identity, H1)", () => {
   withHome((home) => {
     const tOld = makeTranscript(home, "old.jsonl");
     const tNew = makeTranscript(home, "new.jsonl");
+    // Two distinct sessions that overlap the live chain ONLY on the shared host,
+    // at the same depth — identical overlap_count and nearest_overlap_current.
+    // They differ only by recency, which says nothing about which child this is.
+    // (Recent claimed_at so neither is GC'd as too-old by the write path.)
     writeClaim({
       client_type: "codex", cwd: "/repo", ancestors: [host],
-      session_id: "old", transcript_path: tOld, server_pid: 1, claimed_at: 100,
+      session_id: "old", transcript_path: tOld, server_pid: 1, claimed_at: now(),
     });
     writeClaim({
       client_type: "codex", cwd: "/repo", ancestors: [host],
-      session_id: "new", transcript_path: tNew, server_pid: 2, claimed_at: 200,
+      session_id: "new", transcript_path: tNew, server_pid: 2, claimed_at: now() + 50,
     });
+    // Must abstain rather than adopt the newer session — adopting either risks
+    // cross-session misrouting.
+    assert.equal(recoverClaim("codex", "/repo", [host]), null);
+  });
+});
 
-    const rec = recoverClaim("codex", "/repo", [host]);
-    assert.equal(rec?.session_id, "new");
+test("claims: distinct sessions sharing only a login-shell at different depths abstain (H1)", () => {
+  withHome((home) => {
+    const t1 = makeTranscript(home, "r1.jsonl");
+    const t2 = makeTranscript(home, "r2.jsonl");
+    // A login shell two sessions were both launched under. On restart each
+    // session's own launcher re-spawned with a new pid and no longer overlaps,
+    // so the live child overlaps BOTH stored claims only on this shared shell —
+    // but at DIFFERENT record-side depths (0 vs 1).
+    const loginShell: Ancestor = { pid: 5000, sig: "Sun May 31 04:00:00 2026" };
+    writeClaim({
+      client_type: "codex", cwd: "/repo",
+      ancestors: [loginShell], // shell at record-depth 0
+      session_id: "sess-A", transcript_path: t1, server_pid: 1, claimed_at: now() + 50,
+    });
+    writeClaim({
+      client_type: "codex", cwd: "/repo",
+      ancestors: [{ pid: 6001, sig: "dead-launcher-b" }, loginShell], // shell at record-depth 1
+      session_id: "sess-B", transcript_path: t2, server_pid: 2, claimed_at: now(),
+    });
+    // Both score overlap_count=1, nearest_overlap_current=0; they differ only on
+    // nearest_overlap_record (0 vs 1) — not a meaningful signal. Must abstain.
+    assert.equal(recoverClaim("codex", "/repo", [loginShell]), null);
   });
 });
 

@@ -30,6 +30,15 @@ test("recentlyWoke: independent per key — one peer's wake doesn't debounce ano
   assert.equal(recentlyWoke(store, "99999999-0000-0000-0000-000000000000", NOW + 1), false);
 });
 
+test("recentlyWoke: a backwards clock step does not suppress wakes", () => {
+  const store = newWakeDebounceStore();
+  markWoke(store, SID, NOW);
+  // Clock steps backward (NTP correction / laptop resume): delta is negative, so
+  // the wake must NOT be treated as recent (would otherwise wedge wakes for the
+  // duration of the skew).
+  assert.equal(recentlyWoke(store, SID, NOW - 5_000), false, "negative delta is not recent");
+});
+
 test("a second wake refreshes the window", () => {
   const store = newWakeDebounceStore();
   markWoke(store, SID, NOW);

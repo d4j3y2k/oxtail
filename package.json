@@ -1,6 +1,6 @@
 {
   "name": "oxtail",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "private": false,
   "type": "module",
   "description": "Coordination layer for parallel AI coding agent sessions, exposed over MCP.",

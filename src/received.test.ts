@@ -92,11 +92,44 @@ test("received: entry survives the hook's direct file truncation", () => {
   });
 });
 
+// M4: a re-record of the same message_id (ask_peer abort recovery, chained
+// re-delivery) must replace the prior line, not append a duplicate — duplicates
+// waste the receivedMax prune budget and can evict still-needed handles early.
+test("received: re-recording the same message_id is idempotent (one ledger line)", () => {
+  withHome(() => {
+    const msg = mailbox.enqueue(4242, "answer", SENDER, { request_id: "req-1" });
+    recordReceived(RECEIVER, msg);
+    recordReceived(RECEIVER, msg); // abort-recovery re-record
+    recordReceived(RECEIVER, msg); // and again
+
+    const lines = readFileSync(receivedFilePath(RECEIVER), "utf8")
+      .split("\n")
+      .filter((l) => l.length > 0);
+    assert.equal(lines.length, 1, "duplicate message_id must not accumulate ledger lines");
+
+    const found = lookupReceived(RECEIVER, msg.id);
+    assert.ok(found, "the handle still resolves");
+    assert.equal(found!.request_id, "req-1");
+  });
+});
+
 test("received: lookupReceived returns null for an unknown id", () => {
   withHome(() => {
     const msg = mailbox.enqueue(4242, "x", SENDER);
     recordReceived(RECEIVER, msg);
     assert.equal(lookupReceived(RECEIVER, "deadbeefdeadbeef"), null);
+  });
+});
+
+// L1: a hand-written/torn ledger line with a matching id but no valid envelope
+// (missing schema_version/body) must NOT be returned as a "found" message.
+test("received: lookupReceived rejects a malformed line even if the id matches", () => {
+  withHome(() => {
+    // Seed a valid record so the ledger dir/file exist, then overwrite with a
+    // hand-written id-only line (no schema_version/body).
+    recordReceived(RECEIVER, mailbox.enqueue(4242, "seed", SENDER));
+    writeFileSync(receivedFilePath(RECEIVER), '{"id":"abc123"}\n');
+    assert.equal(lookupReceived(RECEIVER, "abc123"), null, "id-only line is not a valid envelope");
   });
 });
 

@@ -61,11 +61,14 @@ test("locks: release does not remove a lock owned by someone else", () => {
   });
 });
 
-test("locks: release with an empty token removes the lock (legacy path)", () => {
+test("locks: release with an empty token LEAVES the lock (cannot prove ownership)", () => {
   withTmp((dir) => {
     const lock = makeLock(dir, 0, null);
     releaseDirLock(lock, "");
-    assert.equal(existsSync(lock), false);
+    // An empty token reaches release only via a lockTokens Map miss; removing
+    // here would stomp whatever lock currently exists. Leave it (H3) — a leaked
+    // lock self-heals via clearStaleLock once stale.
+    assert.equal(existsSync(lock), true);
   });
 });
 
