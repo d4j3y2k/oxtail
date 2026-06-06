@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -140,6 +140,10 @@ type ReadSessionResponse = {
   session: string;
   mode: "transcript" | "pane" | "none";
   client_type: string | null;
+  resolved_session_id: string | null;
+  session_id_source: string | null;
+  transcript_mtime: string | null;
+  transcript_age_seconds: number | null;
   project_root: string;
   inferred: boolean;
   error: string | null;
@@ -304,6 +308,12 @@ test("integration: read_session rejects out-of-scope peer entry", async () => {
     assert.match(result.error ?? "", /not in project scope/);
     assert.equal(result.project_root, projectRoot);
     assert.equal(result.inferred, false);
+    // Freshness/provenance fields must be present (schema stability) and null on
+    // an error exit — clients can rely on the shape across every path.
+    assert.equal(result.resolved_session_id, null);
+    assert.equal(result.session_id_source, null);
+    assert.equal(result.transcript_mtime, null);
+    assert.equal(result.transcript_age_seconds, null);
   } finally {
     await server.cleanup();
   }
@@ -414,6 +424,174 @@ test("integration: read_session reads a transcript-capable peer with no tmux ses
       result.messages && result.messages.some((m) => m.text.includes("hello from codex peer")),
       "transcript messages should include the peer's user turn",
     );
+    // Freshness/provenance: a transcript read surfaces which identity/thread it
+    // resolved, how it was derived, and how stale the backing file is — so a
+    // caller can tell a quiet peer from a stale rotated thread.
+    assert.equal(result.resolved_session_id, codexUuid);
+    assert.equal(result.session_id_source, "self-register");
+    assert.match(result.transcript_mtime ?? "", /^\d{4}-\d{2}-\d{2}T.*Z$/);
+    assert.equal(typeof result.transcript_age_seconds, "number");
+    assert.ok((result.transcript_age_seconds ?? -1) >= 0, "age is non-negative");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("integration: read_session surfaces sticky-claim + stale transcript age (the incident shape)", async () => {
+  const server = await spawnServer();
+  try {
+    const me = await callTool<GetMySessionResponse>(server.client, "get_my_session");
+    const projectRoot = me.entry.client.cwd;
+
+    // The silent-staleness incident: a Codex peer whose registry identity was
+    // sticky-RECOVERED (env stripped on MCP-child restart) and is pinned to an
+    // OLD thread. read_session reads that stale transcript; the freshness fields
+    // must make the staleness visible — session_id_source "sticky-claim" plus a
+    // large transcript_age_seconds — so a reader knows to trust the mailbox.
+    const transcriptPath = join(server.home, "codex-stale-rollout.jsonl");
+    const rollout = [
+      {
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "old testflight thread turn" }],
+        },
+      },
+    ];
+    writeFileSync(transcriptPath, rollout.map((l) => JSON.stringify(l)).join("\n") + "\n");
+    // Backdate the file ~1 hour so age clearly reads as stale, deterministically.
+    const hourAgoSec = Math.floor(Date.now() / 1000) - 3600;
+    utimesSync(transcriptPath, hourAgoSec, hourAgoSec);
+
+    const codexUuid = "019e7d25-aaaa-7f90-a422-795f18cbd07e";
+    const peer = {
+      server_pid: process.pid,
+      started_at: Math.floor(Date.now() / 1000),
+      client: {
+        type: "codex",
+        session_id: codexUuid,
+        transcript_path: transcriptPath,
+        session_id_source: "sticky-claim",
+        cwd: projectRoot,
+      },
+      tmux_pane: null,
+      tmux_session: null,
+    };
+    const sessionsDir = join(server.home, ".oxtail", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, `${process.pid}.json`), JSON.stringify(peer, null, 2));
+
+    const result = await callTool<ReadSessionResponse>(server.client, "read_session", {
+      name: codexUuid,
+      project_root: projectRoot,
+    });
+
+    assert.equal(result.mode, "transcript", `expected transcript read, error=${result.error}`);
+    assert.equal(result.resolved_session_id, codexUuid);
+    assert.equal(result.session_id_source, "sticky-claim");
+    assert.ok(
+      (result.transcript_age_seconds ?? 0) >= 3000,
+      `stale transcript should read as old, got age=${result.transcript_age_seconds}`,
+    );
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("integration: read_session returns a structured result (not a throw) when the transcript is unreadable/rotated", async () => {
+  const server = await spawnServer();
+  try {
+    const me = await callTool<GetMySessionResponse>(server.client, "get_my_session");
+    const projectRoot = me.entry.client.cwd;
+
+    // The reader guards a *missing* file (returns empty), but a transcript that
+    // exists yet can't be read — rotated into a directory, EISDIR/EACCES, or
+    // deleted in the existsSync->read gap — used to throw out of readSession and
+    // surface as an MCP error, denying the caller any signal. A directory at the
+    // transcript_path deterministically makes readFileSync throw EISDIR. The
+    // tool must now return a structured ReadResult that still carries provenance.
+    const transcriptPath = join(server.home, "rotated-into-a-directory");
+    mkdirSync(transcriptPath, { recursive: true });
+
+    const codexUuid = "019e7d25-bbbb-7f90-a422-795f18cbd07e";
+    const peer = {
+      server_pid: process.pid,
+      started_at: Math.floor(Date.now() / 1000),
+      client: {
+        type: "codex",
+        session_id: codexUuid,
+        transcript_path: transcriptPath,
+        session_id_source: "sticky-claim",
+        cwd: projectRoot,
+      },
+      tmux_pane: null,
+      tmux_session: null,
+    };
+    const sessionsDir = join(server.home, ".oxtail", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, `${process.pid}.json`), JSON.stringify(peer, null, 2));
+
+    // callTool would THROW (MCP isError) if readSession threw; reaching the
+    // assertions at all proves the read failure was caught and structured.
+    const result = await callTool<ReadSessionResponse>(server.client, "read_session", {
+      name: codexUuid,
+      project_root: projectRoot,
+    });
+
+    assert.match(result.error ?? "", /transcript read failed/, "unreadable transcript → structured error, not a throw");
+    // Provenance survives the read failure so the caller can still see it was a
+    // stale sticky-claim identity rather than getting an opaque exception.
+    assert.equal(result.resolved_session_id, codexUuid);
+    assert.equal(result.session_id_source, "sticky-claim");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("integration: read_session carries provenance on the in-scope no-transcript error path", async () => {
+  const server = await spawnServer();
+  try {
+    const me = await callTool<GetMySessionResponse>(server.client, "get_my_session");
+    const projectRoot = me.entry.client.cwd;
+
+    // A registered, in-scope peer whose registry entry has neither a transcript
+    // nor a tmux session (e.g. a sticky-claim identity not yet resolved to a
+    // transcript). This hits the in-scope "nothing to read" error exit — but the
+    // provenance is on the registry entry and must ride along, so a staleness-
+    // aware caller can still distinguish a sticky-claim peer from a genuinely
+    // unknown target. (The out-of-scope/unknown/ambiguous exits intentionally
+    // leave it null — emitting an out-of-project id would leak across scope.)
+    const codexUuid = "019e7d25-cccc-7f90-a422-795f18cbd07e";
+    const peer = {
+      server_pid: process.pid,
+      started_at: Math.floor(Date.now() / 1000),
+      client: {
+        type: "codex",
+        session_id: codexUuid,
+        transcript_path: null,
+        session_id_source: "sticky-claim",
+        cwd: projectRoot,
+      },
+      tmux_pane: null,
+      tmux_session: null,
+    };
+    const sessionsDir = join(server.home, ".oxtail", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, `${process.pid}.json`), JSON.stringify(peer, null, 2));
+
+    const result = await callTool<ReadSessionResponse>(server.client, "read_session", {
+      name: codexUuid,
+      project_root: projectRoot,
+    });
+
+    assert.equal(result.mode, "none");
+    assert.match(result.error ?? "", /no transcript and no tmux session/);
+    assert.equal(result.resolved_session_id, codexUuid);
+    assert.equal(result.session_id_source, "sticky-claim");
+    // Transcript freshness genuinely doesn't apply here (no transcript) → null.
+    assert.equal(result.transcript_mtime, null);
+    assert.equal(result.transcript_age_seconds, null);
   } finally {
     await server.cleanup();
   }
