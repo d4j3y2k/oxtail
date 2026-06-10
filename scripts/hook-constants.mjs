@@ -45,10 +45,17 @@ export const HOOK_MARKER_KEY = "_oxtailHook";
 //       with the server. A stale pre-v8 hook keeps draining LEGACY pid boxes
 //       correctly but never sees the session box — and a v0.17+ peer's sends
 //       route there — so the upgrade warning matters: re-run install-hook.
+//   v9: SessionStart auto-join drop. New sessionstart.sh writes the hook's
+//       stdin payload (session_id, cwd, transcript_path) + the writing hook's
+//       $PPID/start-sig to ~/.oxtail/session-starts/<safe_sid>; the server's
+//       hook-drop detect strategy adopts it (ancestry-disambiguated), removing
+//       the manual /oxtail-join ceremony for hooked Claude Code sessions. A
+//       missing/stale sessionstart.sh just means detection falls back to the
+//       explicit claim — never wrong, only manual.
 // INVARIANT: any change to an assets/*.sh script or the helper sources MUST
 // bump this version, so existing installs are forced to re-install.
 // scripts/check-hook-version.mjs enforces this in CI.
-export const HOOK_MARKER_VERSION = 8;
+export const HOOK_MARKER_VERSION = 9;
 
 const HOOKS_DIR = path.join(os.homedir(), ".oxtail", "hooks");
 
@@ -81,6 +88,13 @@ export const MANAGED_HOOKS = [
     asset: "userpromptsubmit.sh",
     scriptPath: path.join(HOOKS_DIR, "userpromptsubmit.sh"),
     command: `"$HOME/.oxtail/hooks/userpromptsubmit.sh"`,
+  },
+  {
+    id: "sessionstart",
+    event: "SessionStart",
+    asset: "sessionstart.sh",
+    scriptPath: path.join(HOOKS_DIR, "sessionstart.sh"),
+    command: `"$HOME/.oxtail/hooks/sessionstart.sh"`,
   },
 ];
 
