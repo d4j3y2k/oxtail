@@ -105,5 +105,8 @@ helper="${OXTAIL_HOOK_HELPER:-$script_dir/hook-drain.mjs}"
 node_bin="__OXTAIL_NODE__"
 [ -x "$node_bin" ] || node_bin=$(command -v node 2>/dev/null || true)
 { [ -n "$node_bin" ] && [ -x "$node_bin" ]; } || exit 0
-"$node_bin" "$helper" --event pretooluse --protocol 1 "${boxes[@]}" || true
+# --sid lets the helper write delivery receipts attributed to this session
+# (sid is UUID-charset-gated above). An older installed helper routes the flag
+# into its box-path list, where path validation discards it — fail open.
+"$node_bin" "$helper" --event pretooluse --protocol 1 --sid "$sid" "${boxes[@]}" || true
 exit 0

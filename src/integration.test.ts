@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { readAll, register, type RegistryEntry } from "./registry.js";
-import { drain, enqueue } from "./mailbox.js";
+import { drain, enqueue, recordDelivered } from "./mailbox.js";
 import { recordReceived } from "./received.js";
 import { recordPendingAsk } from "./pending-ask.js";
 
@@ -2694,6 +2694,123 @@ test("phase-a: tool responses are minified JSON, schema fields intact, smaller t
     assert.equal(listText, JSON.stringify(listParsed), "list response must be minified");
     assert.equal(listParsed.schema_version, 1, "list schema_version preserved");
     assert.ok(Array.isArray(listParsed.sessions), "sessions[] shape preserved");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+type MessageStatusResponse = {
+  schema_version: 1;
+  ok: true;
+  message_id: string;
+  status: "delivered" | "pending" | "unknown";
+  delivered_at?: number;
+  via?: string;
+  recipient_session_id?: string | null;
+  enqueued_at?: number;
+  note?: string;
+};
+
+test("receipts: message_status walks pending → delivered → unknown across the message lifecycle", async () => {
+  const server = await spawnServer();
+  try {
+    const peerPid = process.pid;
+    const peerSessionId = "deadbeef-1111-4222-8333-444455556666";
+    seedPeerEntry(server.home, {
+      server_pid: peerPid,
+      session_id: peerSessionId,
+      tmux_session: "status-peer",
+      cwd: server.home,
+    });
+
+    const sent = await callTool<SendOk | SendErr>(server.client, "send_message", {
+      target: "status-peer",
+      body: "track me",
+    });
+    assert.equal(sent.ok, true, JSON.stringify(sent));
+    const messageId = (sent as SendOk).message_id;
+
+    // Still queued in the peer's inbox → pending (outbox record locates it).
+    const pending = await callTool<MessageStatusResponse>(server.client, "message_status", {
+      message_id: messageId,
+    });
+    assert.equal(pending.status, "pending", JSON.stringify(pending));
+    assert.ok(pending.enqueued_at! > 0);
+
+    // The recipient hands it into context (simulated with the same writer the
+    // real read paths use) → delivered, attributed.
+    const prev = process.env.HOME;
+    process.env.HOME = server.home;
+    try {
+      const drained = drain(peerPid);
+      assert.equal(drained.length, 1);
+      recordDelivered([drained[0].id], "read_my_messages", peerSessionId);
+    } finally {
+      process.env.HOME = prev;
+    }
+    const delivered = await callTool<MessageStatusResponse>(server.client, "message_status", {
+      message_id: messageId,
+    });
+    assert.equal(delivered.status, "delivered");
+    assert.equal(delivered.via, "read_my_messages");
+    assert.equal(delivered.recipient_session_id, peerSessionId);
+
+    // A different message drained WITHOUT a receipt (pre-receipt reader) →
+    // honest unknown, not failure.
+    const sent2 = await callTool<SendOk>(server.client, "send_message", {
+      target: "status-peer",
+      body: "silently drained",
+    });
+    process.env.HOME = server.home;
+    try {
+      drain(peerPid);
+    } finally {
+      process.env.HOME = prev;
+    }
+    const unknown = await callTool<MessageStatusResponse>(server.client, "message_status", {
+      message_id: sent2.message_id,
+    });
+    assert.equal(unknown.status, "unknown");
+    assert.match(unknown.note ?? "", /pre-receipt/);
+
+    // A never-sent id → unknown with the no-outbox note.
+    const ghost = await callTool<MessageStatusResponse>(server.client, "message_status", {
+      message_id: "0123456789abcdef",
+    });
+    assert.equal(ghost.status, "unknown");
+    assert.match(ghost.note ?? "", /no outbox record/);
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("receipts: read_my_messages writes receipts for what it returns", async () => {
+  const server = await spawnServer();
+  try {
+    // Enqueue directly into the spawned server's own pid box, then have IT
+    // drain via the tool — the drain must leave a receipt in ITS home.
+    const prev = process.env.HOME;
+    let sentId: string;
+    process.env.HOME = server.home;
+    try {
+      const all = readAll();
+      assert.equal(all.length, 1, "spawned server registered itself");
+      sentId = enqueue(all[0].server_pid, "receipt via tool", "some-sender").id;
+    } finally {
+      process.env.HOME = prev;
+    }
+    const read = await callTool<ReadMyMessagesResponse>(server.client, "read_my_messages", {});
+    assert.equal(read.count, 1);
+
+    process.env.HOME = server.home;
+    try {
+      const { readDeliveryReceipt } = await import("./mailbox.js");
+      const r = readDeliveryReceipt(sentId!);
+      assert.ok(r, "read_my_messages must receipt what it returned");
+      assert.equal(r!.via, "read_my_messages");
+    } finally {
+      process.env.HOME = prev;
+    }
   } finally {
     await server.cleanup();
   }

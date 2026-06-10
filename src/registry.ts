@@ -13,6 +13,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ClientInfo } from "./clients.js";
 import {
+  gcDeliveryArtifacts,
   gcOrphanMailboxes,
   mailboxHasMessages,
   mailboxSessionKey,
@@ -400,6 +401,7 @@ function gcOrphanMailboxesFromRegistry(): void {
       }
     }
     gcOrphanMailboxes(pids, sessionKeys);
+    gcDeliveryArtifacts();
   } catch {
     // housekeeping must never break registration
   }

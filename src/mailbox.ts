@@ -611,6 +611,161 @@ export function mailboxLockPath(box: BoxId): string {
   return lockPath(box);
 }
 
+// ── delivery receipts + sender outbox ────────────────────────────────────────
+// A receipt answers the sender's question read_session never could: "did my
+// message actually reach the peer's CONTEXT, and when?" — turning "is Codex
+// asleep or just slow?" from vibes into data. Written by the RECIPIENT side at
+// the moment a message is handed to the agent (hook envelope, read_my_messages
+// return, ask_peer reply drain), one tiny JSON file per message_id, write-once
+// (first delivery wins; duplicate writes are EEXIST no-ops). The sender's
+// outbox record (written at enqueue) lets message_status distinguish "still
+// queued in an inbox box" from "gone with no receipt". Both stores are
+// best-effort — a write failure must never affect the delivery itself — and
+// are pruned by mtime alongside the orphan-mailbox GC.
+//
+// Lives here (not its own module) because mailbox.js ships in the installed
+// hook helper closure (HELPER_FILES): the PreToolUse/Stop hook delivery path
+// must write receipts with the same code the server uses.
+
+const MESSAGE_ID_RE = /^[0-9a-f]{16}$/;
+
+function receiptsDir(): string {
+  return join(homedir(), ".oxtail", "receipts");
+}
+
+function outboxDir(): string {
+  return join(homedir(), ".oxtail", "outbox");
+}
+
+export type ReceiptVia = "hook" | "read_my_messages" | "ask_peer_reply";
+
+export type DeliveryReceipt = {
+  schema_version: 1;
+  message_id: string;
+  delivered_at: number; // unix seconds
+  via: ReceiptVia;
+  recipient_session_id: string | null;
+};
+
+export type OutboxRecord = {
+  schema_version: 1;
+  message_id: string;
+  enqueued_at: number; // unix seconds
+  target_session_id: string | null;
+  target_server_pid: number;
+  from_session_id: string | null;
+};
+
+// Record that `ids` were handed to the agent. Write-once via O_EXCL: the first
+// delivery event wins (re-delivered duplicates must not move delivered_at).
+export function recordDelivered(
+  ids: string[],
+  via: ReceiptVia,
+  recipientSessionId: string | null,
+  nowSec: number = Math.floor(Date.now() / 1000),
+): void {
+  let dirReady = false;
+  for (const id of ids) {
+    if (!MESSAGE_ID_RE.test(id)) continue; // id is the filename — shape-gate it
+    try {
+      if (!dirReady) {
+        mkdirSync(receiptsDir(), { recursive: true, mode: 0o700 });
+        dirReady = true;
+      }
+      const receipt: DeliveryReceipt = {
+        schema_version: 1,
+        message_id: id,
+        delivered_at: nowSec,
+        via,
+        recipient_session_id: recipientSessionId,
+      };
+      writeFileSync(join(receiptsDir(), id), JSON.stringify(receipt), {
+        mode: 0o600,
+        flag: "wx",
+      });
+    } catch {
+      // EEXIST (already receipted) or any IO failure: receipts are best-effort.
+    }
+  }
+}
+
+export function readDeliveryReceipt(messageId: string): DeliveryReceipt | null {
+  if (!MESSAGE_ID_RE.test(messageId)) return null;
+  try {
+    const d = JSON.parse(readFileSync(join(receiptsDir(), messageId), "utf8")) as DeliveryReceipt;
+    if (!d || d.schema_version !== 1 || d.message_id !== messageId) return null;
+    return d;
+  } catch {
+    return null;
+  }
+}
+
+export function recordOutbox(rec: OutboxRecord): void {
+  if (!MESSAGE_ID_RE.test(rec.message_id)) return;
+  try {
+    mkdirSync(outboxDir(), { recursive: true, mode: 0o700 });
+    writeFileSync(join(outboxDir(), rec.message_id), JSON.stringify(rec), {
+      mode: 0o600,
+      flag: "wx",
+    });
+  } catch {
+    // best-effort: a missing outbox record only degrades message_status detail
+  }
+}
+
+export function readOutboxRecord(messageId: string): OutboxRecord | null {
+  if (!MESSAGE_ID_RE.test(messageId)) return null;
+  try {
+    const d = JSON.parse(readFileSync(join(outboxDir(), messageId), "utf8")) as OutboxRecord;
+    if (!d || d.schema_version !== 1 || d.message_id !== messageId) return null;
+    return d;
+  } catch {
+    return null;
+  }
+}
+
+// Lock-free read-only peek for message_status's "pending" check. Torn lines are
+// skipped by the parser; a racing drain just flips the answer to "not here",
+// which the caller resolves via the receipt that drain writes.
+export function boxContainsMessageId(box: BoxId, messageId: string): boolean {
+  let raw: string;
+  try {
+    raw = readFileSync(mailboxPath(box), "utf8");
+  } catch {
+    return false;
+  }
+  return parseMailboxRecords(raw, { via: "status-peek" }).some((m) => m.id === messageId);
+}
+
+const DELIVERY_ARTIFACT_TTL_MS = 7 * 24 * 3_600_000;
+
+// Prune aged receipts/outbox records (mtime-based). Same cadence and the same
+// best-effort posture as gcOrphanMailboxes; called from register().
+export function gcDeliveryArtifacts(nowMs: number = Date.now()): number {
+  let removed = 0;
+  for (const dir of [receiptsDir(), outboxDir()]) {
+    let files: string[];
+    try {
+      files = readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const f of files) {
+      if (!MESSAGE_ID_RE.test(f)) continue;
+      const full = join(dir, f);
+      try {
+        if (nowMs - statSync(full).mtimeMs > DELIVERY_ARTIFACT_TTL_MS) {
+          unlinkSync(full);
+          removed++;
+        }
+      } catch {
+        // vanished or unreadable — skip
+      }
+    }
+  }
+  return removed;
+}
+
 // Empty boxes only become garbage once nothing references them: a dead pid's
 // registry breadcrumb is reaped as soon as its box is empty (readAll), after
 // which the box file itself lingered forever — dozens of 0-byte .jsonl files

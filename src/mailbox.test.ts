@@ -971,3 +971,56 @@ test("mailbox gc: removes only EMPTY, OLD, UNREFERENCED boxes (and their lock si
     assert.equal(mailbox.drain(70001).length, 1, "deleted box recreates on enqueue");
   });
 });
+
+test("receipts: write-once recordDelivered + readDeliveryReceipt round-trip", () => {
+  withHome((home) => {
+    const sent = mailbox.enqueue(81101, "receipt me", "sender-sid");
+    mailbox.recordDelivered([sent.id], "read_my_messages", "recip-sid", 1000);
+    const r = mailbox.readDeliveryReceipt(sent.id);
+    assert.ok(r);
+    assert.equal(r!.delivered_at, 1000);
+    assert.equal(r!.via, "read_my_messages");
+    assert.equal(r!.recipient_session_id, "recip-sid");
+    // Write-once: a re-delivered duplicate must NOT move delivered_at.
+    mailbox.recordDelivered([sent.id], "hook", null, 2000);
+    assert.equal(mailbox.readDeliveryReceipt(sent.id)!.delivered_at, 1000);
+    // Hostile ids never become filenames.
+    mailbox.recordDelivered(["../../evil", "", "zz"], "hook", null);
+    assert.equal(mailbox.readDeliveryReceipt("../../evil" as string), null);
+    assert.ok(!existsSync(join(home, ".oxtail", "evil")));
+  });
+});
+
+test("receipts: outbox record + boxContainsMessageId power the pending check", () => {
+  withHome(() => {
+    const sent = mailbox.enqueue(81102, "pending body", "sender-sid");
+    mailbox.recordOutbox({
+      schema_version: 1,
+      message_id: sent.id,
+      enqueued_at: sent.enqueued_at,
+      target_session_id: null,
+      target_server_pid: 81102,
+      from_session_id: "sender-sid",
+    });
+    const out = mailbox.readOutboxRecord(sent.id);
+    assert.ok(out);
+    assert.equal(out!.target_server_pid, 81102);
+    assert.equal(mailbox.boxContainsMessageId(81102, sent.id), true, "still queued");
+    mailbox.drain(81102);
+    assert.equal(mailbox.boxContainsMessageId(81102, sent.id), false, "drained");
+  });
+});
+
+test("receipts: gcDeliveryArtifacts prunes only aged records", () => {
+  withHome((home) => {
+    const fresh = mailbox.enqueue(81103, "a", "s");
+    const stale = mailbox.enqueue(81103, "b", "s");
+    mailbox.recordDelivered([fresh.id, stale.id], "hook", null);
+    const old = (Date.now() - 8 * 24 * 3_600_000) / 1000;
+    utimesSync(join(home, ".oxtail", "receipts", stale.id), old, old);
+    const removed = mailbox.gcDeliveryArtifacts();
+    assert.equal(removed, 1);
+    assert.ok(mailbox.readDeliveryReceipt(fresh.id), "fresh receipt kept");
+    assert.equal(mailbox.readDeliveryReceipt(stale.id), null, "aged receipt pruned");
+  });
+});

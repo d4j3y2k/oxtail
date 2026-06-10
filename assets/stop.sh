@@ -121,6 +121,7 @@ if [ ! -f "$helper" ] || [ -z "$node_bin" ] || [ ! -x "$node_bin" ]; then
   exit 0
 fi
 rc=0
-"$node_bin" "$helper" --event stop --protocol 1 "${boxes[@]}" || rc=$?
+# --sid: delivery-receipt attribution (UUID-gated above); old helpers discard it.
+"$node_bin" "$helper" --event stop --protocol 1 --sid "$sid" "${boxes[@]}" || rc=$?
 [ "$rc" -eq 3 ] || mark_idle
 exit 0

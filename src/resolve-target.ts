@@ -96,7 +96,23 @@ export function resolveTarget(target: string, caller: RegistryEntry): ResolveOk 
     return true;
   });
 
-  if (candidates.length === 0) return { ok: false, error: "target-not-found" };
+  // Self-exclusion BEFORE the ambiguity count: the caller's own entry (and any
+  // dual-scope MCP sibling sharing its claimed session_id) is never a peer
+  // candidate. Without this, name-targeting a shared tmux session counted US
+  // toward ambiguity — the live v0.17.1-era failure shape: [caller(claimed),
+  // codex(unclaimed)] returned ambiguous-target whose only listed candidate was
+  // the caller itself, making the sole real peer unreachable in-band. Track
+  // whether self matched so a target that resolves ONLY to us still reports
+  // self-send rather than target-not-found.
+  const isSelf = (e: RegistryEntry): boolean =>
+    e.server_pid === caller.server_pid ||
+    (caller.client.session_id != null && e.client.session_id === caller.client.session_id);
+  const selfMatched = candidates.some(isSelf);
+  candidates = candidates.filter((e) => !isSelf(e));
+
+  if (candidates.length === 0) {
+    return { ok: false, error: selfMatched ? "self-send" : "target-not-found" };
+  }
   if (candidates.length > 1) {
     // Only claimed session_ids are addressable; an unclaimed peer has no UUID to
     // hand back. Don't emit a `pid:<n>` pseudo-handle — it isn't a routable
@@ -118,14 +134,13 @@ export function resolveTarget(target: string, caller: RegistryEntry): ResolveOk 
         : {}),
     };
   }
+  // Exactly one non-self peer. It may be UNCLAIMED (client.session_id null) —
+  // that is now a routable bootstrap target: delivery lands in its legacy pid
+  // box (DeliveryRoute handles a null session_id) and a wake reaches its
+  // verified pane, so the peer can be nudged to claim_session in-band instead
+  // of requiring a human tmux relay. Tools that NEED a claimed identity for
+  // correlation (ask_peer, reply waits) keep their own explicit guards.
   const peer = candidates[0];
-  if (
-    peer.server_pid === caller.server_pid ||
-    (caller.client.session_id &&
-      peer.client.session_id === caller.client.session_id)
-  ) {
-    return { ok: false, error: "self-send" };
-  }
   if (!projectRootsMatch(caller, peer)) return { ok: false, error: "cross-project" };
   return { ok: true, entry: peer };
 }

@@ -60,10 +60,18 @@ export const HOOK_MARKER_KEY = "_oxtailHook";
 //       confirm against a v0.17.1+ server; the hook fix keeps the on-disk
 //       drop canonical. hook-drain.ts: truncate a non-empty box whose lines
 //       are ALL torn/invalid so it stops re-spawning the helper every call.
+//  v11: delivery receipts. The hooks pass `--sid <session uuid>` so the
+//       hook-drain helper can write a receipt (~/.oxtail/receipts/<message_id>,
+//       via mailbox.js recordDelivered) for every message it hands into the
+//       agent's context — powering the sender-side message_status tool.
+//       Compatibility is structural in both directions: an old helper routes
+//       the unknown flag into its box-path list where validation discards it
+//       (delivery intact, no receipts), and a new helper without --sid records
+//       receipts with a null recipient.
 // INVARIANT: any change to an assets/*.sh script or the helper sources MUST
 // bump this version, so existing installs are forced to re-install.
 // scripts/check-hook-version.mjs enforces this in CI.
-export const HOOK_MARKER_VERSION = 10;
+export const HOOK_MARKER_VERSION = 11;
 
 const HOOKS_DIR = path.join(os.homedir(), ".oxtail", "hooks");
 

@@ -134,3 +134,48 @@ test("hook-drain: successful write truncates and reports delivered", () => {
     assert.ok(envelope.reason.includes("request_id=rq-9"));
   });
 });
+
+test("hook-drain: --sid writes delivery receipts on the delivered path only", () => {
+  withHome((home) => {
+    const sid = "12345678-1234-4321-8765-1234567890ab";
+    const box = mailbox.mailboxSessionKey(sid);
+    const sent = mailbox.enqueue(box, "receipted body", "sender-sid");
+    const out = openSync(join(home, "env.json"), "w");
+    let code: number;
+    try {
+      code = runHookDrain(
+        ["--event", "pretooluse", "--protocol", "1", "--sid", sid, mailbox.mailboxFilePath(box)],
+        process.env,
+        out,
+      );
+    } finally {
+      closeSync(out);
+    }
+    assert.equal(code, EXIT_DELIVERED);
+    const receipt = mailbox.readDeliveryReceipt(sent.id);
+    assert.ok(receipt, "delivered envelope must leave a receipt");
+    assert.equal(receipt!.via, "hook");
+    assert.equal(receipt!.recipient_session_id, sid);
+
+    // Failed stdout write (fail-open path) must NOT leave a receipt.
+    const sent2 = mailbox.enqueue(box, "must not receipt", "sender-sid");
+    const closed = openSync(join(home, "scratch2"), "w");
+    closeSync(closed);
+    const code2 = runHookDrain(
+      ["--event", "pretooluse", "--protocol", "1", "--sid", sid, mailbox.mailboxFilePath(box)],
+      process.env,
+      closed,
+    );
+    assert.equal(code2, EXIT_NOTHING);
+    assert.equal(mailbox.readDeliveryReceipt(sent2.id), null, "no envelope → no receipt");
+  });
+});
+
+test("hook-drain: a malformed --sid is dropped, an old-helper-style stray flag is discarded as a non-box", () => {
+  const ok = parseArgs(["--event", "stop", "--protocol", "1", "--sid", "not-a-uuid", "/a.jsonl"]);
+  assert.ok(ok);
+  assert.equal(ok!.sid, null, "shape-gated");
+  assert.deepEqual(ok!.boxes, ["/a.jsonl"]);
+  // Old helpers route unknown flags into boxes; isValidMailboxPath rejects them.
+  assert.ok(!isValidMailboxPath("--sid", "/Users/x"));
+});
