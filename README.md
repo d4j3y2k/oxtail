@@ -21,7 +21,7 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 **Claude Code** — add to `~/.claude.json` (global) or any project's `.mcp.json`:
 
 ```jsonc
-{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.10.1"] } } }
+{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.16.2"] } } }
 ```
 
 **Codex CLI** — add to `~/.codex/config.toml`:
@@ -29,14 +29,14 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 ```toml
 [mcp_servers.oxtail]
 command = "npx"
-args = ["-y", "oxtail@0.10.1"]
+args = ["-y", "oxtail@0.16.2"]
 ```
 
 **Claude slash command** (`/oxtail-join`):
 
 ```sh
 mkdir -p ~/.claude/commands
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.13.0/.claude/commands/oxtail-join.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.16.2/.claude/commands/oxtail-join.md \
   -o ~/.claude/commands/oxtail-join.md
 ```
 
@@ -44,9 +44,9 @@ curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.13.0/.claude/command
 
 ```sh
 mkdir -p ~/.codex/skills/oxtail-join/agents
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.13.0/integrations/codex/oxtail-join/SKILL.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.16.2/integrations/codex/oxtail-join/SKILL.md \
   -o ~/.codex/skills/oxtail-join/SKILL.md
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.13.0/integrations/codex/oxtail-join/agents/openai.yaml \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.16.2/integrations/codex/oxtail-join/agents/openai.yaml \
   -o ~/.codex/skills/oxtail-join/agents/openai.yaml
 ```
 
@@ -72,7 +72,7 @@ Contributing? `git clone https://github.com/d4j3y2k/oxtail && cd oxtail && npm i
 - `register_my_session` — pin this MCP server's `session_id` directly. Kept for debugging; prefer `claim_session`.
 - `get_my_session` — return this MCP server's own registry entry plus a per-strategy detection diagnosis. Useful for debugging.
 
-See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.13.0/AGENTS.md) for scope and architecture.
+See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.16.2/AGENTS.md) for scope and architecture.
 
 ## Usage from an agent
 
@@ -247,7 +247,7 @@ All wake paths funnel through one place, which **coalesces** rapid repeat wakes 
 If `ask_peer` returns an abort error before its built-in 60s timeout fires, your MCP client's tool-call ceiling is lower than 60s. Override the bound at server startup:
 
 ```sh
-OXTAIL_ASK_PEER_TIMEOUT_MS=30000 npx -y oxtail@0.10.1
+OXTAIL_ASK_PEER_TIMEOUT_MS=30000 npx -y oxtail@0.16.2
 ```
 
 The server reads the env var once at boot and uses it as the fixed timeout for all `ask_peer` calls in that session. Values must be positive numbers; anything else falls back to the 60000ms default.
@@ -325,8 +325,11 @@ A scheduled CI job (`.github/workflows/codex-drift.yml`, also runnable on demand
 
 ## Status
 
-v0.15.0. Pushes the autonomous peer-messaging matrix toward zero human relay, hardens the wake path, makes correlated replies atomic, and makes delegation durable across long (minutes-to-hours) efforts.
+v0.16.2. Pushes the autonomous peer-messaging matrix toward zero human relay, hardens the wake/delivery core against crash and race classes, makes delegation durable across long (minutes-to-hours) efforts, and makes the read side staleness-honest.
 
+- **`read_session` freshness/provenance (v0.16.2).** Every `read_session` return now says *which* identity/thread it read and how it was derived (`resolved_session_id`, `session_id_source`) and how stale the backing transcript is (`transcript_mtime`, `transcript_age_seconds`) — closing a silent false-negative where a sticky-recovered identity pinned to an old transcript read as "peer never replied" while the peer was live elsewhere. The tool is documented as browse/diagnostic only: confirm a reply via the mailbox (`read_my_messages` / the `ask_peer` correlated reply), never via `read_session`.
+- **Receive convention for no-hook peers (v0.16.1).** The `read_my_messages` description no longer says no-hook peers "must poll" — observed live, that wording sent an idle Codex into sleep-loop polling and a 100s blocking `ask_peer` that bought nothing. Delivery is sender-driven: a wake-bearing send re-invokes an idle peer's pane; the receiver reads once at the start of that turn, acts, and ends the turn. The Codex join skill documents the same standing convention ("idle is safe — trust the wake").
+- **Compile-sim hardening (v0.16.0).** A 3-lens compile-sim pass (strict frontend / concrete interpreter / symbolic path explorer) over the delivery core surfaced 4 HIGH + 5 MEDIUM + 4 LOW correctness fixes — including `recoverClaim` abstaining instead of guessing, a wall-clock (not retry-count) lock-acquire budget, a `proc_sig` start-time signature that detects OS pid reuse before waking a stranger's pane, and torn-line-safe mailbox migration.
 - **Durable `ask_peer` + long-effort liveness (v0.15.0).** A timed-out `ask_peer` records a pending obligation (`~/.oxtail/pending-ask/`, keyed on requester `session_id` + `request_id`, written *before* a final authoritative union-drain), so the peer's reply — arriving minutes or hours later — *wakes the requester back* (`wake_reason: "late_reply_to_pending"`) instead of landing silently. The pull-back takes the lenient wake path, so it reaches even a markerless idle Codex requester — closing the last wake-on-reply asymmetry. The reply drain unions the requester's sibling MCP-child pids (and sweeps migrate-crash duplicates) so a dual-scope reply can't strand. Separately, the `PreToolUse` hook now re-stamps the `busy` marker every tool call, so a long *active* turn never reads as stale-busy and invites a spurious wake. New env: `OXTAIL_PENDING_ASK_TTL_MS` (1h), `OXTAIL_ACTIVITY_BUSY_TTL_MS` (10m); `ask_peer` default timeout 45s→60s.
 - **Reply by id (v0.13.0).** `reply_to_message(message_id, body)` removes the manual `target` + `reply_to` rewiring that silently degraded a correlated exchange into loose mailbox traffic: the server looks the inbound envelope up in a durable per-session **received-ledger** (`~/.oxtail/received/<hash(session_id)>.jsonl`), derives the reply target and `reply_to` itself, and enforces ownership structurally (you can only reply to a message delivered to you). The ledger is written *before* the mailbox line is visible — so a handle the hook displays is always resolvable even though both delivery paths destroy the queue entry once it is handed off. Fail-closed on an unknown/aged-out id.
 - **Wake-on-reply (v0.11.0).** A reply — `send_message` with `reply_to` — auto-wakes a freshly-idle requester by default, so an awaited answer doesn't strand an idle peer. Strictly gated (fresh-idle only, per-target rate limit, one-wake dedupe, `OXTAIL_AUTOWAKE=off` kill-switch). `wake:"off"` opts out; explicit `wake:"auto"` is the escape hatch for a requester without an idle marker (Codex / hookless Claude).
