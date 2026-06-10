@@ -104,6 +104,17 @@ export function deliverToPeer(
     }
   }
   deliver(route, msg);
+  // Sender-side outbox record, AFTER the enqueue succeeded: message_status uses
+  // it to locate the recipient's inbox (pending vs gone) when no delivery
+  // receipt exists yet. Best-effort — the delivery above is already done.
+  mailbox.recordOutbox({
+    schema_version: 1,
+    message_id: msg.id,
+    enqueued_at: msg.enqueued_at,
+    target_session_id: route.session_id ?? null,
+    target_server_pid: route.server_pid,
+    from_session_id: fromSessionId ?? null,
+  });
   return msg;
 }
 

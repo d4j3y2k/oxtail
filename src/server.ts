@@ -1205,8 +1205,90 @@ server.registerTool(
       message_id: msg.id,
       target_session_id: peer.client.session_id,
       target_server_pid: peer.server_pid,
+      ...(peer.client.session_id == null
+        ? {
+            bootstrap: true,
+            note: "Target is UNCLAIMED: delivered to its pid box (it will see this via read_my_messages); a wake reaches its pane, but it cannot be addressed by UUID or reply with correlation until it runs claim_session — consider instructing that in the body.",
+          }
+        : {}),
       ...(wake_status ? { wake_status } : {}),
       ...(wake_reason ? { wake_reason } : {}),
+    });
+  },
+);
+
+server.registerTool(
+  "message_status",
+  {
+    description: [
+      "Check whether a message you sent has actually reached the peer's context. Pass the message_id returned by send_message / reply_to_message / ask_peer. Status is one of:",
+      '"delivered" — the recipient\'s hook envelope, read_my_messages, or ask_peer reply drain handed it to the agent; includes delivered_at (unix seconds), via ("hook" | "read_my_messages" | "ask_peer_reply"), and recipient_session_id when known.',
+      '"pending" — still sitting in the recipient\'s inbox boxes (enqueued but not yet read). The peer sees it at its next hook event or read_my_messages; wake it (send_message wake:"auto") if it needs prompting.',
+      '"unknown" — no receipt and not found in any inbox box. Causes: the recipient runs a pre-receipt oxtail (≤v0.17) or a hook helper older than v11 (delivered silently), the id is wrong or from another machine, or the records aged out (receipts/outbox are pruned after ~7 days). Treat as "probably delivered, unverifiable" for old peers — not as failure.',
+      "Receipts are written by the RECIPIENT side at hand-off time and are write-once (first delivery wins; re-delivered duplicates do not move delivered_at). This is delivery-into-context, not proof the agent acted on it — for an acknowledged exchange use ask_peer.",
+    ].join(" "),
+    inputSchema: {
+      message_id: z
+        .string()
+        .regex(/^[0-9a-f]{16}$/, "message_id is the 16-hex id returned by the send tools")
+        .describe("The message_id returned when you sent the message."),
+    },
+  },
+  async ({ message_id }) => {
+    const receipt = mailbox.readDeliveryReceipt(message_id);
+    if (receipt) {
+      return jsonResult({
+        schema_version: 1,
+        ok: true,
+        message_id,
+        status: "delivered",
+        delivered_at: receipt.delivered_at,
+        via: receipt.via,
+        recipient_session_id: receipt.recipient_session_id,
+      });
+    }
+    const out = mailbox.readOutboxRecord(message_id);
+    if (out) {
+      // Look where the recipient's readers would look: its full inbox union
+      // (session box + pid siblings) when the target was claimed, else just the
+      // pid box the unclaimed delivery landed in. Lock-free peek — a racing
+      // drain flips this to "not found", and the receipt that drain writes is
+      // what the caller's retry will see.
+      const targetBoxes = inboxBoxes(out.target_server_pid, out.target_session_id);
+      const pending = targetBoxes.some((b) => {
+        try {
+          return mailbox.boxContainsMessageId(b, message_id);
+        } catch {
+          return false;
+        }
+      });
+      if (pending) {
+        return jsonResult({
+          schema_version: 1,
+          ok: true,
+          message_id,
+          status: "pending",
+          enqueued_at: out.enqueued_at,
+          target_session_id: out.target_session_id,
+          target_server_pid: out.target_server_pid,
+        });
+      }
+      return jsonResult({
+        schema_version: 1,
+        ok: true,
+        message_id,
+        status: "unknown",
+        enqueued_at: out.enqueued_at,
+        target_session_id: out.target_session_id,
+        note: "Enqueued, but no delivery receipt and no longer in any inbox box. Most likely the recipient drained it with a pre-receipt reader (oxtail ≤v0.17 or a hook helper older than v11); could also be a migrate/sweep race resolving on the next check. Not proof of failure.",
+      });
+    }
+    return jsonResult({
+      schema_version: 1,
+      ok: true,
+      message_id,
+      status: "unknown",
+      note: "No delivery receipt and no outbox record for this id. Either it was not sent from this machine, the id is mistyped, or the records aged out (receipts/outbox are pruned after ~7 days).",
     });
   },
 );
@@ -1389,6 +1471,15 @@ server.registerTool(
         deferredCount = 0;
       }
     }
+    // Delivery receipts for what we are RETURNING (the deferred overflow was
+    // re-queued, not delivered — it gets receipted by the drain that returns
+    // it). Best-effort, after the requeue so a requeue fallback that returns
+    // overflow inline (messages reassigned above) is receipted too.
+    mailbox.recordDelivered(
+      messages.map((m) => m.id).filter(Boolean),
+      "read_my_messages",
+      sid ?? null,
+    );
     return jsonResult({
       schema_version: 1,
       ok: true,
@@ -1574,7 +1665,7 @@ server.registerTool(
         ok: false,
         error: "peer-has-no-session-id",
         message:
-          "Target peer has no registered client.session_id. Ask the peer to call register_my_session before retrying ask_peer.",
+          "Target peer has no registered client.session_id, so a correlated reply wait is impossible. Bootstrap it in-band first: send_message with wake:\"auto\" to this same target (delivery lands in its pid box, the wake nudges its pane) with a body instructing it to call claim_session — then retry ask_peer.",
       });
     }
 
@@ -1779,6 +1870,14 @@ server.registerTool(
         // us, so there's nothing to durably wake — surface it rather than guess.
         trace("ask_peer_pending_skipped_unclaimed", { request_id: requestId });
       }
+    }
+
+    // The reply is being returned into the requester's context — receipt it so
+    // the REPLIER's message_status shows delivered (covers the grace-window,
+    // poll-success, and final-drain late-catch paths; a late reply that arrives
+    // after timeout is receipted by the read_my_messages that surfaces it).
+    if (reply) {
+      mailbox.recordDelivered([reply.id].filter(Boolean), "ask_peer_reply", fromSessionId ?? null);
     }
 
     const timedOut = polled && reply === null;

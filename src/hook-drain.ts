@@ -9,7 +9,8 @@
 // the hook scripts at install time.
 //
 // Contract with the bash hooks (keep stable; version it via --protocol):
-//   argv:  --event pretooluse|stop --protocol 1 <mailbox .jsonl paths...>
+//   argv:  --event pretooluse|stop --protocol 1 [--sid <session uuid>]
+//          <mailbox .jsonl paths...>
 //   env:   OXTAIL_HOOK_MAX_BODY_CHARS (default 24000)
 //   stdout: the complete hook envelope JSON, or nothing when no messages.
 //   exit:  3 = delivered (stop.sh keeps the busy marker: the turn continues)
@@ -32,7 +33,7 @@ import { homedir } from "node:os";
 import { basename, join, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { acquireDirLock, releaseDirLock } from "./locks.js";
-import { parseMailboxRecords, type Mailbox } from "./mailbox.js";
+import { parseMailboxRecords, recordDelivered, type Mailbox } from "./mailbox.js";
 
 export const HOOK_DRAIN_PROTOCOL = 1;
 
@@ -135,22 +136,33 @@ export function renderStop(msgs: Mailbox[], maxBodyChars: number): string {
 type ParsedArgs = {
   event: "pretooluse" | "stop";
   protocol: number;
+  sid: string | null;
   boxes: string[];
 } | null;
+
+// --sid is OPTIONAL and forward/backward compatible by construction: an OLD
+// helper receiving it from a v11+ hook routes the flag+value into `boxes`,
+// where isValidMailboxPath rejects them (no receipts, delivery intact); a NEW
+// helper invoked by an old hook just records receipts with a null recipient.
+const SID_RE = /^[0-9a-f-]{36}$/;
 
 export function parseArgs(argv: string[]): ParsedArgs {
   let event: string | null = null;
   let protocol: number | null = null;
+  let sid: string | null = null;
   const boxes: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--event") event = argv[++i] ?? null;
     else if (a === "--protocol") protocol = Number(argv[++i]);
-    else boxes.push(a);
+    else if (a === "--sid") {
+      const v = argv[++i] ?? "";
+      sid = SID_RE.test(v) ? v : null; // shape-gate; receipts tolerate null
+    } else boxes.push(a);
   }
   if (event !== "pretooluse" && event !== "stop") return null;
   if (protocol === null || !Number.isFinite(protocol)) return null;
-  return { event, protocol, boxes };
+  return { event, protocol, sid, boxes };
 }
 
 function maxBodyChars(env: NodeJS.ProcessEnv): number {
@@ -294,6 +306,15 @@ export function runHookDrain(
         // ENOENT/contention — worst case this box re-delivers (same ids, deduped)
       }
     }
+    // The envelope bytes are out — these messages are now IN the agent's
+    // context. Record delivery receipts so the senders' message_status can see
+    // it. Strictly after the stdout write (a receipt must never exist for an
+    // envelope that failed) and best-effort by construction.
+    recordDelivered(
+      msgs.map((m) => m.id).filter(Boolean),
+      "hook",
+      args.sid,
+    );
     return EXIT_DELIVERED;
   } finally {
     for (const { path, token } of locked) {
