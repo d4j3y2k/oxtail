@@ -1,5 +1,6 @@
 import { birthTimeMatchStrategy } from "./birthTimeMatchStrategy.js";
 import { envStrategy } from "./envStrategy.js";
+import { hookDropStrategy } from "./hookDropStrategy.js";
 import {
   isHit,
   type DetectContext,
@@ -18,6 +19,7 @@ export type {
 export { isAbstain, isHit } from "./types.js";
 export { birthTimeMatchStrategy } from "./birthTimeMatchStrategy.js";
 export { envStrategy } from "./envStrategy.js";
+export { hookDropStrategy } from "./hookDropStrategy.js";
 
 export function composeDetectors(strategies: DetectStrategy[]) {
   return (ctx: DetectContext): SessionIdResult | null => {
@@ -29,10 +31,18 @@ export function composeDetectors(strategies: DetectStrategy[]) {
   };
 }
 
-export const detectSessionId = composeDetectors([envStrategy, birthTimeMatchStrategy]);
+// Order: env (authoritative when present) → hook-drop (SessionStart drop file,
+// ancestry-disambiguated — the auto-join path for Claude Code, whose env is
+// structurally stripped) → birth-time (transcript fingerprint fallback).
+export const detectSessionId = composeDetectors([
+  envStrategy,
+  hookDropStrategy,
+  birthTimeMatchStrategy,
+]);
 
 const NAMED_STRATEGIES: Array<[string, DetectStrategy]> = [
   ["env", envStrategy],
+  ["hook-drop", hookDropStrategy],
   ["birth-time", birthTimeMatchStrategy],
 ];
 
