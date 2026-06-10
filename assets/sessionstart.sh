@@ -25,13 +25,22 @@ set -u
 payload=$(cat 2>/dev/null || true)
 [ -z "$payload" ] && exit 0
 
+# Whitespace-tolerant scanner (per Codex review): the live payload is minified
+# today, but `"session_id" : "x"` is equally valid JSON and must not silently
+# disable auto-join if upstream ever pretty-prints.
 sid=$(printf '%s' "$payload" | awk '
   {
-    p = index($0, "\"session_id\":\"")
+    p = index($0, "\"session_id\"")
     if (p == 0) next
-    rest = substr($0, p + 14)
-    out = ""
+    rest = substr($0, p + 12)
     i = 1; n = length(rest)
+    while (i <= n && (substr(rest, i, 1) == " " || substr(rest, i, 1) == "\t")) i++
+    if (i > n || substr(rest, i, 1) != ":") next
+    i++
+    while (i <= n && (substr(rest, i, 1) == " " || substr(rest, i, 1) == "\t")) i++
+    if (i > n || substr(rest, i, 1) != "\"") next
+    i++
+    out = ""
     while (i <= n) {
       c = substr(rest, i, 1)
       if (c == "\\") {

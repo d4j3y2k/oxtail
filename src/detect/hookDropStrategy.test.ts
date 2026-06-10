@@ -29,8 +29,16 @@ function withHome<T>(fn: (home: string) => T): T {
   }
 }
 
-function ctxFor(cwd: string): DetectContext {
-  return { type: "claude-code", cwd, started_at: Math.floor(Date.now() / 1000), env: {} };
+// started_at defaults to 60s ago: most tests exercise the post-grace state
+// (the +30s late-redetect pass). Tests of the grace gate itself pass a fresh
+// started_at explicitly.
+function ctxFor(cwd: string, startedAgoSec = 60): DetectContext {
+  return {
+    type: "claude-code",
+    cwd,
+    started_at: Math.floor(Date.now() / 1000) - startedAgoSec,
+    env: {},
+  };
 }
 
 function drop(o: {
@@ -56,13 +64,54 @@ function writeDrop(home: string, d: HookDrop): void {
   writeFileSync(join(dir, safe), JSON.stringify(d), { mode: 0o600 });
 }
 
-test("hook-drop: single cwd-matching drop, no ancestry → medium hit", () => {
+test("hook-drop: single cwd-matching drop, no ancestry, post-grace → medium hit", () => {
   const d = drop({ sid: "aaaa-1", cwd: "/proj" });
   const out = pickHookDrop(ctxFor("/proj"), [d], []);
   assert.ok(isHit(out));
   assert.equal(out.session_id, "aaaa-1");
   assert.equal(out.source, "hook-drop");
   assert.equal(out.confidence, "medium");
+});
+
+test("hook-drop: t0/t30 regression — a fresh FOREIGN drop is not adopted inside the startup grace", () => {
+  // Codex's PR #28 BLOCK shape: session A started 30s ago and wrote its drop;
+  // session B (us) just started and B's own drop hasn't landed yet. B's first
+  // detection sees exactly one fresh unconfirmed drop — A's. Without the grace
+  // gate B would adopt A's identity, and monotonic identity never repairs it.
+  const aDrop = drop({
+    sid: "session-A",
+    cwd: "/proj",
+    written_at: Math.floor(Date.now() / 1000) - 30,
+  });
+  const justStarted = ctxFor("/proj", 0);
+  const out = pickHookDrop(justStarted, [aDrop], []);
+  assert.ok(isAbstain(out), "must not adopt during the grace window");
+  assert.notEqual(out.structural, true, "retries must re-run this");
+  assert.match(out.reason, /own drop to land/);
+
+  // By the +30s retry B's drop has landed: two unconfirmed drops → abstain
+  // (structural), never a guess between two live sessions.
+  const bDrop = drop({ sid: "session-B", cwd: "/proj" });
+  const later = ctxFor("/proj", 30);
+  const out2 = pickHookDrop(later, [aDrop, bDrop], []);
+  assert.ok(isAbstain(out2));
+  assert.equal(out2.structural, true);
+
+  // And if ancestry CAN identify B's host, B resolves correctly even with A's
+  // drop present — the high path is unaffected by the grace.
+  const bConfirmed = drop({
+    sid: "session-B",
+    cwd: "/proj",
+    ppid: 6001,
+    sig: "Tue Jun 9 21:00:00 2026",
+  });
+  const out3 = pickHookDrop(
+    later,
+    [aDrop, bConfirmed],
+    [{ pid: 6001, sig: "Tue Jun 9 21:00:00 2026" }],
+  );
+  assert.ok(isHit(out3));
+  assert.equal(out3.session_id, "session-B");
 });
 
 test("hook-drop: ancestor-confirmed drop wins among several sharing a cwd → high hit", () => {
@@ -213,6 +262,18 @@ test("sessionstart.sh: re-fires (resume/clear) overwrite the same drop in place"
     assert.deepEqual(files, [sid], "one drop per session_id, refreshed in place");
     const wrapper = JSON.parse(readFileSync(join(sessionStartsDir(home), sid), "utf8")) as HookDrop;
     assert.equal(wrapper.payload.source, "resume");
+  });
+});
+
+test("sessionstart.sh: whitespace around the session_id colon still parses (Codex hardening note)", async () => {
+  await withHome(async (home) => {
+    const sid = "d40pw444-1111-4222-8333-444455556666";
+    const payload = `{ "session_id" :  "${sid}", "cwd": "/p", "source": "startup" }`;
+    const r = await runHook({ HOME: home }, payload);
+    assert.equal(r.code, 0, `stderr: ${r.stderr}`);
+    assert.equal(r.stdout, "");
+    const wrapper = JSON.parse(readFileSync(join(sessionStartsDir(home), sid), "utf8")) as HookDrop;
+    assert.equal(wrapper.payload.session_id, sid, "pretty-printed payload must not disable auto-join");
   });
 });
 
