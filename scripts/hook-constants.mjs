@@ -52,10 +52,18 @@ export const HOOK_MARKER_KEY = "_oxtailHook";
 //       the manual /oxtail-join ceremony for hooked Claude Code sessions. A
 //       missing/stale sessionstart.sh just means detection falls back to the
 //       explicit claim — never wrong, only manual.
+//  v10: sessionstart.sh collapses internal space runs in ppid_sig. lstart pads
+//       single-digit days with a double space ("Tue Jun  9"), but the reader's
+//       sig (claims.ts snapshotProcs) is rebuilt single-spaced from a
+//       whitespace split, so v9 drops failed ancestorConfirmed on days 1-9 of
+//       every month. The server also normalizes on read, so v9 drops still
+//       confirm against a v0.17.1+ server; the hook fix keeps the on-disk
+//       drop canonical. hook-drain.ts: truncate a non-empty box whose lines
+//       are ALL torn/invalid so it stops re-spawning the helper every call.
 // INVARIANT: any change to an assets/*.sh script or the helper sources MUST
 // bump this version, so existing installs are forced to re-install.
 // scripts/check-hook-version.mjs enforces this in CI.
-export const HOOK_MARKER_VERSION = 9;
+export const HOOK_MARKER_VERSION = 10;
 
 const HOOKS_DIR = path.join(os.homedir(), ".oxtail", "hooks");
 

@@ -66,8 +66,12 @@ chmod 700 "$dir" 2>/dev/null || true
 
 # The Claude Code process hosting this session. lstart (start time) makes the
 # pid meaningful across OS pid reuse; it contains only [A-Za-z0-9 :] so it is
-# safe to embed in a JSON string without escaping.
-ppid_sig=$(ps -o lstart= -p $PPID 2>/dev/null | sed 's/^ *//;s/ *$//' || true)
+# safe to embed in a JSON string without escaping. Internal space runs MUST be
+# collapsed, not just trimmed: lstart pads single-digit days with a second
+# space ("Tue Jun  9 ..."), while the reader (claims.ts snapshotProcs) rebuilds
+# its sig from a whitespace split — i.e. single-spaced. Without the collapse,
+# ancestorConfirmed's exact match fails on days 1-9 of every month.
+ppid_sig=$(ps -o lstart= -p $PPID 2>/dev/null | sed 's/  */ /g;s/^ *//;s/ *$//' || true)
 now=$(date +%s 2>/dev/null || echo 0)
 
 # Wrapper JSON: our provenance fields + the RAW stdin payload embedded verbatim

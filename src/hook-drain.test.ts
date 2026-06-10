@@ -4,7 +4,7 @@
 // stdout write must never destroy undelivered mail).
 
 import { strict as assert } from "node:assert";
-import { closeSync, mkdtempSync, openSync, readFileSync, rmSync } from "node:fs";
+import { closeSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -86,6 +86,28 @@ test("hook-drain: failed stdout write FAILS OPEN — no truncate, lock released"
       closeSync(out);
     }
     assert.equal(mailbox.mailboxHasMessages(pid), false, "delivered → drained");
+  });
+});
+
+test("hook-drain: torn-only box is truncated so the bash -s gate stops re-spawning the helper", () => {
+  withHome((home) => {
+    const pid = 81002;
+    mailbox.enqueue(pid, "seed", "sender"); // create the box + lock layout
+    const path = mailbox.mailboxFilePath(pid);
+    // Crash-torn content: non-empty on disk, zero parseable records. Before the
+    // fix this returned EXIT_NOTHING without truncating, so the bash trigger's
+    // `-s` check re-spawned a Node helper on every subsequent tool call.
+    writeFileSync(path, '{"schema_version":1,"id":"torn');
+    const out = openSync(join(home, "out.json"), "w");
+    let code: number;
+    try {
+      code = runHookDrain(["--event", "pretooluse", "--protocol", "1", path], process.env, out);
+    } finally {
+      closeSync(out);
+    }
+    assert.equal(code, EXIT_NOTHING, "nothing deliverable");
+    assert.equal(readFileSync(path, "utf8"), "", "garbage-only box self-heals to empty");
+    assert.equal(readFileSync(join(home, "out.json"), "utf8"), "", "no envelope emitted");
   });
 });
 

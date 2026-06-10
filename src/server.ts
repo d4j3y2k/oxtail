@@ -89,24 +89,13 @@ import {
   type TranscriptMessage,
 } from "./transcripts.js";
 
-export type Session = {
-  name: string;
-  path: string;
-  attached: boolean;
-  created_at: number;
-  windows: number;
-  client_type: ClientType | null;
-  client_session_id: string | null;
-  state: StateCard | null;
-};
-
-type ListResult = {
-  schema_version: 1;
-  project_root: string;
-  inferred: boolean;
-  sessions: Session[];
-  error: string | null;
-};
+import {
+  joinSessionsWithRegistry,
+  tailChars,
+  toCompactList,
+  type ListResult,
+  type Session,
+} from "./list-shape.js";
 
 type ReadResult = {
   schema_version: 1;
@@ -240,37 +229,6 @@ function listTmuxPaneCwds(): Map<string, string[]> {
   return out;
 }
 
-// Pure join: matched tmux rows × registry entries → one Session row per agent.
-// Extracted from buildListResult so it can be unit-tested without invoking
-// tmux. When N agents share a tmux session, N rows are emitted with identical
-// tmux fields and distinct client_session_id. Tmux sessions with no matching
-// registry entry get a single null-client row so unclaimed peers (Codex
-// pre-claim, stale sessions) remain discoverable.
-export function joinSessionsWithRegistry(
-  matched: Omit<Session, "client_type" | "client_session_id" | "state">[],
-  registry: RegistryEntry[],
-): Session[] {
-  const regsByTmux = new Map<string, RegistryEntry[]>();
-  for (const e of registry) {
-    if (!e.tmux_session) continue;
-    const arr = regsByTmux.get(e.tmux_session);
-    if (arr) arr.push(e);
-    else regsByTmux.set(e.tmux_session, [e]);
-  }
-  return matched.flatMap((s): Session[] => {
-    const regs = regsByTmux.get(s.name) ?? [];
-    if (regs.length === 0) {
-      return [{ ...s, client_type: null, client_session_id: null, state: null }];
-    }
-    return regs.map((reg) => ({
-      ...s,
-      client_type: reg.client.type ?? null,
-      client_session_id: reg.client.session_id ?? null,
-      state: reg.state ?? null,
-    }));
-  });
-}
-
 export function buildListResult(input: { project_root?: string }): ListResult {
   const explicit = typeof input.project_root === "string" && input.project_root.length > 0;
   const root = explicit ? input.project_root! : inferProjectRoot(process.cwd());
@@ -289,71 +247,6 @@ export function buildListResult(input: { project_root?: string }): ListResult {
   return { schema_version: 1, project_root: resolvedRoot, inferred: !explicit, sessions, error };
 }
 
-type CompactAgent = {
-  client_type: ClientType | null;
-  client_session_id: string | null;
-  state: StateCard | null;
-};
-type CompactTmuxSession = {
-  name: string;
-  path: string;
-  attached: boolean;
-  created_at: number;
-  windows: number;
-  agents: CompactAgent[];
-};
-type ListCompactResult = {
-  schema_version: 1;
-  project_root: string;
-  inferred: boolean;
-  tmux_sessions: CompactTmuxSession[];
-  error: string | null;
-};
-
-// Opt-in compact shape: hoist the tmux fields that are byte-identical across
-// every agent sharing a session (name/path/attached/created_at/windows) into one
-// group, with the per-agent fields nested under `agents`. Kills the per-row
-// duplication that grows with the agent matrix (and the redundant per-row `path`
-// that usually equals project_root). The DEFAULT response keeps the flat
-// `sessions[]` shape — backward compatible; callers ask for this with
-// compact:true. An unclaimed tmux session (no oxtail-aware agent) becomes a group
-// with an empty `agents` array.
-export function toCompactList(r: ListResult): ListCompactResult {
-  const groups = new Map<string, CompactTmuxSession>();
-  const order: string[] = [];
-  for (const s of r.sessions) {
-    let g = groups.get(s.name);
-    if (!g) {
-      g = {
-        name: s.name,
-        path: s.path,
-        attached: s.attached,
-        created_at: s.created_at,
-        windows: s.windows,
-        agents: [],
-      };
-      groups.set(s.name, g);
-      order.push(s.name);
-    }
-    // joinSessionsWithRegistry emits a single all-null row for a tmux session
-    // with no registry match; don't materialize that as a phantom agent.
-    if (s.client_type !== null || s.client_session_id !== null || s.state !== null) {
-      g.agents.push({
-        client_type: s.client_type,
-        client_session_id: s.client_session_id,
-        state: s.state,
-      });
-    }
-  }
-  return {
-    schema_version: 1,
-    project_root: r.project_root,
-    inferred: r.inferred,
-    tmux_sessions: order.map((n) => groups.get(n)!),
-    error: r.error,
-  };
-}
-
 function capturePane(target: string, lines: number): string {
   const safe = Math.max(20, Math.min(2000, Math.floor(lines)));
   return execFileSync(
@@ -370,17 +263,6 @@ function capturePane(target: string, lines: number): string {
 const DEFAULT_PANE_MAX_CHARS = 20_000;
 const MIN_PANE_MAX_CHARS = 500;
 const MAX_PANE_MAX_CHARS = 200_000;
-
-export function tailChars(text: string, maxChars: number): { text: string; truncated: boolean } {
-  // Fast path: code-unit length is an upper bound on code-point count, so if it
-  // already fits there's nothing to do (and we skip the Array.from allocation).
-  if (text.length <= maxChars) return { text, truncated: false };
-  // Slice by code points so we never split a surrogate pair at the boundary.
-  const cps = Array.from(text);
-  if (cps.length <= maxChars) return { text, truncated: false };
-  const tail = cps.slice(cps.length - maxChars).join("");
-  return { text: `…[pane truncated to last ${maxChars} chars]\n${tail}`, truncated: true };
-}
 
 type ScopeResolution = {
   inScope: boolean;
@@ -1626,9 +1508,18 @@ function drainAskPeerReply(
   // Legacy/uncorrelated peers: keep the best-effort own-pid session match (no
   // request_id to correlate the union safely — and a legacy peer's server only
   // ever enqueues to pid boxes anyway).
-  return require_reply_to
-    ? mailbox.drainMatchingReplyMany(boxes, from_session_id, request_id)
-    : mailbox.drainMatchingSession(ownPid, from_session_id);
+  if (!require_reply_to) return mailbox.drainMatchingSession(ownPid, from_session_id);
+  const drained = mailbox.drainMatchingReplyManyChecked(boxes, from_session_id, request_id);
+  if (drained.reply && drained.skipped.length > 0) {
+    // A box we couldn't inspect (transient lock) may hold a migrate-crash
+    // duplicate (same message_id) of the reply we just pulled; without this a
+    // later read_my_messages re-delivers the lone survivor as a "new" message.
+    // Previously only the timeout path's final drain swept — the grace-window
+    // and poll-success paths returned early and skipped it. Best-effort by
+    // exact id, so a DISTINCT second reply is never touched.
+    mailbox.sweepMessageId(drained.skipped, drained.reply.id);
+  }
+  return drained.reply;
 }
 
 server.registerTool(
@@ -1772,6 +1663,21 @@ server.registerTool(
         aborted = true;
       } else {
         throw e;
+      }
+    }
+
+    // Success-path duplicate sweep over a FRESH inbox union (Codex review
+    // residual on PR #30): the grace/poll drains sweep skipped boxes from the
+    // box set computed at ask START, so a sibling MCP child that appeared
+    // DURING the wait could still hold a migrate-crash duplicate of this
+    // reply. Recompute the union once on success and sweep the exact id —
+    // cheap (a few sub-ms lock cycles), and a DISTINCT second reply is never
+    // touched. The timeout path already recomputes via finalBoxes below.
+    if (reply && !aborted && requireReplyTo && fromSessionId) {
+      try {
+        mailbox.sweepMessageId(inboxBoxes(entry.server_pid, fromSessionId), reply.id);
+      } catch {
+        // best-effort — worst case is the pre-existing rare same-id re-delivery
       }
     }
 

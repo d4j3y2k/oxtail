@@ -4,11 +4,15 @@ import {
   closeSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   readSync,
   renameSync,
+  rmdirSync,
+  rmSync,
   statSync,
   truncateSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -605,4 +609,80 @@ export function mailboxFilePath(box: BoxId): string {
 
 export function mailboxLockPath(box: BoxId): string {
   return lockPath(box);
+}
+
+// Empty boxes only become garbage once nothing references them: a dead pid's
+// registry breadcrumb is reaped as soon as its box is empty (readAll), after
+// which the box file itself lingered forever — dozens of 0-byte .jsonl files
+// (plus lock sidecars) accumulating per month of dogfooding. The age gate keeps
+// us far away from any create-then-write or claim-then-route window; an empty
+// box is also recreated lazily by the next enqueue, so deletion is always
+// recoverable even if a referencing session later resumes.
+const MAILBOX_GC_MIN_AGE_MS = 7 * 24 * 3_600_000;
+
+// Remove orphaned, EMPTY mailbox files (and their lock sidecars). A box is an
+// orphan when nothing in the registry can route to it: a pid box with no
+// `<pid>.json` registry file, or a session box no entry's `mailbox_key` names.
+// Never touches a non-empty box — mail is reaped only via drain/migrate paths.
+// Best-effort: per-box errors are skipped; returns the number removed.
+export function gcOrphanMailboxes(
+  referencedPids: ReadonlySet<number>,
+  referencedSessionKeys: ReadonlySet<string>,
+  nowMs: number = Date.now(),
+): number {
+  let files: string[];
+  try {
+    files = readdirSync(mailboxesDir());
+  } catch {
+    return 0; // no mailboxes dir yet
+  }
+  let removed = 0;
+  for (const f of files) {
+    const m = /^(\d+|s-[A-Za-z0-9_-]+)\.jsonl$/.exec(f);
+    if (!m) continue; // lock dirs, owner sidecars, foreign files
+    const box: BoxId = /^\d+$/.test(m[1]) ? Number(m[1]) : m[1];
+    if (typeof box === "number" ? referencedPids.has(box) : referencedSessionKeys.has(box)) {
+      continue;
+    }
+    const path = mailboxPath(box);
+    try {
+      const st = statSync(path);
+      if (st.size > 0 || nowMs - st.mtimeMs < MAILBOX_GC_MIN_AGE_MS) continue;
+    } catch {
+      continue; // vanished — nothing to do
+    }
+    try {
+      acquireLock(box);
+    } catch {
+      continue; // contended — try again next server start
+    }
+    let held = true;
+    try {
+      // Re-check under the lock: a writer can't be mid-append now, and anything
+      // that landed since the unlocked stat survives.
+      const st = statSync(path);
+      if (st.size > 0) continue;
+      unlinkSync(path);
+      // Remove the lock infrastructure WHILE STILL HOLDING the lock — we are
+      // provably the only holder, so this can never destroy a peer's held lock
+      // (a release-then-rmdir would have exactly that race). A concurrent
+      // acquirer just recreates the dir fresh and proceeds; the formal release
+      // is skipped because there is nothing left to release.
+      try {
+        rmSync(`${lockPath(box)}.owner`, { force: true });
+        rmdirSync(lockPath(box));
+        lockTokens.delete(mailboxPath(box));
+        held = false;
+      } catch {
+        // sidecar cleanup is cosmetic; fall through to a normal release
+      }
+      removed++;
+      trace("mailbox_gc_removed", { box: String(box) });
+    } catch {
+      // vanished/unlink failure — leave it for the next pass
+    } finally {
+      if (held) releaseLock(box);
+    }
+  }
+  return removed;
 }

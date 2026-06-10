@@ -106,6 +106,12 @@ function parseDrop(raw: string): HookDrop | null {
   if (d.schema_version !== 1) return null;
   if (!d.payload || typeof d.payload !== "object") return null;
   if (typeof d.payload.session_id !== "string" || !d.payload.session_id) return null;
+  // Normalize the sig to the same single-spaced form snapshotProcs() produces
+  // (it splits the ps line on whitespace and re-joins). Pre-v10 hooks recorded
+  // lstart's raw double space before single-digit days ("Tue Jun  9 ..."),
+  // which would never exact-match — normalizing here keeps drops from stale
+  // installed hooks confirmable instead of silently abstaining on days 1-9.
+  d.ppid_sig = typeof d.ppid_sig === "string" ? d.ppid_sig.replace(/\s+/g, " ").trim() : "";
   return d;
 }
 

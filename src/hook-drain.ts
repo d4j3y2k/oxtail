@@ -249,10 +249,24 @@ export function runHookDrain(
       } catch {
         continue; // vanished/unreadable under lock — nothing to deliver from it
       }
+      let records = 0;
       for (const m of parseMailboxRecords(raw, { box: basename(path), via: "hook-drain" })) {
+        records++;
         if (seenIds.has(m.id)) continue;
         seenIds.add(m.id);
         msgs.push(m);
+      }
+      if (raw.length > 0 && records === 0) {
+        // Non-empty but zero parseable records (torn/garbage only). Truncate it
+        // now, under the lock we hold — otherwise the bash trigger's `-s` gate
+        // keeps seeing a "non-empty" box and re-spawns this helper on EVERY
+        // tool call until a server-side drain happens to clear it. Mirrors
+        // drain()'s unconditional post-read truncate; nothing valid is lost.
+        try {
+          truncateSync(path, 0);
+        } catch {
+          // best effort — worst case the next event retries
+        }
       }
     }
 

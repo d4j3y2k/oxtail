@@ -2,7 +2,7 @@
 // plus a subprocess pipeline test for assets/sessionstart.sh itself.
 
 import { strict as assert } from "node:assert";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -203,6 +203,30 @@ test("hook-drop: listHookDrops skips malformed + writer-temp files, prunes aged 
   });
 });
 
+test("hook-drop: a stale-hook drop with lstart's double-spaced sig (single-digit day) is normalized on read and still confirms", () => {
+  withHome((home) => {
+    // Real `ps -o lstart=` bytes for days 1-9 of the month: the day is padded
+    // with a SECOND space ("Tue Jun  9 ..."). v9 sessionstart.sh recorded that
+    // verbatim, while snapshotProcs() rebuilds ancestor sigs single-spaced from
+    // a whitespace split — so without read-side normalization the exact match
+    // in ancestorConfirmed never fired on ~9 of every 30 calendar days.
+    const d = drop({ sid: "v9-sig-1", cwd: "/proj", ppid: 4321, sig: "Tue Jun  9 21:58:27 2026" });
+    writeDrop(home, d);
+    const drops = listHookDrops(home);
+    assert.equal(drops.length, 1);
+    assert.equal(
+      drops[0].ppid_sig,
+      "Tue Jun 9 21:58:27 2026",
+      "internal space run collapsed to the snapshotProcs form",
+    );
+    const out = pickHookDrop(ctxFor("/proj"), drops, [
+      { pid: 4321, sig: "Tue Jun 9 21:58:27 2026" },
+    ]);
+    assert.ok(isHit(out));
+    assert.equal(out.confidence, "high", "ancestry confirmation survives a stale-hook drop");
+  });
+});
+
 // ── assets/sessionstart.sh subprocess pipeline ──────────────────────────────
 
 function runHook(env: Record<string, string>, stdin: string): Promise<{
@@ -248,6 +272,32 @@ test("sessionstart.sh: writes the drop with ancestry, NEVER prints to stdout", a
     // The hook's $PPID is the spawning process — this test runner.
     assert.equal(wrapper.ppid, process.pid);
     assert.ok(wrapper.written_at > 0);
+  });
+});
+
+test("sessionstart.sh: ppid_sig byte-matches the reader's snapshotProcs normalization", async () => {
+  await withHome(async (home) => {
+    const sid = "d40psig1-1111-4222-8333-444455556666";
+    const payload = JSON.stringify({
+      session_id: sid,
+      cwd: "/p",
+      hook_event_name: "SessionStart",
+      source: "startup",
+    });
+    const r = await runHook({ HOME: home }, payload);
+    assert.equal(r.code, 0, `stderr: ${r.stderr}`);
+    const wrapper = JSON.parse(readFileSync(join(sessionStartsDir(home), sid), "utf8")) as HookDrop;
+    // The hook's $PPID is this test runner, so rebuild the reader-side sig for
+    // OUR pid exactly the way claims.ts snapshotProcs() does (whitespace split,
+    // single-space join) and require byte equality. Uses REAL ps output, so on
+    // days 1-9 of the month this catches the lstart double-space regression the
+    // hand-written fixtures missed.
+    const ps = execFileSync("ps", ["-o", "lstart=", "-p", String(process.pid)], {
+      encoding: "utf8",
+    });
+    const readerSig = ps.trim().split(/\s+/).join(" ");
+    assert.equal(wrapper.ppid_sig, readerSig, "writer sig must equal the reader normalization");
+    assert.ok(!wrapper.ppid_sig.includes("  "), "no internal double space survives");
   });
 });
 
