@@ -365,7 +365,10 @@ export function register(entry: RegistryEntry): void {
   gcDeadSiblings(entry);
   // Finally sweep mailbox files nothing can route to anymore (empty + old +
   // unreferenced) — registry reaping removes the breadcrumbs but used to leave
-  // the 0-byte box files behind forever. Once per server start is plenty.
+  // the 0-byte box files behind forever. register() also re-fires on claim /
+  // sticky refinement / state updates, so this runs more than once per server
+  // lifetime; that's fine — it's bounded to old empty orphans and the rescan
+  // is a cheap readdir when there's nothing to do (Codex round-2 wording nit).
   gcOrphanMailboxesFromRegistry();
 }
 
