@@ -47,6 +47,12 @@ if [ ! -t 0 ]; then
   ')
 fi
 [ -z "$sid" ] && exit 0
+# Shape-gate before $sid is interpolated into the registry grep below: a value
+# outside the UUID charset would act as regex metacharacters there (over- or
+# under-matching other sessions' registry files). Claude Code session ids are
+# UUIDs; anything else fails open to read_my_messages, mirroring the server's
+# own UUID guard.
+case "$sid" in *[!0-9a-fA-F-]*) exit 0 ;; esac
 
 # 2. Re-stamp "busy" on EVERY tool call (before any early-exit below) so a long,
 # ACTIVE turn keeps a fresh marker and never reads as stale-busy (>TTL) to a

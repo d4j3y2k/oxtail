@@ -28,7 +28,10 @@ import {
   type RegistryEntry,
 } from "./registry.js";
 import * as mailbox from "./mailbox.js";
-import { joinSessionsWithRegistry, tailChars, toCompactList, type Session } from "./server.js";
+// IMPORTANT: import from list-shape.js, NOT server.js — importing server.js
+// runs its top-level register() and turns the test process into a live oxtail
+// agent against the real $HOME (real registry entry + orphan-mailbox GC).
+import { joinSessionsWithRegistry, tailChars, toCompactList, type Session } from "./list-shape.js";
 
 type TmuxRow = Omit<Session, "client_type" | "client_session_id" | "state">;
 

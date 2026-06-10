@@ -79,6 +79,12 @@ if [ ! -d "$sessions_dir" ] || [ ! -d "$mailboxes_dir" ]; then
   exit 0
 fi
 
+# Shape-gate before $sid is interpolated into the registry grep below: a value
+# outside the UUID charset would act as regex metacharacters there. It is still
+# a real stop, so mark idle first — only the mailbox discovery is skipped
+# (read_my_messages remains the fallback path), mirroring pretooluse.sh.
+case "$sid" in *[!0-9a-fA-F-]*) mark_idle; exit 0 ;; esac
+
 # 4. Discover this session's non-empty mailboxes (same logic as pretooluse.sh:
 #    legacy per-pid boxes + the session box via the entry's `mailbox_key`).
 boxes=()

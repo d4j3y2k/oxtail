@@ -12,7 +12,12 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ClientInfo } from "./clients.js";
-import { mailboxHasMessages, mailboxSessionKey, migrateMailbox } from "./mailbox.js";
+import {
+  gcOrphanMailboxes,
+  mailboxHasMessages,
+  mailboxSessionKey,
+  migrateMailbox,
+} from "./mailbox.js";
 
 export type StateCard = {
   purpose: string | null;
@@ -358,6 +363,43 @@ export function register(entry: RegistryEntry): void {
   // undrained mail into us first. Leaves live siblings alone; readAll() collapses
   // those by session_id.
   gcDeadSiblings(entry);
+  // Finally sweep mailbox files nothing can route to anymore (empty + old +
+  // unreferenced) — registry reaping removes the breadcrumbs but used to leave
+  // the 0-byte box files behind forever. Once per server start is plenty.
+  gcOrphanMailboxesFromRegistry();
+}
+
+// Build the referenced-box sets from the registry and hand off to the mailbox
+// GC. Conservative on parse failures: any `<pid>.json` FILENAME marks that pid
+// box referenced even when the entry is unreadable, and a claimed entry marks
+// its session box referenced even when `mailbox_key` is absent (pre-v0.17
+// writers) by recomputing the key from session_id. Best-effort; never blocks
+// register().
+function gcOrphanMailboxesFromRegistry(): void {
+  try {
+    const dir = registryDir();
+    if (!existsSync(dir)) return;
+    const pids = new Set<number>();
+    const sessionKeys = new Set<string>();
+    for (const file of readdirSync(dir)) {
+      const m = /^(\d+)\.json$/.exec(file);
+      if (!m) continue;
+      pids.add(Number(m[1]));
+      const other = readEntryFile(dir, file);
+      if (!other) continue;
+      if (other.mailbox_key) sessionKeys.add(other.mailbox_key);
+      if (other.client.session_id) {
+        try {
+          sessionKeys.add(mailboxSessionKey(other.client.session_id));
+        } catch {
+          // malformed id — recomputation is belt-and-braces only
+        }
+      }
+    }
+    gcOrphanMailboxes(pids, sessionKeys);
+  } catch {
+    // housekeeping must never break registration
+  }
 }
 
 function gcDeadSiblings(entry: RegistryEntry): void {

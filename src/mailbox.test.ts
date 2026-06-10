@@ -925,3 +925,49 @@ test("mailbox: migrateMailbox into a SESSION box preserves ids and clears the so
     assert.equal(drained[0].id, sent.id, "id preserved across migration");
   });
 });
+
+test("mailbox gc: removes only EMPTY, OLD, UNREFERENCED boxes (and their lock sidecars)", () => {
+  withHome((home) => {
+    const dir = join(home, ".oxtail", "mailboxes");
+    const old = (Date.now() - 8 * 24 * 3_600_000) / 1000; // 8 days, past the 7-day gate
+
+    // Orphan + empty + old → removed.
+    mailbox.enqueue(70001, "x", "s");
+    mailbox.drain(70001);
+    utimesSync(mailbox.mailboxFilePath(70001), old, old);
+    // Referenced pid, empty + old → kept.
+    mailbox.enqueue(70002, "x", "s");
+    mailbox.drain(70002);
+    utimesSync(mailbox.mailboxFilePath(70002), old, old);
+    // Orphan but NON-EMPTY → kept (mail is never gc'd).
+    mailbox.enqueue(70003, "keep me", "s");
+    utimesSync(mailbox.mailboxFilePath(70003), old, old);
+    // Orphan + empty but FRESH → kept (age gate).
+    mailbox.enqueue(70004, "x", "s");
+    mailbox.drain(70004);
+    // Session boxes: orphan-old removed, referenced-old kept.
+    const orphanKey = mailbox.mailboxSessionKey("aaaa1111-2222-4333-8444-555566667777");
+    const liveKey = mailbox.mailboxSessionKey("bbbb1111-2222-4333-8444-555566667777");
+    mailbox.enqueue(orphanKey, "x", "s");
+    mailbox.drain(orphanKey);
+    utimesSync(mailbox.mailboxFilePath(orphanKey), old, old);
+    mailbox.enqueue(liveKey, "x", "s");
+    mailbox.drain(liveKey);
+    utimesSync(mailbox.mailboxFilePath(liveKey), old, old);
+
+    const removed = mailbox.gcOrphanMailboxes(new Set([70002]), new Set([liveKey]));
+    assert.equal(removed, 2, "exactly the two orphans");
+    assert.ok(!existsSync(mailbox.mailboxFilePath(70001)), "orphan pid box removed");
+    assert.ok(!existsSync(mailbox.mailboxLockPath(70001)), "its lock sidecar removed too");
+    assert.ok(!existsSync(mailbox.mailboxFilePath(orphanKey)), "orphan session box removed");
+    assert.ok(existsSync(mailbox.mailboxFilePath(70002)), "referenced pid box kept");
+    assert.equal(mailbox.drain(70003).length, 1, "non-empty orphan kept its mail");
+    assert.ok(existsSync(mailbox.mailboxFilePath(70004)), "fresh box kept");
+    assert.ok(existsSync(mailbox.mailboxFilePath(liveKey)), "referenced session box kept");
+
+    // Idempotent + still-usable: the removed box is recreated lazily by enqueue.
+    assert.equal(mailbox.gcOrphanMailboxes(new Set([70002]), new Set([liveKey])), 0);
+    mailbox.enqueue(70001, "back", "s");
+    assert.equal(mailbox.drain(70001).length, 1, "deleted box recreates on enqueue");
+  });
+});

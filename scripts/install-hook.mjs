@@ -134,7 +134,13 @@ export async function install() {
   for (const h of shipped) {
     const hooksDir = path.dirname(h.scriptPath);
     await mkdir(hooksDir, { recursive: true, mode: 0o755 });
-    const installedText = h.text.replace('"__OXTAIL_NODE__"', JSON.stringify(process.execPath));
+    // Function replacer: a string second argument interprets `$`-sequences
+    // ($$, $&, $`) as replacement patterns, so an execPath containing `$`
+    // would bake a silently corrupted node_bin= line into the hook.
+    const installedText = h.text.replace(
+      '"__OXTAIL_NODE__"',
+      () => JSON.stringify(process.execPath),
+    );
     const scriptTmp = `${h.scriptPath}.tmp-${randomBytes(6).toString("hex")}`;
     // writeFile's `mode` only applies on creation; explicit chmod for belt+braces.
     await writeFile(scriptTmp, installedText, { mode: 0o755 });

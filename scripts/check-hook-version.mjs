@@ -27,11 +27,15 @@ function parseVersion(text) {
 }
 
 const base = process.argv[2] || process.env.GITHUB_BASE_SHA || "origin/main";
-// Hook scripts AND the hook-drain helper entry: both run as the installed hook
-// surface. (The helper's mailbox/locks deps drift via the marker hash check at
-// server startup instead — bumping the version for every mailbox.ts change
-// would be noise.)
-const HOOK_ASSET_RE = /^(assets\/.*\.sh|src\/hook-drain\.ts)$/;
+// Hook scripts AND the full hook-drain helper dependency closure (HELPER_FILES
+// in hook-constants.mjs: hook-drain + mailbox + locks + trace): all of it runs
+// as the installed hook surface. mailbox/locks define the on-disk JSONL and
+// lock protocol the helper executes, so a change there can drift the installed
+// copy just as silently as a .sh edit — the startup freshness warning catches
+// it eventually, but only the version bump forces the re-install. The cost is
+// occasional version-bump noise for comment-only edits; accepted (v0.17.1
+// review) over the silent-stale window.
+const HOOK_ASSET_RE = /^(assets\/.*\.sh|src\/(hook-drain|mailbox|locks|trace)\.ts)$/;
 
 let changed;
 try {
