@@ -21,7 +21,7 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 **Claude Code** — add to `~/.claude.json` (global) or any project's `.mcp.json`:
 
 ```jsonc
-{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.17.0"] } } }
+{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.17.1"] } } }
 ```
 
 **Codex CLI** — add to `~/.codex/config.toml`:
@@ -29,14 +29,14 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 ```toml
 [mcp_servers.oxtail]
 command = "npx"
-args = ["-y", "oxtail@0.17.0"]
+args = ["-y", "oxtail@0.17.1"]
 ```
 
 **Claude slash command** (`/oxtail-join`) — optional once the hooks are installed (the v0.17 SessionStart hook auto-joins Claude Code sessions; see [How session_id resolution works](#how-session_id-resolution-works-v040)); still the explicit fallback:
 
 ```sh
 mkdir -p ~/.claude/commands
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.17.0/.claude/commands/oxtail-join.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.17.1/.claude/commands/oxtail-join.md \
   -o ~/.claude/commands/oxtail-join.md
 ```
 
@@ -44,9 +44,9 @@ curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.17.0/.claude/command
 
 ```sh
 mkdir -p ~/.codex/skills/oxtail-join/agents
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.17.0/integrations/codex/oxtail-join/SKILL.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.17.1/integrations/codex/oxtail-join/SKILL.md \
   -o ~/.codex/skills/oxtail-join/SKILL.md
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.17.0/integrations/codex/oxtail-join/agents/openai.yaml \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.17.1/integrations/codex/oxtail-join/agents/openai.yaml \
   -o ~/.codex/skills/oxtail-join/agents/openai.yaml
 ```
 
@@ -72,7 +72,7 @@ Contributing? `git clone https://github.com/d4j3y2k/oxtail && cd oxtail && npm i
 - `register_my_session` — pin this MCP server's `session_id` directly. Kept for debugging; prefer `claim_session`.
 - `get_my_session` — return this MCP server's own registry entry plus a per-strategy detection diagnosis. Useful for debugging.
 
-See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.17.0/AGENTS.md) for scope and architecture.
+See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.17.1/AGENTS.md) for scope and architecture.
 
 ## Usage from an agent
 
@@ -247,7 +247,7 @@ All wake paths funnel through one place, which **coalesces** rapid repeat wakes 
 If `ask_peer` returns an abort error before its built-in 60s timeout fires, your MCP client's tool-call ceiling is lower than 60s. Override the bound at server startup:
 
 ```sh
-OXTAIL_ASK_PEER_TIMEOUT_MS=30000 npx -y oxtail@0.17.0
+OXTAIL_ASK_PEER_TIMEOUT_MS=30000 npx -y oxtail@0.17.1
 ```
 
 The server reads the env var once at boot and uses it as the fixed timeout for all `ask_peer` calls in that session. Values must be positive numbers; anything else falls back to the 60000ms default.
@@ -326,8 +326,9 @@ A scheduled CI job (`.github/workflows/codex-drift.yml`, also runnable on demand
 
 ## Status
 
-v0.17.0. Pushes the autonomous peer-messaging matrix toward zero human relay, hardens the wake/delivery core against crash and race classes, makes delegation durable across long (minutes-to-hours) efforts, and rekeys the mailbox itself onto the agent identity.
+v0.17.1. Pushes the autonomous peer-messaging matrix toward zero human relay, hardens the wake/delivery core against crash and race classes, makes delegation durable across long (minutes-to-hours) efforts, and rekeys the mailbox itself onto the agent identity.
 
+- **Auto-join date fix + hook self-heal (v0.17.1, hooks v10).** A 3-lens compile-sim pass over v0.17.0 plus a live Claude↔Codex test session surfaced three fixes. (1) `sessionstart.sh` recorded `ps lstart`'s raw bytes, which pad single-digit days with a double space (`Tue Jun  9 …`) — but the reader rebuilds ancestor sigs single-spaced, so `ancestorConfirmed`'s exact match silently failed on days 1–9 of *every month*, exactly the multi-session-per-project case ancestry exists to disambiguate (confirmed live against a production drop on 2026-06-09). The hook now collapses internal space runs and the server normalizes on read, so drops from stale v9 hooks still confirm. (2) The `hook-drain` helper now truncates a non-empty mailbox whose lines are all torn/invalid — previously such a box re-spawned a Node helper on every tool call until a server-side drain cleared it, defeating the quiet-inbox-is-pure-bash design. (3) `ask_peer`'s grace-window and poll-success paths now sweep migrate-crash duplicate replies from transiently-locked sibling boxes, matching the timeout path — closing a rare window where a later `read_my_messages` re-delivered an already-returned reply. Re-run `npx oxtail install-hook` after upgrading.
 - **Session-keyed mailboxes + hook-drain helper (v0.17.0).** A session's inbox is now a single file keyed by its `client.session_id` (`~/.oxtail/mailboxes/<mailboxSessionKey(session_id)>.jsonl`) instead of one file per MCP-child pid — so a pid rotation (the restart class behind the v0.10.x split-identity bug family) can no longer strand mail by construction, and the documented resolve→enqueue orphan residual is closed for v0.17+ readers. Senders route on the receiver's advertised `capabilities.mailbox.session_keyed` (pre-v0.17 peers keep getting pid-keyed mail they can actually read), readers drain the session box plus any legacy pid boxes with `message_id` dedup, and a legacy send whose registry breadcrumb vanished mid-flight rescues a session-box copy. The PreToolUse/Stop hooks became thin bash triggers: the empty-inbox fast path is still pure bash (no Node process on a quiet tool call), but lock + JSON parse + budget + rendering moved to a `hook-drain` helper installed beside the scripts — the *same compiled lock/mailbox code the server runs*, ending the era of the awk JSON parser, the bash lock mirror, and the key-order coupling. The helper handshake is versioned and fails open. Re-run `npx oxtail install-hook` after upgrading (the server warns if you don't).
 - **`read_session` freshness/provenance (v0.16.2).** Every `read_session` return now says *which* identity/thread it read and how it was derived (`resolved_session_id`, `session_id_source`) and how stale the backing transcript is (`transcript_mtime`, `transcript_age_seconds`) — closing a silent false-negative where a sticky-recovered identity pinned to an old transcript read as "peer never replied" while the peer was live elsewhere. The tool is documented as browse/diagnostic only: confirm a reply via the mailbox (`read_my_messages` / the `ask_peer` correlated reply), never via `read_session`.
 - **Receive convention for no-hook peers (v0.16.1).** The `read_my_messages` description no longer says no-hook peers "must poll" — observed live, that wording sent an idle Codex into sleep-loop polling and a 100s blocking `ask_peer` that bought nothing. Delivery is sender-driven: a wake-bearing send re-invokes an idle peer's pane; the receiver reads once at the start of that turn, acts, and ends the turn. The Codex join skill documents the same standing convention ("idle is safe — trust the wake").

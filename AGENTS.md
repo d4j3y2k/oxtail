@@ -17,7 +17,7 @@ Scope is **project-root as the unit**. Sessions in one project root see each oth
 - **Registry (leaning):** `tmux list-sessions` filtered by project-derived names, rather than a custom JSON registry. Free dead-session detection, free naming, no daemon to maintain. Decision pending real-use signals.
 - **Project scoping:** project root inferred from session CWD at agent startup.
 
-## Status: v0.17.0 ready, dogfooding
+## Status: v0.17.1 ready, dogfooding
 
 Ten MCP tools live: `list_project_sessions`, `read_session`, `claim_session`, `set_my_state`, `register_my_session`, `get_my_session`, the v0.5 messaging pair `send_message` and `read_my_messages`, `ask_peer` (delegate-and-wait, introduced v0.6, per-client wake routing in v0.7, durable on timeout in v0.15), and `reply_to_message` (reply by id, v0.13). Registered both project-locally (via `.mcp.json` using `tsx ./src/server.ts` for the dev loop) and globally (in `~/.claude.json` and `~/.codex/config.toml`, pointing at `dist/server.js`).
 

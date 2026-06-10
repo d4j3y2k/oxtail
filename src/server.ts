@@ -1626,9 +1626,18 @@ function drainAskPeerReply(
   // Legacy/uncorrelated peers: keep the best-effort own-pid session match (no
   // request_id to correlate the union safely — and a legacy peer's server only
   // ever enqueues to pid boxes anyway).
-  return require_reply_to
-    ? mailbox.drainMatchingReplyMany(boxes, from_session_id, request_id)
-    : mailbox.drainMatchingSession(ownPid, from_session_id);
+  if (!require_reply_to) return mailbox.drainMatchingSession(ownPid, from_session_id);
+  const drained = mailbox.drainMatchingReplyManyChecked(boxes, from_session_id, request_id);
+  if (drained.reply && drained.skipped.length > 0) {
+    // A box we couldn't inspect (transient lock) may hold a migrate-crash
+    // duplicate (same message_id) of the reply we just pulled; without this a
+    // later read_my_messages re-delivers the lone survivor as a "new" message.
+    // Previously only the timeout path's final drain swept — the grace-window
+    // and poll-success paths returned early and skipped it. Best-effort by
+    // exact id, so a DISTINCT second reply is never touched.
+    mailbox.sweepMessageId(drained.skipped, drained.reply.id);
+  }
+  return drained.reply;
 }
 
 server.registerTool(
