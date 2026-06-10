@@ -37,10 +37,18 @@ export const HOOK_MARKER_KEY = "_oxtailHook";
 //       long ACTIVE turn stays fresh and doesn't invite a spurious wake:auto once
 //       it outruns ACTIVITY_BUSY_TTL_MS. A stale pre-v7 hook just doesn't refresh
 //       (the prior behavior) — never wrong, only less fresh on long turns.
-// INVARIANT: any change to an assets/*.sh script MUST bump this version, so
-// existing installs are forced to re-install. scripts/check-hook-version.mjs
-// enforces this in CI.
-export const HOOK_MARKER_VERSION = 7;
+//   v8: session-keyed mailboxes + the hook-drain helper. pretooluse/stop become
+//       thin bash triggers: the fast path (sid, busy/idle marker, non-empty
+//       mailbox discovery incl. the new session box via the registry's
+//       `mailbox_key`) stays bash; lock+parse+render moves to a Node helper
+//       installed beside the scripts (HELPER_FILES), one implementation shared
+//       with the server. A stale pre-v8 hook keeps draining LEGACY pid boxes
+//       correctly but never sees the session box — and a v0.17+ peer's sends
+//       route there — so the upgrade warning matters: re-run install-hook.
+// INVARIANT: any change to an assets/*.sh script or the helper sources MUST
+// bump this version, so existing installs are forced to re-install.
+// scripts/check-hook-version.mjs enforces this in CI.
+export const HOOK_MARKER_VERSION = 8;
 
 const HOOKS_DIR = path.join(os.homedir(), ".oxtail", "hooks");
 
@@ -81,6 +89,28 @@ export const MANAGED_HOOKS = [
 export const HOOK_SCRIPT_PATH = MANAGED_HOOKS[0].scriptPath;
 export const HOOK_COMMAND = MANAGED_HOOKS[0].command;
 
+// The hook-drain helper and its (compiled) dependency closure, installed beside
+// the hook scripts so the hooks never depend on the ephemeral npx package dir.
+// Sources are the package's dist/ output — the SAME compiled lock/mailbox code
+// the server runs, which is the whole point: the advisory-lock and JSONL-parse
+// protocols live once, in src/locks.ts and src/mailbox.ts. The files keep their
+// relative-import names; HELPER_PACKAGE_JSON marks the install dir as ESM so
+// node runs them as modules.
+//   id         — keys the per-file hash in the settings.json marker
+//   dist       — filename under the package's dist/
+//   installPath— where the file lands
+export const HELPER_FILES = [
+  "hook-drain.js",
+  "mailbox.js",
+  "locks.js",
+  "trace.js",
+].map((f) => ({
+  id: `helper:${f}`,
+  dist: f,
+  installPath: path.join(HOOKS_DIR, f === "hook-drain.js" ? "hook-drain.mjs" : f),
+}));
+export const HELPER_PACKAGE_JSON = path.join(HOOKS_DIR, "package.json");
+
 export function scriptHash(text) {
   return createHash("sha256").update(text).digest("hex").slice(0, 16);
 }
@@ -89,10 +119,14 @@ export function scriptHash(text) {
 // so it works both from src (dev/tests) and dist (published) — scripts/ and
 // assets/ ship side by side in the npm tarball.
 const ASSETS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "assets");
+// The compiled helper sources. In a published install this always exists; in a
+// dev checkout it requires `npm run build` (the test script builds first).
+export const DIST_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist");
 
-// Hash of each shipped hook asset as it exists in THIS install of the package.
-// Compared against the marker's recorded hashes to detect a stale install.
-// A null entry means the asset couldn't be read (skip it rather than alarm).
+// Hash of each shipped hook asset + helper file as it exists in THIS install of
+// the package. Compared against the marker's recorded hashes to detect a stale
+// install. A null entry means the file couldn't be read (skip it rather than
+// alarm — e.g. an unbuilt dev checkout has no dist/).
 export function shippedHookHashes() {
   const hashes = {};
   for (const h of MANAGED_HOOKS) {
@@ -100,6 +134,13 @@ export function shippedHookHashes() {
       hashes[h.id] = scriptHash(readFileSync(path.join(ASSETS_DIR, h.asset), "utf8"));
     } catch {
       hashes[h.id] = null;
+    }
+  }
+  for (const f of HELPER_FILES) {
+    try {
+      hashes[f.id] = scriptHash(readFileSync(path.join(DIST_DIR, f.dist), "utf8"));
+    } catch {
+      hashes[f.id] = null;
     }
   }
   return hashes;
@@ -146,10 +187,10 @@ export function assessHookFreshness(settingsPath = SETTINGS_PATH) {
     marker.hashes && typeof marker.hashes === "object" ? marker.hashes : {};
   const shipped = shippedHookHashes();
   const driftedHooks = [];
-  for (const h of MANAGED_HOOKS) {
-    const want = shipped[h.id];
+  for (const id of [...MANAGED_HOOKS.map((h) => h.id), ...HELPER_FILES.map((f) => f.id)]) {
+    const want = shipped[id];
     if (want == null) continue; // can't compare; don't false-alarm
-    if (installedHashes[h.id] !== want) driftedHooks.push(h.id);
+    if (installedHashes[id] !== want) driftedHooks.push(id);
   }
   const versionMismatch = marker.version !== HOOK_MARKER_VERSION;
   // Trigger "stale" on actual script drift only — a version-only mismatch with

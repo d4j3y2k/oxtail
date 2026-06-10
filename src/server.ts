@@ -21,6 +21,7 @@ import { trace } from "./trace.js";
 import {
   buildEntry,
   chooseVerifiedWakePane,
+  entryForPid,
   findByTmuxSession,
   processStartSig,
   readAll,
@@ -33,7 +34,11 @@ import {
 } from "./registry.js";
 import * as mailbox from "./mailbox.js";
 import * as received from "./received.js";
-import { deliverExistingToPeer, deliverToPeer } from "./delivery.js";
+import {
+  deliverExistingToPeer,
+  deliverToPeer,
+  type DeliveryRoute,
+} from "./delivery.js";
 import { recoverClaim, resolveAncestors, writeClaim } from "./claims.js";
 import {
   autowakeKillSwitchOff,
@@ -1263,6 +1268,41 @@ function peerSupportsReplyTo(peer: RegistryEntry): boolean {
   return peer.capabilities?.mailbox?.reply_to === true;
 }
 
+// Where to deliver to this peer. Routing keys on the peer's ADVERTISED
+// session_keyed capability: a pre-v0.17 reader only drains pid boxes, so
+// session-box mail would never reach it (see delivery.ts).
+function routeFor(peer: RegistryEntry): DeliveryRoute {
+  return {
+    session_id: peer.client.session_id,
+    server_pid: peer.server_pid,
+    session_keyed: peer.capabilities?.mailbox?.session_keyed === true,
+  };
+}
+
+// Our own inbox route, for self re-delivery (ask_peer abort recovery). We are
+// by definition session_keyed-capable when claimed.
+function selfRoute(): DeliveryRoute {
+  return {
+    session_id: entry.client.session_id,
+    server_pid: entry.server_pid,
+    session_keyed: !!entry.client.session_id,
+  };
+}
+
+// The union of boxes this session's inbound mail can live in: the SESSION box
+// (canonical v0.17+ inbox, what capable senders write), plus every sibling/
+// previous MCP-child pid box still holding legacy traffic, plus our own pid as
+// a floor (pre-claim sends land there). Order matters for the legacy ask_peer
+// fallback: own pid first among the numeric boxes.
+function inboxBoxes(ownPid: number, sessionId: string | null | undefined): mailbox.BoxId[] {
+  if (!sessionId) return [ownPid];
+  return [
+    mailbox.mailboxSessionKey(sessionId),
+    ownPid,
+    ...sessionPidsForId(sessionId).filter((p) => p !== ownPid),
+  ];
+}
+
 function projectRootsMatch(caller: RegistryEntry, peer: RegistryEntry): boolean {
   const callerProject = findProjectRoot(caller.client.cwd);
   const peerProject = findProjectRoot(peer.client.cwd);
@@ -1295,19 +1335,6 @@ function isAliveLocal(pid: number): boolean {
   }
 }
 
-function reReadRegistryEntry(server_pid: number): RegistryEntry | null {
-  // PID-reuse guard: re-read the on-disk file and compare started_at to the
-  // one we cached in memory at lookup time. A reused pid lands on a freshly
-  // written entry with a different started_at.
-  const path = join(homedir(), ".oxtail", "sessions", `${server_pid}.json`);
-  try {
-    const raw = readFileSync(path, "utf8");
-    return JSON.parse(raw) as RegistryEntry;
-  } catch {
-    return null;
-  }
-}
-
 const UUID_RE = /^[0-9a-f-]{36}$/;
 
 function resolveTarget(target: string, caller: RegistryEntry): ResolveOk | ResolveErr {
@@ -1324,7 +1351,10 @@ function resolveTarget(target: string, caller: RegistryEntry): ResolveOk | Resol
   // would have been overwritten with a different started_at.
   candidates = candidates.filter((e) => {
     if (!isAliveLocal(e.server_pid)) return false;
-    const fresh = reReadRegistryEntry(e.server_pid);
+    // PID-reuse guard: re-read the on-disk file and compare started_at to the
+    // one we cached in memory at lookup time. A reused pid lands on a freshly
+    // written entry with a different started_at.
+    const fresh = entryForPid(e.server_pid);
     if (!fresh) return false;
     if (fresh.started_at !== e.started_at) return false;
     // PID-reuse: started_at is the original registration time and lives on the
@@ -1430,8 +1460,9 @@ server.registerTool(
     // deliverToPeer records the durable reply-handle in the recipient's ledger
     // BEFORE the mailbox line is visible, so a later reply_to_message(message_id)
     // resolves even after the destructive mailbox/hook drain — and never sees a
-    // displayed-but-unrecorded handle (record precedes append).
-    const msg = deliverToPeer(peer.client.session_id, peer.server_pid, body, fromSessionId, {
+    // displayed-but-unrecorded handle (record precedes append). Routing: the
+    // peer's session box when it advertises session_keyed, else its legacy pid.
+    const msg = deliverToPeer(routeFor(peer), body, fromSessionId, {
       reply_to,
       source_message_id,
     });
@@ -1533,7 +1564,7 @@ server.registerTool(
     const fromSessionId = entry.client.session_id ?? undefined;
     // Record the reply itself into the original asker's ledger (record-before-
     // append) so replies can be replied to in turn — chained correlation.
-    const msg = deliverToPeer(peer.client.session_id, peer.server_pid, body, fromSessionId, {
+    const msg = deliverToPeer(routeFor(peer), body, fromSessionId, {
       reply_to: replyTo,
       source_message_id: message_id,
     });
@@ -1606,30 +1637,29 @@ server.registerTool(
   },
   async () => {
     const sid = entry.client.session_id;
-    let pids: number[];
-    if (sid) {
-      // Union by identity: every sibling/previous pid that registered under our
-      // session_id, plus our own pid as a guaranteed floor. Mirrors the hook.
-      pids = sessionPidsForId(sid);
-      if (!pids.includes(entry.server_pid)) pids.push(entry.server_pid);
-    } else {
-      // Unclaimed child: no identity to union by — drain only our own pid.
-      pids = [entry.server_pid];
-    }
-    const { messages: drained, skipped } = mailbox.drainMany(pids);
-    // Merge chronologically; stable sort keeps drainMany's oldest-pid-first
-    // order for same-second ties.
+    // Union by identity: the session box (canonical v0.17+ inbox) plus every
+    // sibling/previous pid box still holding legacy traffic, plus our own pid
+    // as a guaranteed floor. Mirrors the hook. Unclaimed child: own pid only.
+    const boxes = inboxBoxes(entry.server_pid, sid);
+    const { messages: drained, skipped } = mailbox.drainMany(boxes);
+    // Merge chronologically; stable sort keeps drainMany's session-box-first /
+    // oldest-pid-first order for same-second ties.
     drained.sort((a, b) => a.enqueued_at - b.enqueued_at);
     const { messages: budgeted, deferred } = budgetMessages(drained);
-    // Lossless overflow: re-home deferred whole messages to our own mailbox for
-    // the next drain/hook in one atomic append. If THAT fails (the originals are
-    // already drained off disk), fall back to returning the overflow inline this
-    // once — exceeding the budget beats dropping messages. Bodies never truncated.
+    // Lossless overflow: re-home deferred whole messages to our own inbox for
+    // the next drain/hook in one atomic append — the session box when claimed
+    // (so they survive a pid rotation while parked), else our own pid box. If
+    // THAT fails (the originals are already drained off disk), fall back to
+    // returning the overflow inline this once — exceeding the budget beats
+    // dropping messages. Bodies never truncated.
     let messages = budgeted;
     let deferredCount = deferred.length;
     if (deferred.length > 0) {
       try {
-        mailbox.requeueMany(entry.server_pid, deferred);
+        mailbox.requeueMany(
+          sid ? mailbox.mailboxSessionKey(sid) : entry.server_pid,
+          deferred,
+        );
       } catch {
         messages = [...budgeted, ...deferred];
         deferredCount = 0;
@@ -2064,48 +2094,42 @@ async function resolveSendWake(
   return {};
 }
 
-// Poll my mailbox at ASK_PEER_POLL_MS until a matching reply lands or the
+// Poll my inbox at ASK_PEER_POLL_MS until a matching reply lands or the
 // deadline elapses. Each tick checks mtime first and only acquires the
 // mailbox lock when there's a probable hit. The lock is held only inside
 // drainMatchingSession (sub-10ms) — never across the poll interval, so the
 // PreToolUse hook on subsequent caller tool calls is never starved.
-// The requester's mailbox pid union: own pid first (fast-path locality), then
-// any sibling/previous MCP child sharing the session_id. Recomputed at the final
-// drain so a sibling that appeared DURING the wait is still covered.
-function requesterPids(ownPid: number, sessionId: string | undefined): number[] {
-  return sessionId
-    ? [ownPid, ...sessionPidsForId(sessionId).filter((p) => p !== ownPid)]
-    : [ownPid];
-}
-
+// The requester's inbox union (session box + own pid + siblings) is recomputed
+// at the final drain so a sibling that appeared DURING the wait is covered.
 async function askPeerPoll(
-  pids: number[],
+  boxes: mailbox.BoxId[],
+  ownPid: number,
   from_session_id: string,
   request_id: string,
   require_reply_to: boolean,
   deadlineMs: number,
   signal: AbortSignal,
 ): Promise<mailbox.Mailbox | null> {
-  // Watch the mtime of EVERY sibling pid's mailbox (a dual-scope requester's
-  // reply may land in a pid other than the one blocked here), draining only when
-  // a file that exists has changed — so the lock is acquired on a probable hit,
-  // never every tick. Mirrors the single-pid optimization, widened to the union.
-  const lastMtimes = new Map<number, number>();
+  // Watch the mtime of EVERY inbox box (the reply's landing box depends on the
+  // REPLIER's version: a v0.17+ peer writes our session box, an old peer writes
+  // a sibling pid), draining only when a file that exists has changed — so the
+  // lock is acquired on a probable hit, never every tick.
+  const lastMtimes = new Map<mailbox.BoxId, number>();
   while (Date.now() < deadlineMs) {
     if (signal.aborted) throw new Error("aborted");
     let changed = false;
-    for (const pid of pids) {
+    for (const box of boxes) {
       let m = -1;
       try {
-        m = statSync(mailbox.mailboxFilePath(pid)).mtimeMs;
+        m = statSync(mailbox.mailboxFilePath(box)).mtimeMs;
       } catch {
         // ENOENT: mailbox file not created yet
       }
-      if (m !== -1 && lastMtimes.get(pid) !== m) changed = true;
-      lastMtimes.set(pid, m);
+      if (m !== -1 && lastMtimes.get(box) !== m) changed = true;
+      lastMtimes.set(box, m);
     }
     if (changed) {
-      const reply = drainAskPeerReply(pids, from_session_id, request_id, require_reply_to);
+      const reply = drainAskPeerReply(boxes, ownPid, from_session_id, request_id, require_reply_to);
       if (reply) return reply;
     }
     const remaining = deadlineMs - Date.now();
@@ -2116,17 +2140,19 @@ async function askPeerPoll(
 }
 
 function drainAskPeerReply(
-  pids: number[],
+  boxes: mailbox.BoxId[],
+  ownPid: number,
   from_session_id: string,
   request_id: string,
   require_reply_to: boolean,
 ): mailbox.Mailbox | null {
-  // Correlated peers: union-drain by reply_to across the requester's siblings.
+  // Correlated peers: union-drain by reply_to across the requester's inbox.
   // Legacy/uncorrelated peers: keep the best-effort own-pid session match (no
-  // request_id to correlate the union safely).
+  // request_id to correlate the union safely — and a legacy peer's server only
+  // ever enqueues to pid boxes anyway).
   return require_reply_to
-    ? mailbox.drainMatchingReplyMany(pids, from_session_id, request_id)
-    : mailbox.drainMatchingSession(pids[0], from_session_id);
+    ? mailbox.drainMatchingReplyMany(boxes, from_session_id, request_id)
+    : mailbox.drainMatchingSession(ownPid, from_session_id);
 }
 
 server.registerTool(
@@ -2188,13 +2214,14 @@ server.registerTool(
     const requestId = randomBytes(8).toString("hex");
     const requireReplyTo = peerSupportsReplyTo(peer);
     const fromSessionId = entry.client.session_id ?? undefined;
-    // The reply is addressed to OUR session_id; resolveTarget enqueues it to the
-    // session's freshest sibling, which may not be entry.server_pid. Drain the
-    // union (own pid first for fast-path locality), mirroring read_my_messages.
-    const myPids: number[] = requesterPids(entry.server_pid, fromSessionId);
+    // The reply is addressed to OUR session_id; which box it lands in depends
+    // on the REPLIER's version (session box from v0.17+ peers, a sibling pid
+    // from older ones). Watch/drain the whole inbox union, mirroring
+    // read_my_messages.
+    const myBoxes = inboxBoxes(entry.server_pid, fromSessionId);
     // Record-before-append (mirrors send_message): lets the peer answer with
     // reply_to_message(message_id) instead of hand-wiring target + reply_to.
-    const msg = deliverToPeer(expectedSessionId, peer.server_pid, body, fromSessionId, {
+    const msg = deliverToPeer(routeFor(peer), body, fromSessionId, {
       request_id: requestId,
     });
     const startedAt = Date.now();
@@ -2221,7 +2248,8 @@ server.registerTool(
       // their response may already be in our mailbox.
       await askPeerDelay(ASK_PEER_GRACE_MS, extra.signal);
       reply = drainAskPeerReply(
-        myPids,
+        myBoxes,
+        entry.server_pid,
         expectedSessionId,
         requestId,
         requireReplyTo,
@@ -2249,7 +2277,8 @@ server.registerTool(
           // return this and the caller fail-fasts instead of polling.
         } else {
           reply = await askPeerPoll(
-            myPids,
+            myBoxes,
+            entry.server_pid,
             expectedSessionId,
             requestId,
             requireReplyTo,
@@ -2279,7 +2308,7 @@ server.registerTool(
         // requester's received-ledger entry so reply_to_message against the
         // displayed id still resolves. mailbox.enqueue would mint a NEW id and
         // skip the ledger, breaking the reply handle on the abort path.
-        deliverExistingToPeer(entry.client.session_id, entry.server_pid, reply);
+        deliverExistingToPeer(selfRoute(), reply);
         trace("ask_peer_abort_reenqueue", { message_id: reply.id });
       } catch (e) {
         trace("ask_peer_abort_reenqueue_failed", {
@@ -2318,15 +2347,15 @@ server.registerTool(
           // (no durable pull-back). Surface it so the degradation is observable.
           trace("ask_peer_pending_record_failed", { request_id: requestId });
         }
-        // Authoritative final drain. Recompute the pid union NOW — a sibling MCP
-        // child may have appeared during the wait. Use the CHECKED variant and
-        // retry any pid we couldn't inspect (transient lock): silently treating
-        // "couldn't read" as "no reply" would leave the record with no later
-        // event to consume it → a stranded pull-back.
-        const finalPids = requesterPids(entry.server_pid, fromSessionId);
-        let drained = mailbox.drainMatchingReplyManyChecked(finalPids, expectedSessionId, requestId);
+        // Authoritative final drain. Recompute the inbox union NOW — a sibling
+        // MCP child may have appeared during the wait. Use the CHECKED variant
+        // and retry any box we couldn't inspect (transient lock): silently
+        // treating "couldn't read" as "no reply" would leave the record with no
+        // later event to consume it → a stranded pull-back.
+        const finalBoxes = inboxBoxes(entry.server_pid, fromSessionId);
+        let drained = mailbox.drainMatchingReplyManyChecked(finalBoxes, expectedSessionId, requestId);
         if (drained.skipped.length > 0) {
-          // A pid we couldn't inspect might hold either the already-landed reply
+          // A box we couldn't inspect might hold either the already-landed reply
           // (if we have none yet) OR a migrate-crash duplicate of the reply we DID
           // pull (which a later read_my_messages would re-deliver). Retry once
           // after a brief delay for the lock to clear.
@@ -2433,8 +2462,9 @@ async function maybeHookHint(): Promise<void> {
     } else if (fresh.status === "stale") {
       process.stderr.write(
         `[oxtail] installed hooks are out of date (${fresh.driftedHooks.join(", ")} drifted from this version) — ` +
-          "run `npx oxtail install-hook` to upgrade. A stale PreToolUse hook silently breaks correlated " +
-          "ask/reply by not surfacing request_id to the receiving peer.\n",
+          "run `npx oxtail install-hook` to upgrade. A pre-v8 hook only drains the legacy pid mailboxes, " +
+          "so it can MISS session-box mail from v0.17+ peers entirely (delivery degrades to read_my_messages " +
+          "until you re-install).\n",
       );
     }
     // "ok" / "unknown" → stay silent.

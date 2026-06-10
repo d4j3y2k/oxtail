@@ -12,7 +12,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ClientInfo } from "./clients.js";
-import { mailboxHasMessages, migrateMailbox } from "./mailbox.js";
+import { mailboxHasMessages, mailboxSessionKey, migrateMailbox } from "./mailbox.js";
 
 export type StateCard = {
   purpose: string | null;
@@ -28,6 +28,12 @@ export type RegistryEntry = {
   // Optional for backward compat with entries written before this field existed.
   proc_sig?: string;
   client: ClientInfo;
+  // Precomputed session-box filename stem (mailboxSessionKey of
+  // client.session_id; null pre-claim). Stored so the bash hooks can read the
+  // key from the registry file they already grep — they must NEVER re-derive it
+  // (single named protocol primitive, per Codex review). register() recomputes
+  // it on every write, so it can't go stale against session_id.
+  mailbox_key?: string | null;
   tmux_pane: string | null;
   tmux_session: string | null;
   state: StateCard | null;
@@ -39,6 +45,11 @@ export type RegistryCapabilities = {
     reply_to?: boolean;
     provenance?: boolean;
     push_budget?: boolean;
+    // v0.17+: this peer drains its SESSION box (mailboxSessionKey-keyed), so
+    // senders should deliver there. Absent/false = pre-v0.17 reader that only
+    // drains pid boxes — senders must fall back to the legacy pid path or the
+    // message would never be seen.
+    session_keyed?: boolean;
   };
 };
 
@@ -47,6 +58,7 @@ export const CURRENT_CAPABILITIES: RegistryCapabilities = {
     reply_to: true,
     provenance: true,
     push_budget: true,
+    session_keyed: true,
   },
 };
 
@@ -161,6 +173,14 @@ export function readEntryFile(dir: string, file: string): RegistryEntry | null {
   }
   if (entry.server_pid !== fnamePid) return null;
   return entry;
+}
+
+// Re-read a single pid's on-disk entry, enforcing the same filename/server_pid
+// provenance rule as readEntryFile. Used for freshness checks against a cached
+// in-memory entry: PID-reuse guards (compare started_at/proc_sig) and the
+// legacy-send breadcrumb re-check in delivery.ts.
+export function entryForPid(pid: number): RegistryEntry | null {
+  return readEntryFile(registryDir(), `${pid}.json`);
 }
 
 function resolveTmuxSessionFromPane(pane: string | null): string | null {
@@ -301,6 +321,12 @@ export function refreshTmuxBinding(entry: RegistryEntry): void {
 
 export function register(entry: RegistryEntry): void {
   ensureDir();
+  // Recompute the session-box key on every write so it can never drift from
+  // client.session_id (claim_session, sticky recovery, and handshake refinement
+  // all mutate session_id and then re-register).
+  entry.mailbox_key = entry.client.session_id
+    ? mailboxSessionKey(entry.client.session_id)
+    : null;
   // PUBLICATION ORDER (per Codex review): write OUR registry breadcrumb BEFORE
   // touching dead siblings. gcDeadSiblings() migrates a dead sibling's mail into
   // entry.server_pid's mailbox and then unlinks that sibling's registry file; if
@@ -348,11 +374,15 @@ function gcDeadSiblings(entry: RegistryEntry): void {
     if (isAlive(other.server_pid)) continue;
     // Consolidate before dropping: a peer may have enqueued to this dead
     // sibling's pid mailbox before we (the restarted/sibling child) registered.
-    // Move that undrained mail into our own mailbox — same session_id, same
-    // agent identity — so the message survives the pid rotation instead of
+    // Move that undrained mail into our own inbox — the SESSION box when
+    // claimed (the canonical v0.17+ inbox, immune to further pid rotation),
+    // else our own pid box — so the message survives the rotation instead of
     // being orphaned with the registry file. Best-effort; never blocks register.
     try {
-      migrateMailbox(other.server_pid, entry.server_pid);
+      migrateMailbox(
+        other.server_pid,
+        sid ? mailboxSessionKey(sid) : entry.server_pid,
+      );
     } catch {
       // migration is best-effort; we decide below whether to drop the breadcrumb
     }

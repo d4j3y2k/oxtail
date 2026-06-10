@@ -1,10 +1,10 @@
 import { strict as assert } from "node:assert";
-import { mkdirSync, mkdtempSync, rmdirSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import * as mailbox from "./mailbox.js";
-import { deliverExistingToPeer, deliverToPeer } from "./delivery.js";
+import { deliverExistingToPeer, deliverToPeer, routeBox, type DeliveryRoute } from "./delivery.js";
 import { lookupReceived, receivedFilePath, recordReceived } from "./received.js";
 
 function withHome<T>(fn: (home: string) => T): T {
@@ -27,6 +27,51 @@ const RECEIVER = "11111111-1111-1111-1111-111111111111";
 const SENDER = "22222222-2222-2222-2222-222222222222";
 const PID = 4242;
 
+const KEYED: DeliveryRoute = { session_id: RECEIVER, server_pid: PID, session_keyed: true };
+const LEGACY: DeliveryRoute = { session_id: RECEIVER, server_pid: PID, session_keyed: false };
+const UNCLAIMED: DeliveryRoute = { session_id: null, server_pid: PID, session_keyed: false };
+
+const RECEIVER_BOX = mailbox.mailboxSessionKey(RECEIVER);
+
+// Write a registry breadcrumb for PID claiming RECEIVER, the way a live legacy
+// peer's entry looks on disk — so the legacy-send breadcrumb re-check passes.
+function writeBreadcrumb(home: string, pid: number, sessionId: string | null): void {
+  const dir = join(home, ".oxtail", "sessions");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(
+    join(dir, `${pid}.json`),
+    JSON.stringify(
+      {
+        server_pid: pid,
+        started_at: Math.floor(Date.now() / 1000),
+        client: {
+          type: "claude-code",
+          session_id: sessionId,
+          transcript_path: null,
+          session_id_source: "self-register",
+          cwd: home,
+        },
+        tmux_pane: null,
+        tmux_session: null,
+        state: null,
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+test("delivery: routeBox — session box for capable claimed peers, pid box otherwise", () => {
+  assert.equal(routeBox(KEYED), RECEIVER_BOX);
+  assert.equal(routeBox(LEGACY), PID, "no capability advertised → legacy pid box");
+  assert.equal(routeBox(UNCLAIMED), PID, "unclaimed → pid box even if capability were set");
+  assert.equal(
+    routeBox({ session_id: null, server_pid: PID, session_keyed: true }),
+    PID,
+    "session_keyed without a session_id still has no session box to route to",
+  );
+});
+
 // Abort-recovery path: an ALREADY-BUILT reply must be re-delivered without
 // minting a new id, and must (re)write the requester's ledger so the displayed
 // message_id stays resolvable. The old path used mailbox.enqueue, which minted a
@@ -39,10 +84,10 @@ test("delivery: deliverExistingToPeer preserves the id AND records the ledger ha
       source_message_id: "q-1",
     });
 
-    deliverExistingToPeer(RECEIVER, PID, original);
+    deliverExistingToPeer(KEYED, original);
 
-    const drained = mailbox.drain(PID);
-    assert.equal(drained.length, 1, "reply re-delivered to the mailbox");
+    const drained = mailbox.drain(RECEIVER_BOX);
+    assert.equal(drained.length, 1, "reply re-delivered to the session box");
     assert.equal(drained[0].id, original.id, "id preserved — NOT re-minted");
     assert.equal(drained[0].body, "the answer");
     assert.equal(drained[0].request_id, "ask-7");
@@ -57,7 +102,7 @@ test("delivery: deliverExistingToPeer preserves the id AND records the ledger ha
 test("delivery: deliverExistingToPeer to an unclaimed receiver still delivers (no ledger)", () => {
   withHome(() => {
     const original = mailbox.buildMessage("for unclaimed", SENDER);
-    deliverExistingToPeer(null, PID, original);
+    deliverExistingToPeer(UNCLAIMED, original);
     const drained = mailbox.drain(PID);
     assert.equal(drained.length, 1);
     assert.equal(drained[0].id, original.id, "id preserved even without a ledger");
@@ -67,15 +112,63 @@ test("delivery: deliverExistingToPeer to an unclaimed receiver still delivers (n
 
 test("delivery: deliverToPeer makes the line drainable AND the handle resolvable", () => {
   withHome(() => {
-    const msg = deliverToPeer(RECEIVER, PID, "hi peer", SENDER, { request_id: "d1" });
+    const msg = deliverToPeer(KEYED, "hi peer", SENDER, { request_id: "d1" });
 
-    const drained = mailbox.drain(PID);
-    assert.equal(drained.length, 1, "message delivered to the mailbox");
+    const drained = mailbox.drain(RECEIVER_BOX);
+    assert.equal(drained.length, 1, "message delivered to the session box");
     assert.equal(drained[0].id, msg.id);
 
     const found = lookupReceived(RECEIVER, msg.id);
     assert.ok(found, "reply handle resolvable even after the queue is drained");
     assert.equal(found!.request_id, "d1");
+  });
+});
+
+// Mixed-version routing: a peer that does NOT advertise session_keyed (a
+// pre-v0.17 reader) must keep receiving on its legacy pid box — its reader
+// never looks at the session box. With a live breadcrumb, no rescue copy.
+test("delivery: legacy peer with a live breadcrumb gets pid-box mail only", () => {
+  withHome((home) => {
+    writeBreadcrumb(home, PID, RECEIVER);
+    const msg = deliverToPeer(LEGACY, "old-school", SENDER);
+
+    const pidDrained = mailbox.drain(PID);
+    assert.equal(pidDrained.length, 1, "legacy pid box got the message");
+    assert.equal(pidDrained[0].id, msg.id);
+    assert.equal(
+      mailbox.mailboxHasMessages(RECEIVER_BOX),
+      false,
+      "no session-box copy when the breadcrumb is alive — old readers would never drain it and a later new reader would re-deliver it",
+    );
+  });
+});
+
+// The Codex-flagged mixed-version hole: a legacy send whose target breadcrumb
+// vanished in the resolve→enqueue gap leaves the pid-box mail unreachable by
+// ANY reader's session union. The rescue writes a session-box copy so a v0.17+
+// reader still receives it. Same message_id, so a union drain dedups.
+test("delivery: legacy send with a LOST breadcrumb rescues a session-box copy", () => {
+  withHome(() => {
+    // No registry file for PID at all — the breadcrumb is gone.
+    const msg = deliverToPeer(LEGACY, "rescued", SENDER);
+
+    assert.ok(mailbox.mailboxHasMessages(PID), "pid copy still written (legacy contract)");
+    assert.ok(mailbox.mailboxHasMessages(RECEIVER_BOX), "session-box rescue copy written");
+
+    // A v0.17+ reader union-drains both; message_id dedup delivers exactly once.
+    const { messages } = mailbox.drainMany([RECEIVER_BOX, PID]);
+    assert.equal(messages.length, 1, "union drain dedups the rescue copy");
+    assert.equal(messages[0].id, msg.id);
+  });
+});
+
+// A breadcrumb that exists but belongs to a DIFFERENT identity (pid reuse, or
+// the entry rotated to another session) is as lost as a missing one.
+test("delivery: legacy send with a breadcrumb claimed by another session rescues too", () => {
+  withHome((home) => {
+    writeBreadcrumb(home, PID, "99999999-9999-9999-9999-999999999999");
+    deliverToPeer(LEGACY, "stolen pid", SENDER);
+    assert.ok(mailbox.mailboxHasMessages(RECEIVER_BOX), "rescue copy written");
   });
 });
 
@@ -132,10 +225,10 @@ test("delivery: ledger write failure still appends the message", () => {
     mkdirSync(dirname(lock), { recursive: true });
     mkdirSync(lock); // occupy the (fresh, non-stale) lock so recordReceived throws
     try {
-      const msg = deliverToPeer(RECEIVER, PID, "must still arrive", SENDER, {
+      const msg = deliverToPeer(KEYED, "must still arrive", SENDER, {
         request_id: "avail-1",
       });
-      const drained = mailbox.drain(PID);
+      const drained = mailbox.drain(RECEIVER_BOX);
       assert.equal(drained.length, 1, "delivery proceeds even when the ledger write fails");
       assert.equal(drained[0].id, msg.id);
       assert.equal(drained[0].body, "must still arrive");
@@ -147,7 +240,7 @@ test("delivery: ledger write failure still appends the message", () => {
 
 test("delivery: unclaimed receiver still gets the message, just no ledger handle", () => {
   withHome(() => {
-    const msg = deliverToPeer(null, PID, "for an unclaimed peer", SENDER);
+    const msg = deliverToPeer(UNCLAIMED, "for an unclaimed peer", SENDER);
     const drained = mailbox.drain(PID);
     assert.equal(drained.length, 1, "delivery must not depend on a ledger write");
     assert.equal(drained[0].body, "for an unclaimed peer");

@@ -27,7 +27,11 @@ function parseVersion(text) {
 }
 
 const base = process.argv[2] || process.env.GITHUB_BASE_SHA || "origin/main";
-const HOOK_ASSET_RE = /^assets\/.*\.sh$/;
+// Hook scripts AND the hook-drain helper entry: both run as the installed hook
+// surface. (The helper's mailbox/locks deps drift via the marker hash check at
+// server startup instead — bumping the version for every mailbox.ts change
+// would be noise.)
+const HOOK_ASSET_RE = /^(assets\/.*\.sh|src\/hook-drain\.ts)$/;
 
 let changed;
 try {

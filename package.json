@@ -1,6 +1,6 @@
 {
   "name": "oxtail",
-  "version": "0.16.2",
+  "version": "0.17.0",
   "private": false,
   "type": "module",
   "description": "Coordination layer for parallel AI coding agent sessions, exposed over MCP.",
@@ -22,6 +22,7 @@
     "build": "tsc",
     "dev": "tsx watch src/server.ts",
     "start": "node dist/server.js",
+    "pretest": "npm run build",
     "test": "node --import tsx --test 'src/**/*.test.ts'",
     "prepack": "rm -rf dist && npm run build",
     "prepublishOnly": "npm test"
