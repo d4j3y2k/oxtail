@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { execFileSync } from "node:child_process";
 import { test } from "node:test";
-import { ASK_PEER_WAKE_TEXT, askPeerWakeImpl } from "./server.js";
+import { ASK_PEER_WAKE_TEXT, askPeerWakeImpl } from "./wake.js";
 
 // Phase D: the wake prompt is trimmed, but because Codex / hookless Claude peers
 // see only raw mailbox JSON (no reply instruction) after waking, the wake text
