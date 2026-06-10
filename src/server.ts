@@ -4,7 +4,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import * as z from "zod/v4";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import {
   clientFromHandshake,
   detectClient,
@@ -1957,10 +1958,24 @@ async function maybeHookHint(): Promise<void> {
 // Importing server.ts (e.g. from a test that needs an exported helper) used
 // to await server.connect(transport) at module load — which never resolves
 // without stdin EOF and hung `npm test` indefinitely. Gate the transport
-// behind a direct-invocation check, mirroring scripts/install-hook.mjs.
-const invokedDirectly =
-  typeof process.argv[1] === "string" &&
-  import.meta.url === new URL(process.argv[1], "file:").href;
+// behind a direct-invocation check, mirroring hook-drain.ts.
+//
+// argv[1] MUST be realpathed before the comparison (found live verifying
+// v0.18.0): Node's ESM loader resolves symlinks for import.meta.url, so
+// invoking through any symlinked path (`/tmp` → `/private/tmp` on macOS,
+// pnpm's symlink-farm node_modules, a symlinked project dir) made the raw
+// string comparison miss — and the server exited 0 with NO output and NO
+// diagnostics, the worst possible failure shape for an MCP stdio binary.
+const invokedDirectly = (() => {
+  if (typeof process.argv[1] !== "string") return false;
+  let p = process.argv[1];
+  try {
+    p = realpathSync(p);
+  } catch {
+    // keep as-is; the comparison below then matches non-symlinked layouts
+  }
+  return import.meta.url === pathToFileURL(p).href;
+})();
 
 if (invokedDirectly) {
   const transport = new StdioServerTransport();
