@@ -2462,8 +2462,9 @@ async function maybeHookHint(): Promise<void> {
     } else if (fresh.status === "stale") {
       process.stderr.write(
         `[oxtail] installed hooks are out of date (${fresh.driftedHooks.join(", ")} drifted from this version) — ` +
-          "run `npx oxtail install-hook` to upgrade. A stale PreToolUse hook silently breaks correlated " +
-          "ask/reply by not surfacing request_id to the receiving peer.\n",
+          "run `npx oxtail install-hook` to upgrade. A pre-v8 hook only drains the legacy pid mailboxes, " +
+          "so it can MISS session-box mail from v0.17+ peers entirely (delivery degrades to read_my_messages " +
+          "until you re-install).\n",
       );
     }
     // "ok" / "unknown" → stay silent.

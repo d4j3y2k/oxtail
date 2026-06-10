@@ -162,6 +162,44 @@ function maxBodyChars(env: NodeJS.ProcessEnv): number {
 export const EXIT_NOTHING = 0;
 export const EXIT_DELIVERED = 3;
 
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// Write the WHOLE buffer to fd or report failure — never assume one writeSync
+// call wrote everything (Codex review BLOCK): writeSync returns bytes-written,
+// and a short write to the hook stdout pipe would otherwise produce malformed
+// hook JSON while the helper still truncated the boxes, turning a delivery
+// failure into destructive loss. EAGAIN (non-blocking pipe momentarily full)
+// retries briefly; any other error or exhausted retries returns false and the
+// caller MUST NOT truncate.
+function writeAllSync(fd: number, data: string): boolean {
+  const buf = Buffer.from(data, "utf8");
+  let off = 0;
+  let spins = 0;
+  while (off < buf.length) {
+    let n = 0;
+    try {
+      n = writeSync(fd, buf, off, buf.length - off);
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === "EAGAIN" && spins < 1_000) {
+        spins++;
+        sleepSync(1);
+        continue;
+      }
+      return false;
+    }
+    if (n <= 0) {
+      if (++spins >= 1_000) return false;
+      sleepSync(1);
+      continue;
+    }
+    off += n;
+  }
+  return true;
+}
+
 export function runHookDrain(
   argv: string[],
   env: NodeJS.ProcessEnv = process.env,
@@ -226,10 +264,15 @@ export function runHookDrain(
         ? renderPreToolUse(msgs, budget)
         : renderStop(msgs, budget);
 
-    // Write the envelope BEFORE truncating: once these bytes are out they are
-    // the hook's stdout, so a crash after this point re-delivers (dedup-able)
-    // rather than losing. writeSync flushes synchronously.
-    writeSync(stdoutFd, envelope + "\n");
+    // Write the FULL envelope BEFORE truncating: once these bytes are out they
+    // are the hook's stdout, so a crash after this point re-delivers
+    // (dedup-able) rather than losing. If the write can't complete (short
+    // write, broken pipe), FAIL OPEN: leave every box intact — the messages
+    // re-deliver on the next event instead of being destroyed behind a
+    // malformed envelope.
+    if (!writeAllSync(stdoutFd, envelope + "\n")) {
+      return EXIT_NOTHING;
+    }
     for (const { path } of locked) {
       try {
         truncateSync(path, 0);
