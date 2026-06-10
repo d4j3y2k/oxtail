@@ -17,6 +17,9 @@ import {
   HOOK_MARKER_KEY,
   HOOK_MARKER_VERSION,
   MANAGED_HOOKS,
+  HELPER_FILES,
+  HELPER_PACKAGE_JSON,
+  DIST_DIR,
   scriptHash,
 } from "./hook-constants.mjs";
 
@@ -42,12 +45,32 @@ function findOxtailHookIndex(parsed, event, asset) {
 }
 
 export async function install() {
-  // Read shipped scripts + compute hashes up front.
+  // Read shipped scripts + compute hashes up front. Hashes are of the SHIPPED
+  // text (pre-substitution) — assessHookFreshness compares marker-vs-shipped,
+  // never re-hashes the installed (node-path-substituted) file.
   const shipped = [];
   for (const hook of MANAGED_HOOKS) {
     const shippedPath = new URL(`../assets/${hook.asset}`, import.meta.url).pathname;
     const text = await readFile(shippedPath, "utf8");
     shipped.push({ ...hook, text, hash: scriptHash(text) });
+  }
+  // The hook-drain helper + its compiled dependency closure (the same lock/
+  // mailbox code the server runs). Copied beside the hook scripts so the hooks
+  // never depend on the ephemeral npx package dir. Hard-fail if dist/ is
+  // missing — installing hooks that fail open forever would be a silent
+  // delivery regression.
+  const helpers = [];
+  for (const f of HELPER_FILES) {
+    const srcPath = path.join(DIST_DIR, f.dist);
+    let text;
+    try {
+      text = await readFile(srcPath, "utf8");
+    } catch {
+      throw new Error(
+        `helper source missing: ${srcPath}. In a dev checkout, run \`npm run build\` first.`,
+      );
+    }
+    helpers.push({ ...f, text, hash: scriptHash(text) });
   }
 
   let source = "{}\n";
@@ -65,7 +88,9 @@ export async function install() {
         markerHashes[h.id] === h.hash &&
         findOxtailHookIndex(parsed, h.event, h.asset) >= 0 &&
         existsSync(h.scriptPath),
-    );
+    ) &&
+    helpers.every((f) => markerHashes[f.id] === f.hash && existsSync(f.installPath)) &&
+    existsSync(HELPER_PACKAGE_JSON);
   if (upToDate) {
     console.log(`oxtail hooks already installed (v${HOOK_MARKER_VERSION}). No changes.`);
     return;
@@ -101,15 +126,33 @@ export async function install() {
     console.log(`Backed up existing settings to ${backup}`);
   }
 
-  // Install each shipped script atomically.
+  // Install each shipped script atomically, baking the absolute node binary
+  // path into the __OXTAIL_NODE__ placeholder so the hook helper runs even when
+  // a GUI-launched Claude Code session's PATH lacks node (the script still
+  // falls back to `command -v node` if this binary later disappears, e.g. an
+  // nvm upgrade — and fails open if both are gone).
   for (const h of shipped) {
     const hooksDir = path.dirname(h.scriptPath);
     await mkdir(hooksDir, { recursive: true, mode: 0o755 });
+    const installedText = h.text.replace('"__OXTAIL_NODE__"', JSON.stringify(process.execPath));
     const scriptTmp = `${h.scriptPath}.tmp-${randomBytes(6).toString("hex")}`;
     // writeFile's `mode` only applies on creation; explicit chmod for belt+braces.
-    await writeFile(scriptTmp, h.text, { mode: 0o755 });
+    await writeFile(scriptTmp, installedText, { mode: 0o755 });
     await chmod(scriptTmp, 0o755);
     await rename(scriptTmp, h.scriptPath);
+  }
+  // Install the helper files + the ESM marker package.json (the copied dist
+  // files are ESM with .js names; the marker makes node treat them as modules).
+  for (const f of helpers) {
+    await mkdir(path.dirname(f.installPath), { recursive: true, mode: 0o755 });
+    const tmp = `${f.installPath}.tmp-${randomBytes(6).toString("hex")}`;
+    await writeFile(tmp, f.text, { mode: 0o644 });
+    await rename(tmp, f.installPath);
+  }
+  {
+    const tmp = `${HELPER_PACKAGE_JSON}.tmp-${randomBytes(6).toString("hex")}`;
+    await writeFile(tmp, JSON.stringify({ type: "module" }, null, 2) + "\n", { mode: 0o644 });
+    await rename(tmp, HELPER_PACKAGE_JSON);
   }
 
   // Edit settings.json: replace any prior oxtail entry per event, else append.
@@ -128,9 +171,10 @@ export async function install() {
     );
   }
 
-  // Write the marker with per-hook hashes.
+  // Write the marker with per-hook + per-helper-file hashes.
   const hashes = {};
   for (const h of shipped) hashes[h.id] = h.hash;
+  for (const f of helpers) hashes[f.id] = f.hash;
   text = applyEdits(
     text,
     modify(

@@ -21,6 +21,9 @@ import { register, type RegistryEntry } from "./registry.js";
 import { enqueue, mailboxFilePath, mailboxLockPath } from "./mailbox.js";
 
 const HOOK_SCRIPT = resolve(import.meta.dirname, "..", "assets", "stop.sh");
+// The compiled hook-drain helper (built by the pretest step). Installed systems
+// have it copied beside the hook script; tests point the override env at dist.
+const HOOK_HELPER = resolve(import.meta.dirname, "..", "dist", "hook-drain.js");
 
 function fakeEntry(home: string, peerPid: number, sessionId: string): RegistryEntry {
   return {
@@ -46,7 +49,7 @@ function runHook(env: Record<string, string>, stdin?: string): Promise<{
 }> {
   return new Promise((resolveResult) => {
     const child = spawn("bash", [HOOK_SCRIPT], {
-      env: { PATH: process.env.PATH ?? "", ...env },
+      env: { PATH: process.env.PATH ?? "", OXTAIL_HOOK_HELPER: HOOK_HELPER, ...env },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -114,7 +117,7 @@ test("stop: happy path — single message becomes a decision:block reason", asyn
   });
 });
 
-test("stop: body budget truncates before incomplete JSON unicode escapes", async () => {
+test("stop: body budget truncates (decoded chars; v8 helper counts decoded, not escaped)", async () => {
   await withHome(async (home) => {
     const peerPid = 72013;
     const sid = "33333333-4444-5555-6666-777777777777";
@@ -127,7 +130,9 @@ test("stop: body budget truncates before incomplete JSON unicode escapes", async
       hook_event_name: "Stop",
       stop_hook_active: false,
     });
-    const r = await runHook({ HOME: home, OXTAIL_HOOK_MAX_BODY_CHARS: "4" }, stdin);
+    // v8: the budget counts DECODED characters (the old awk counted JSON-escaped
+    // chars). 2 keeps exactly "aa" of the 5-char body.
+    const r = await runHook({ HOME: home, OXTAIL_HOOK_MAX_BODY_CHARS: "2" }, stdin);
     assert.equal(r.code, 0, `stderr: ${r.stderr}`);
     const parsed = JSON.parse(r.stdout);
     assert.equal(parsed.decision, "block");
@@ -376,6 +381,45 @@ test("stop: stdout is exactly one JSON line, no sentinel leakage", async () => {
       1,
       "exactly one non-empty line on stdout",
     );
+  });
+});
+
+// ── v8: session-box delivery + helper fail-open ─────────────────────────────
+
+test("stop: drains the SESSION box advertised by the registry entry's mailbox_key", async () => {
+  await withHome(async (home) => {
+    const peerPid = 72600;
+    const sid = "5e552011-0000-4111-8111-c0c0c0c0c0c0";
+    register(fakeEntry(home, peerPid, sid));
+    const { mailboxSessionKey } = await import("./mailbox.js");
+    const sessionBox = mailboxSessionKey(sid);
+    enqueue(sessionBox, "turn-end session-box message");
+
+    const r = await runHook({ HOME: home }, JSON.stringify({ session_id: sid, stop_hook_active: false }));
+    assert.equal(r.code, 0, `stderr: ${r.stderr}`);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(parsed.decision, "block");
+    assert.ok(parsed.reason.includes("---\nturn-end session-box message"));
+    assert.equal(readFileSync(mailboxFilePath(sessionBox), "utf8"), "", "session box drained");
+    assert.equal(activityStatus(home, sid), null, "blocking → busy marker untouched");
+  });
+});
+
+test("stop: missing helper FAILS OPEN as a real stop — idle marked, mailbox intact", async () => {
+  await withHome(async (home) => {
+    const peerPid = 72601;
+    const sid = "5e552012-0000-4111-8111-c0c0c0c0c0c1";
+    register(fakeEntry(home, peerPid, sid));
+    enqueue(peerPid, "survives fail-open");
+
+    const r = await runHook(
+      { HOME: home, OXTAIL_HOOK_HELPER: join(home, "no-such-helper.mjs") },
+      JSON.stringify({ session_id: sid, stop_hook_active: false }),
+    );
+    assert.equal(r.code, 0);
+    assert.equal(r.stdout, "", "no envelope without the helper");
+    assert.ok(readFileSync(mailboxFilePath(peerPid), "utf8").includes("survives fail-open"));
+    assert.equal(activityStatus(home, sid), "idle", "fail-open is a real stop → idle");
   });
 });
 

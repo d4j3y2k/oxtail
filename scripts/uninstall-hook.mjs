@@ -14,6 +14,8 @@ import {
   SETTINGS_PATH,
   HOOK_MARKER_KEY,
   MANAGED_HOOKS,
+  HELPER_FILES,
+  HELPER_PACKAGE_JSON,
 } from "./hook-constants.mjs";
 
 const FORMATTING = { tabSize: 2, insertSpaces: true };
@@ -35,13 +37,18 @@ function findOxtailHookIndex(parsed, event, asset) {
 }
 
 async function removeScripts() {
-  for (const h of MANAGED_HOOKS) {
-    if (!existsSync(h.scriptPath)) continue;
+  const paths = [
+    ...MANAGED_HOOKS.map((h) => h.scriptPath),
+    ...HELPER_FILES.map((f) => f.installPath),
+    HELPER_PACKAGE_JSON,
+  ];
+  for (const p of paths) {
+    if (!existsSync(p)) continue;
     try {
-      await unlink(h.scriptPath);
-      console.log(`Removed ${h.scriptPath}.`);
+      await unlink(p);
+      console.log(`Removed ${p}.`);
     } catch (err) {
-      console.warn(`Could not remove ${h.scriptPath}: ${err?.message ?? err}`);
+      console.warn(`Could not remove ${p}: ${err?.message ?? err}`);
     }
   }
 }
@@ -62,7 +69,10 @@ export async function uninstall() {
   const anyEntry = MANAGED_HOOKS.some(
     (h) => findOxtailHookIndex(parsed, h.event, h.asset) >= 0,
   );
-  const anyScript = MANAGED_HOOKS.some((h) => existsSync(h.scriptPath));
+  const anyScript =
+    MANAGED_HOOKS.some((h) => existsSync(h.scriptPath)) ||
+    HELPER_FILES.some((f) => existsSync(f.installPath)) ||
+    existsSync(HELPER_PACKAGE_JSON);
 
   if (!anyEntry && !hasMarker && !anyScript) {
     console.log("oxtail hooks not installed — nothing to do.");

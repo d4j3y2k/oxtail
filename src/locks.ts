@@ -182,14 +182,18 @@ export function clearStaleLock(
 
 // Acquire the advisory lock, returning the owner token to hand back to
 // releaseDirLock. The caller is responsible for creating the parent directory.
+// `budgetMs` overrides the default wall-clock acquire budget: the hook delivery
+// helper passes a shorter one (it must never stall a tool call on a contended
+// box — skipping and retrying next event is the correct behavior there).
 export function acquireDirLock(
   lock: string,
   staleMs: number,
   traceEvent: string,
   traceCtx: Record<string, unknown>,
+  budgetMs: number = LOCK_ACQUIRE_TIMEOUT_MS,
 ): string {
   const token = mintToken();
-  const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS;
+  const deadline = Date.now() + budgetMs;
   for (;;) {
     try {
       mkdirSync(lock, { mode: 0o700 });

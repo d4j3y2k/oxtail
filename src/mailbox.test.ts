@@ -810,3 +810,118 @@ test("drainFirstMatching: atomic rewrite leaves no .tmp residue", () => {
     assert.deepEqual(mailbox.drain(pid).map((m) => m.body), ["first", "third"]);
   });
 });
+
+// ────────────────────────────────────────────────────────────────────────────
+// v0.17: session-keyed boxes — the mailboxSessionKey protocol primitive and
+// session-box round-trips. The key is the SINGLE place the filename derivation
+// lives (TS computes it; bash hooks only ever read the precomputed
+// `mailbox_key` from registry entries), so its edge cases are pinned here.
+// ────────────────────────────────────────────────────────────────────────────
+
+test("mailboxSessionKey: UUID passes through readably with a hash suffix", () => {
+  const sid = "11667440-01fe-4367-93e4-ad5a067afeb3";
+  const key = mailbox.mailboxSessionKey(sid);
+  assert.ok(key.startsWith("s-11667440-01fe-4367-93e4-ad5a067afeb3-"), key);
+  assert.match(key, /^s-[A-Za-z0-9_-]+-[0-9a-f]{8}$/);
+});
+
+test("mailboxSessionKey: deterministic — same id, same key", () => {
+  const sid = "019e9e9b-765c-7e21-abd5-a0b649473c42";
+  assert.equal(mailbox.mailboxSessionKey(sid), mailbox.mailboxSessionKey(sid));
+});
+
+test("mailboxSessionKey: hostile ids (slash, dotdot, newline, unicode) stay confined", () => {
+  for (const hostile of [
+    "../../etc/passwd",
+    "a/b/c",
+    "x\ny",
+    "naïve-séssion-🦊",
+    "..",
+    "s-already-prefixed",
+  ]) {
+    const key = mailbox.mailboxSessionKey(hostile);
+    assert.match(key, /^s-[A-Za-z0-9_-]+-[0-9a-f]{8}$/, `key for ${JSON.stringify(hostile)}`);
+    assert.ok(!key.includes("/"), "no path separators");
+    assert.ok(!key.includes("\n"), "no newlines");
+  }
+});
+
+test("mailboxSessionKey: ids that sanitize identically still get DISTINCT keys (hash suffix)", () => {
+  // Both sanitize to "a_b" — the collision Codex flagged as the one reason to
+  // hash. The 8-hex sha256 suffix keeps them apart.
+  const a = mailbox.mailboxSessionKey("a/b");
+  const b = mailbox.mailboxSessionKey("a.b");
+  assert.notEqual(a, b, "sanitize-collision must not share a mailbox");
+});
+
+test("mailboxSessionKey: long ids are capped but remain distinct", () => {
+  const base = "x".repeat(100);
+  const a = mailbox.mailboxSessionKey(base + "1");
+  const b = mailbox.mailboxSessionKey(base + "2");
+  assert.ok(a.length <= 2 + 40 + 1 + 8, `capped length, got ${a.length}`);
+  assert.notEqual(a, b);
+});
+
+test("mailboxSessionKey: empty id throws (a shared 'empty' box would cross-deliver)", () => {
+  assert.throws(() => mailbox.mailboxSessionKey(""));
+});
+
+test("mailbox: malformed string box ids are rejected before becoming paths", () => {
+  withHome(() => {
+    for (const bad of ["../../escape", "s-", "s-has/slash", "plain-name", ""]) {
+      assert.throws(() => mailbox.drain(bad), `box ${JSON.stringify(bad)} must throw`);
+    }
+  });
+});
+
+test("mailbox: session-box enqueue/drain round-trip", () => {
+  withHome(() => {
+    const box = mailbox.mailboxSessionKey("33333333-3333-4333-8333-333333333333");
+    const sent = mailbox.enqueue(box, "to the session box", "sender-sid", {
+      request_id: "rq-1",
+    });
+    const drained = mailbox.drain(box);
+    assert.equal(drained.length, 1);
+    assert.equal(drained[0].id, sent.id);
+    assert.equal(drained[0].body, "to the session box");
+    assert.equal(readFileSync(mailbox.mailboxFilePath(box), "utf8"), "");
+  });
+});
+
+test("mailbox: drainMany unions session box + pid boxes and dedups by message_id", () => {
+  withHome(() => {
+    const sid = "44444444-4444-4444-8444-444444444444";
+    const box = mailbox.mailboxSessionKey(sid);
+    const pid = 60123;
+    const inBoth = mailbox.buildMessage("duplicated by a crash-window", "p1");
+    mailbox.requeue(box, inBoth);
+    mailbox.requeue(pid, inBoth); // migrate-crash duplicate
+    mailbox.enqueue(pid, "distinct legacy message", "p2");
+
+    const { messages, skipped } = mailbox.drainMany([box, pid]);
+    assert.equal(skipped, 0);
+    assert.deepEqual(
+      messages.map((m) => m.body).sort(),
+      ["distinct legacy message", "duplicated by a crash-window"],
+      "exactly once each",
+    );
+    // Both boxes fully drained — the duplicate doesn't linger anywhere.
+    assert.equal(mailbox.mailboxHasMessages(box), false);
+    assert.equal(mailbox.mailboxHasMessages(pid), false);
+  });
+});
+
+test("mailbox: migrateMailbox into a SESSION box preserves ids and clears the source", () => {
+  withHome(() => {
+    const sid = "55555555-5555-4555-8555-555555555555";
+    const box = mailbox.mailboxSessionKey(sid);
+    const deadPid = 60999;
+    const sent = mailbox.enqueue(deadPid, "stranded on a dead pid", "peer");
+    const n = mailbox.migrateMailbox(deadPid, box);
+    assert.equal(n, 1);
+    assert.equal(mailbox.mailboxHasMessages(deadPid), false, "source cleared");
+    const drained = mailbox.drain(box);
+    assert.equal(drained.length, 1);
+    assert.equal(drained[0].id, sent.id, "id preserved across migration");
+  });
+});

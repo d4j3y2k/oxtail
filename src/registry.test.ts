@@ -713,7 +713,9 @@ test("register: migrates a dead sibling's mailbox into the new entry before unli
     register(makeRegistryEntry({ pid: process.pid, session_id: "uuid-mig", started_at: 2 }));
 
     assert.ok(!existsSync(join(dir, `${dead}.json`)), "dead sibling unlinked after migration");
-    const mine = mailbox.drain(process.pid);
+    // v0.17: a claimed live entry consolidates into its SESSION box — the
+    // canonical inbox, immune to a further pid rotation — not its pid box.
+    const mine = mailbox.drain(mailbox.mailboxSessionKey("uuid-mig"));
     assert.deepEqual(
       mine.map((m) => m.body),
       ["pre-restart"],
@@ -734,9 +736,10 @@ test("register: publishes the new breadcrumb before migrating; migrate failure k
       JSON.stringify(makeRegistryEntry({ pid: dead, session_id: "uuid-pub", started_at: 1 })),
     );
     mailbox.enqueue(dead, "pending");
-    // Force migrateMailbox(dead, process.pid)'s dest append to fail by holding a
-    // fresh lock on the new pid's mailbox so the migrate times out and throws.
-    const destLock = mailbox.mailboxLockPath(process.pid);
+    // Force the migrate's dest append to fail by holding a fresh lock on the
+    // live entry's SESSION box (the v0.17 consolidation target) so the migrate
+    // times out and throws.
+    const destLock = mailbox.mailboxLockPath(mailbox.mailboxSessionKey("uuid-pub"));
     mkdirSync(destLock, { recursive: true, mode: 0o700 });
     try {
       register(makeRegistryEntry({ pid: process.pid, session_id: "uuid-pub", started_at: 2 }));

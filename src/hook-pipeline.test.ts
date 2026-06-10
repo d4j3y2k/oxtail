@@ -19,9 +19,12 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { register, type RegistryEntry } from "./registry.js";
-import { enqueue, mailboxFilePath, mailboxLockPath } from "./mailbox.js";
+import { enqueue, mailboxFilePath, mailboxLockPath, mailboxSessionKey } from "./mailbox.js";
 
 const HOOK_SCRIPT = resolve(import.meta.dirname, "..", "assets", "pretooluse.sh");
+// The compiled hook-drain helper (built by the pretest step). Installed systems
+// have it copied beside the hook script; tests point the override env at dist.
+const HOOK_HELPER = resolve(import.meta.dirname, "..", "dist", "hook-drain.js");
 
 function fakeEntry(home: string, peerPid: number, sessionId: string): RegistryEntry {
   return {
@@ -47,7 +50,7 @@ function runHook(env: Record<string, string>, stdin?: string): Promise<{
 }> {
   return new Promise((resolveResult) => {
     const child = spawn("bash", [HOOK_SCRIPT], {
-      env: { PATH: process.env.PATH ?? "", ...env },
+      env: { PATH: process.env.PATH ?? "", OXTAIL_HOOK_HELPER: HOOK_HELPER, ...env },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -148,7 +151,7 @@ test("hook: stdin happy path — single message becomes additionalContext", asyn
   });
 });
 
-test("hook: body budget truncates before incomplete JSON unicode escapes", async () => {
+test("hook: body budget truncates (decoded chars; v8 helper counts decoded, not escaped)", async () => {
   await withHome(async (home) => {
     const peerPid = 71013;
     const sid = "33333333-4444-5555-6666-777777777777";
@@ -157,7 +160,9 @@ test("hook: body budget truncates before incomplete JSON unicode escapes", async
     enqueue(peerPid, "aa\u0000bb", senderSid);
 
     const stdin = JSON.stringify({ session_id: sid, hook_event_name: "PreToolUse" });
-    const r = await runHook({ HOME: home, OXTAIL_HOOK_MAX_BODY_CHARS: "4" }, stdin);
+    // v8: the budget counts DECODED characters (the old awk counted JSON-escaped
+    // chars). 2 keeps exactly "aa" of the 5-char body.
+    const r = await runHook({ HOME: home, OXTAIL_HOOK_MAX_BODY_CHARS: "2" }, stdin);
     assert.equal(r.code, 0, `stderr: ${r.stderr}`);
     const parsed = JSON.parse(r.stdout);
     const ctx = parsed.hookSpecificOutput.additionalContext;
@@ -334,6 +339,99 @@ test("hook coexistence: a second PreToolUse script's stdout is independent of ou
       r.stdout.split("\n").filter((l) => l.length > 0).length,
       1,
       "exactly one non-empty line on stdout",
+    );
+  });
+});
+
+// ── v8: session-box delivery + helper fail-open ─────────────────────────────
+
+test("hook: drains the SESSION box advertised by the registry entry's mailbox_key", async () => {
+  await withHome(async (home) => {
+    const peerPid = 71600;
+    const sid = "5e551011-0000-4111-8111-b0b0b0b0b0b0";
+    // register() computes + persists mailbox_key from the claimed session_id.
+    register(fakeEntry(home, peerPid, sid));
+    const sessionBox = mailboxSessionKey(sid);
+    enqueue(sessionBox, "via session box", "77777777-7777-7777-7777-777777777777", {
+      request_id: "rq-sb",
+    });
+
+    const r = await runHook({ HOME: home }, JSON.stringify({ session_id: sid }));
+    assert.equal(r.code, 0, `stderr: ${r.stderr}`);
+    const ctx = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
+    assert.ok(ctx.includes("---\nvia session box"), "session-box message delivered");
+    assert.ok(ctx.includes("request_id=rq-sb"));
+    assert.equal(readFileSync(mailboxFilePath(sessionBox), "utf8"), "", "session box drained");
+  });
+});
+
+test("hook: session box AND legacy pid box drain together, message_id dedup holds", async () => {
+  await withHome(async (home) => {
+    const peerPid = 71601;
+    const sid = "5e551012-0000-4111-8111-b0b0b0b0b0b1";
+    register(fakeEntry(home, peerPid, sid));
+    const sessionBox = mailboxSessionKey(sid);
+    enqueue(sessionBox, "new-path message");
+    enqueue(peerPid, "legacy-path message");
+
+    const r = await runHook({ HOME: home }, JSON.stringify({ session_id: sid }));
+    assert.equal(r.code, 0, `stderr: ${r.stderr}`);
+    const ctx = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
+    assert.ok(ctx.includes("[oxtail] 2 new peer message(s)"));
+    assert.ok(ctx.includes("---\nnew-path message"));
+    assert.ok(ctx.includes("---\nlegacy-path message"));
+    assert.equal(readFileSync(mailboxFilePath(sessionBox), "utf8"), "");
+    assert.equal(readFileSync(mailboxFilePath(peerPid), "utf8"), "");
+  });
+});
+
+test("hook: missing helper FAILS OPEN — exit 0, no output, mailbox intact", async () => {
+  await withHome(async (home) => {
+    const peerPid = 71602;
+    const sid = "5e551013-0000-4111-8111-b0b0b0b0b0b2";
+    register(fakeEntry(home, peerPid, sid));
+    enqueue(peerPid, "must survive");
+
+    const r = await runHook(
+      { HOME: home, OXTAIL_HOOK_HELPER: join(home, "no-such-helper.mjs") },
+      JSON.stringify({ session_id: sid }),
+    );
+    assert.equal(r.code, 0);
+    assert.equal(r.stdout, "");
+    assert.ok(
+      readFileSync(mailboxFilePath(peerPid), "utf8").includes("must survive"),
+      "fail-open must not drain",
+    );
+  });
+});
+
+test("hook helper: protocol mismatch FAILS OPEN — no output, no drain", async () => {
+  await withHome(async (home) => {
+    const peerPid = 71603;
+    const sid = "5e551014-0000-4111-8111-b0b0b0b0b0b3";
+    register(fakeEntry(home, peerPid, sid));
+    enqueue(peerPid, "protocol-guarded");
+
+    // Drive the helper directly with a wrong protocol number, the way a stale
+    // installed hook would after a helper upgrade.
+    const r = await new Promise<{ code: number; stdout: string; stderr: string }>((res) => {
+      const child = spawn(
+        process.execPath,
+        [HOOK_HELPER, "--event", "pretooluse", "--protocol", "999", mailboxFilePath(peerPid)],
+        { env: { ...process.env, HOME: home }, stdio: ["ignore", "pipe", "pipe"] },
+      );
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (c) => { stdout += c; });
+      child.stderr.on("data", (c) => { stderr += c; });
+      child.on("close", (code) => res({ code: code ?? 0, stdout, stderr }));
+    });
+    assert.equal(r.code, 0);
+    assert.equal(r.stdout, "");
+    assert.ok(r.stderr.includes("protocol mismatch"), "mismatch surfaced on stderr");
+    assert.ok(
+      readFileSync(mailboxFilePath(peerPid), "utf8").includes("protocol-guarded"),
+      "mismatch must not drain",
     );
   });
 });
