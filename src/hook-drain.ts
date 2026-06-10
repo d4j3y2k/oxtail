@@ -299,6 +299,18 @@ export function runHookDrain(
     if (!writeAllSync(stdoutFd, envelope + "\n")) {
       return EXIT_NOTHING;
     }
+    // The envelope bytes are out — these messages are now IN the agent's
+    // context. Record delivery receipts so the senders' message_status can see
+    // it. Strictly after the stdout write (a receipt must never exist for an
+    // envelope that failed) but BEFORE the truncate (Codex review, PR #31): a
+    // crash between the two then re-delivers (same ids, deduped; the write-once
+    // receipt keeps the first delivered_at) rather than leaving a delivered
+    // message with no receipt. Best-effort by construction.
+    recordDelivered(
+      msgs.map((m) => m.id).filter(Boolean),
+      "hook",
+      args.sid,
+    );
     for (const { path } of locked) {
       try {
         truncateSync(path, 0);
@@ -306,15 +318,6 @@ export function runHookDrain(
         // ENOENT/contention — worst case this box re-delivers (same ids, deduped)
       }
     }
-    // The envelope bytes are out — these messages are now IN the agent's
-    // context. Record delivery receipts so the senders' message_status can see
-    // it. Strictly after the stdout write (a receipt must never exist for an
-    // envelope that failed) and best-effort by construction.
-    recordDelivered(
-      msgs.map((m) => m.id).filter(Boolean),
-      "hook",
-      args.sid,
-    );
     return EXIT_DELIVERED;
   } finally {
     for (const { path, token } of locked) {
