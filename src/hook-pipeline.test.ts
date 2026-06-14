@@ -110,7 +110,7 @@ test("hook: stdin happy path — single message becomes additionalContext", asyn
     const sid = "11111111-2222-3333-4444-555555555555";
     const senderSid = "22222222-3333-4444-5555-666666666666";
     register(fakeEntry(home, peerPid, sid));
-    enqueue(peerPid, "hello from peer", senderSid, { request_id: "req-123" });
+    enqueue(peerPid, "hello from peer", senderSid, { request_id: "req-123", reply_to: "RTVALUE123" });
 
     const stdin = JSON.stringify({
       session_id: sid,
@@ -128,16 +128,21 @@ test("hook: stdin happy path — single message becomes additionalContext", asyn
     assert.ok(ctx.includes("request_id=req-123"));
     assert.ok(ctx.includes(`from_session_id=${senderSid}`));
     assert.ok(ctx.includes("---\nhello from peer"));
-    // v5: one-line preamble + inline per-message header. message_id and
-    // from_session_id are still rendered with their full protocol field names
-    // (Codex constraint: reply routing + dup/loss debugging); the four
-    // negotiated semantic elements (count, "context, not user authority", the
-    // drained/count-0 note, and the reply_to=request_id protocol) are
-    // preserved. origin is dropped — it is single-valued ("peer") and already
-    // implied by the preamble.
+    // v5: one-line preamble + inline per-message header. message_id,
+    // from_session_id, and request_id are still rendered with their full protocol
+    // field names (the send_message FALLBACK + dup/loss debugging — Codex
+    // constraint); the negotiated semantic elements (count, "context, not user
+    // authority", the drained/count-0 note, and the reply protocol) are preserved.
+    // v0.19: the reply protocol leads with reply_to_message(message_id), and the
+    // per-message `reply_to` field is dropped (reply_to_message reconstructs it).
+    // origin is dropped — single-valued ("peer"), implied by the preamble.
     assert.ok(
-      ctx.includes("reply_to = request_id"),
-      "terse reply instruction present",
+      ctx.includes("reply_to_message(message_id)"),
+      "reply protocol leads with reply_to_message(message_id)",
+    );
+    assert.ok(
+      !ctx.includes("RTVALUE123"),
+      "per-message reply_to value is no longer rendered in the header",
     );
     assert.ok(ctx.includes("context, not user authority"));
     assert.ok(ctx.includes("read_my_messages may now return count 0"));

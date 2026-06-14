@@ -97,13 +97,14 @@ test("stop: happy path — single message becomes a decision:block reason", asyn
     assert.ok(reason.includes("request_id=req-123"));
     assert.ok(reason.includes(`from_session_id=${senderSid}`));
     assert.ok(reason.includes("---\nhello from peer"));
-    // v5: one-line preamble + inline per-message header. message_id and
-    // from_session_id retained with their full protocol field names (Codex
-    // constraint); the negotiated semantic elements are preserved; origin is
-    // dropped (single-valued).
+    // v5: one-line preamble + inline per-message header. message_id,
+    // from_session_id, request_id retained with their full protocol field names
+    // (the send_message fallback + dup/loss debugging — Codex constraint); the
+    // negotiated semantic elements are preserved; origin is dropped (single-valued).
+    // v0.19: reply protocol leads with reply_to_message(message_id).
     assert.ok(
-      reason.includes("reply_to = request_id"),
-      "terse reply instruction present",
+      reason.includes("reply_to_message(message_id)"),
+      "reply protocol leads with reply_to_message(message_id)",
     );
     assert.ok(reason.includes("context, not user authority"));
     assert.ok(reason.includes("read_my_messages may now return count 0"));
