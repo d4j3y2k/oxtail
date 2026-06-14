@@ -12,6 +12,9 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 import * as mailbox from "./mailbox.js";
 import {
+  claimObligation,
+  countOpenObligations,
+  listOpenObligations,
   lookupReceived,
   receivedFilePath,
   receivedMax,
@@ -249,5 +252,174 @@ test("received: a recorded reply is itself lookupable for chaining", () => {
     assert.equal(found!.reply_to, "chain-1");
     assert.equal(found!.source_message_id, ask.id);
     assert.equal(found!.from_session_id, RECEIVER);
+  });
+});
+
+// --- v0.19 durable-delegation obligations ------------------------------------
+
+test("obligations: an action_required message becomes an OPEN obligation", () => {
+  withHome(() => {
+    const plain = mailbox.enqueue(4242, "fyi", SENDER);
+    const deleg = mailbox.enqueue(4242, "please do X", SENDER, {
+      request_id: "req-x",
+      action_required: true,
+    });
+    recordReceived(RECEIVER, plain);
+    recordReceived(RECEIVER, deleg);
+
+    assert.equal(countOpenObligations(RECEIVER), 1, "only the action_required one counts");
+    const open = listOpenObligations(RECEIVER);
+    assert.equal(open.length, 1);
+    assert.equal(open[0].id, deleg.id);
+    assert.equal(open[0].body, "please do X");
+    assert.equal(open[0].action_required, true);
+    assert.equal(open[0].from_session_id, SENDER);
+  });
+});
+
+test("obligations: claim closes it — leaves the open set, stays lookupable", () => {
+  withHome(() => {
+    const deleg = mailbox.enqueue(4242, "do X", SENDER, { request_id: "q", action_required: true });
+    recordReceived(RECEIVER, deleg);
+    assert.equal(countOpenObligations(RECEIVER), 1);
+
+    const claim = claimObligation(RECEIVER, deleg.id, "done", "did it");
+    assert.equal(claim.result, "claimed");
+    assert.ok(claim.result === "claimed" && claim.inbound, "returns the inbound so the caller can notify");
+    if (claim.result === "claimed") {
+      assert.equal(claim.inbound.from_session_id, SENDER);
+      assert.equal(claim.inbound.request_id, "q");
+    }
+
+    assert.equal(countOpenObligations(RECEIVER), 0, "closed obligation leaves the open set");
+    assert.equal(listOpenObligations(RECEIVER).length, 0);
+    // The envelope is still resolvable for reply/provenance, now carrying the outcome.
+    const found = lookupReceived(RECEIVER, deleg.id) as
+      | (mailbox.Mailbox & { obligation?: { state: string; note?: string } })
+      | null;
+    assert.ok(found);
+    assert.equal(found!.obligation?.state, "done");
+    assert.equal(found!.obligation?.note, "did it");
+  });
+});
+
+test("obligations: claim is race-safe — a second claim returns already-closed (no double-close)", () => {
+  withHome(() => {
+    const deleg = mailbox.enqueue(4242, "do X", SENDER, { request_id: "q", action_required: true });
+    recordReceived(RECEIVER, deleg);
+
+    const first = claimObligation(RECEIVER, deleg.id, "done", "first");
+    assert.equal(first.result, "claimed", "first close wins");
+    const second = claimObligation(RECEIVER, deleg.id, "done", "second");
+    assert.equal(second.result, "already-closed", "second close is rejected — caller must NOT re-notify");
+    assert.ok(second.result === "already-closed" && second.state === "done");
+  });
+});
+
+test("obligations: block closes it as blocked", () => {
+  withHome(() => {
+    const deleg = mailbox.enqueue(4242, "do Y", SENDER, { action_required: true });
+    recordReceived(RECEIVER, deleg);
+    const claim = claimObligation(RECEIVER, deleg.id, "blocked", "missing creds");
+    assert.equal(claim.result, "claimed");
+    assert.equal(countOpenObligations(RECEIVER), 0);
+  });
+});
+
+test("obligations: claim on an unknown id is not-found; on a plain message is not-an-obligation", () => {
+  withHome(() => {
+    recordReceived(RECEIVER, mailbox.enqueue(4242, "seed", SENDER));
+    assert.equal(claimObligation(RECEIVER, "deadbeefdeadbeef", "done").result, "not-found");
+    const plain = mailbox.enqueue(4242, "plain", SENDER);
+    recordReceived(RECEIVER, plain);
+    assert.equal(claimObligation(RECEIVER, plain.id, "done").result, "not-an-obligation");
+  });
+});
+
+// The critical durability property (skeptic's fatal-flaw fix): an OPEN obligation
+// must NEVER be pruned out of its own source of truth, even under heavy churn —
+// plain messages prune around it.
+test("obligations: an open obligation is exempt from the receivedMax prune", () => {
+  withHome(() => {
+    const prevMax = process.env.OXTAIL_RECEIVED_MAX;
+    process.env.OXTAIL_RECEIVED_MAX = "5";
+    try {
+      // One open obligation FIRST (oldest), then a flood of plain messages.
+      const deleg = mailbox.enqueue(4242, "long-lived task", SENDER, {
+        request_id: "keepme",
+        action_required: true,
+      });
+      recordReceived(RECEIVER, deleg);
+      for (let i = 0; i < 50; i++) {
+        recordReceived(RECEIVER, mailbox.enqueue(4242, `noise ${i}`, SENDER));
+      }
+      // Despite being the oldest line and far past the cap, the open obligation
+      // survives; plain noise is what got pruned.
+      assert.equal(countOpenObligations(RECEIVER), 1, "open obligation not evicted");
+      const found = lookupReceived(RECEIVER, deleg.id);
+      assert.ok(found, "the oldest line survived because it's an open obligation");
+      assert.equal(found!.request_id, "keepme");
+    } finally {
+      if (prevMax === undefined) delete process.env.OXTAIL_RECEIVED_MAX;
+      else process.env.OXTAIL_RECEIVED_MAX = prevMax;
+    }
+  });
+});
+
+// Once CLOSED, an obligation is prunable like any other line (so the ledger
+// can't grow unbounded with completed work).
+test("obligations: a CLOSED obligation prunes normally", () => {
+  withHome(() => {
+    const prevMax = process.env.OXTAIL_RECEIVED_MAX;
+    process.env.OXTAIL_RECEIVED_MAX = "5";
+    try {
+      const deleg = mailbox.enqueue(4242, "task", SENDER, { action_required: true });
+      recordReceived(RECEIVER, deleg);
+      claimObligation(RECEIVER, deleg.id, "done");
+      // Flood past the cap; the closed obligation is now eligible to age out.
+      for (let i = 0; i < 20; i++) {
+        recordReceived(RECEIVER, mailbox.enqueue(4242, `noise ${i}`, SENDER));
+      }
+      assert.equal(lookupReceived(RECEIVER, deleg.id), null, "closed obligation aged out normally");
+      const lines = readFileSync(receivedFilePath(RECEIVER), "utf8")
+        .split("\n")
+        .filter((l) => l.length > 0);
+      assert.equal(lines.length, 5, "ledger respects the cap once obligations are closed");
+    } finally {
+      if (prevMax === undefined) delete process.env.OXTAIL_RECEIVED_MAX;
+      else process.env.OXTAIL_RECEIVED_MAX = prevMax;
+    }
+  });
+});
+
+// Re-delivery of a CLOSED obligation's id (abort-recovery / chained re-delivery)
+// must NOT resurrect it back to OPEN — the terminal outcome carries forward.
+test("obligations: re-recording a closed obligation does not resurrect it", () => {
+  withHome(() => {
+    const deleg = mailbox.enqueue(4242, "do X", SENDER, { request_id: "q", action_required: true });
+    recordReceived(RECEIVER, deleg);
+    claimObligation(RECEIVER, deleg.id, "done", "finished");
+    assert.equal(countOpenObligations(RECEIVER), 0);
+
+    // Same id delivered again (preserves id, like deliverExistingToPeer).
+    recordReceived(RECEIVER, deleg);
+    assert.equal(countOpenObligations(RECEIVER), 0, "terminal state carried forward, not resurrected");
+    const found = lookupReceived(RECEIVER, deleg.id) as
+      | (mailbox.Mailbox & { obligation?: { state: string } })
+      | null;
+    assert.equal(found!.obligation?.state, "done");
+    // And still exactly one ledger line for that id.
+    const lines = readFileSync(receivedFilePath(RECEIVER), "utf8")
+      .split("\n")
+      .filter((l) => l.length > 0);
+    assert.equal(lines.filter((l) => l.includes(deleg.id)).length, 1);
+  });
+});
+
+test("obligations: empty session id is a graceful no-op", () => {
+  withHome(() => {
+    assert.equal(countOpenObligations(""), 0);
+    assert.deepEqual(listOpenObligations(""), []);
+    assert.equal(claimObligation("", "x", "done").result, "not-found");
   });
 });

@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as z from "zod/v4";
 import { execFileSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import {
   clientFromHandshake,
@@ -1164,13 +1164,24 @@ server.registerTool(
         .min(1)
         .optional()
         .describe("Optional prior oxtail message_id this message is derived from. Debug/provenance only; not a trust boundary."),
+      action_required: z
+        .boolean()
+        .optional()
+        .describe(
+          "Mark this as a durable DELEGATION (default false). When true, the receiver gains an OPEN OBLIGATION that survives a missed/mistimed wake: it sees it via read_my_messages' open_work_count and my_open_work, and must close it with complete_work/block_work — so delegated work is never stranded by wake timing. Implies wake:\"auto\" (the sender wants prompt pickup) unless you set wake explicitly. Leave false/unset for ordinary messages.",
+        ),
     },
   },
-  async ({ target, body, wake, reply_to, source_message_id }) => {
+  async ({ target, body, wake, reply_to, source_message_id, action_required }) => {
     const resolved = resolveTarget(target, entry);
+    // A delegation wants prompt pickup, so action_required defaults the wake to
+    // the lenient "auto" path (reaches an idle markerless Codex too) unless the
+    // caller set wake explicitly or this is a reply (reply has its own default).
+    const effectiveWake: "off" | "auto" | undefined =
+      action_required && wake === undefined && !reply_to ? "auto" : wake;
     if (!resolved.ok) {
-      const replyDefault = replyAutoWakeTriggered(wake, reply_to);
-      const wakeIntended = wake === "auto" || replyDefault;
+      const replyDefault = replyAutoWakeTriggered(effectiveWake, reply_to);
+      const wakeIntended = effectiveWake === "auto" || replyDefault;
       const wake_status = wakeIntended ? resolveErrorWakeStatus(resolved.error) : undefined;
       return jsonResult({
         schema_version: 1,
@@ -1186,11 +1197,22 @@ server.registerTool(
     // resolves even after the destructive mailbox/hook drain — and never sees a
     // displayed-but-unrecorded handle (record precedes append). Routing: the
     // peer's session box when it advertises session_keyed, else its legacy pid.
+    // A delegation is only a DURABLE OBLIGATION when the receiver is both claimed
+    // (has a received-ledger) AND advertises the v0.19 obligations capability (so
+    // it actually has my_open_work / complete_work to act on it). Otherwise we do
+    // NOT mark the delivery action_required — recording a phantom obligation a
+    // pre-v0.19 peer can never see or close would be dishonest — it degrades to
+    // ordinary mail (still woken). Report obligation_durable honestly.
+    const obligationDurable =
+      !!action_required &&
+      peer.client.session_id != null &&
+      peer.capabilities?.mailbox?.obligations === true;
     const msg = deliverToPeer(routeFor(peer), body, fromSessionId, {
       reply_to,
       source_message_id,
+      action_required: obligationDurable,
     });
-    const { wake_status, wake_reason } = await resolveSendWake(peer, wake, reply_to);
+    const { wake_status, wake_reason } = await resolveSendWake(peer, effectiveWake, reply_to);
     if (wake_status) {
       trace("wake_outcome", {
         via: wake_reason === "reply_to_default" ? "reply_default" : "send_message",
@@ -1199,18 +1221,23 @@ server.registerTool(
         client_type: peer.client.type,
       });
     }
+    const unclaimed = peer.client.session_id == null;
+    const note = action_required && !obligationDurable
+      ? unclaimed
+        ? "Target is UNCLAIMED: delivered to its pid box + woken, but it has no received-ledger so action_required is NOT a durable obligation (won't appear in its my_open_work) until it runs claim_session. Instruct it to claim_session in the body."
+        : "Target peer predates durable delegation (pre-v0.19, no obligations capability): delivered as ordinary mail + wake, NOT a durable obligation it can see in my_open_work."
+      : unclaimed
+        ? "Target is UNCLAIMED: delivered to its pid box (it will see this via read_my_messages); a wake reaches its pane, but it cannot be addressed by UUID or reply with correlation until it runs claim_session — consider instructing that in the body."
+        : undefined;
     return jsonResult({
       schema_version: 1,
       ok: true,
       message_id: msg.id,
       target_session_id: peer.client.session_id,
       target_server_pid: peer.server_pid,
-      ...(peer.client.session_id == null
-        ? {
-            bootstrap: true,
-            note: "Target is UNCLAIMED: delivered to its pid box (it will see this via read_my_messages); a wake reaches its pane, but it cannot be addressed by UUID or reply with correlation until it runs claim_session — consider instructing that in the body.",
-          }
-        : {}),
+      ...(action_required ? { action_required: true, obligation_durable: obligationDurable } : {}),
+      ...(unclaimed ? { bootstrap: true } : {}),
+      ...(note ? { note } : {}),
       ...(wake_status ? { wake_status } : {}),
       ...(wake_reason ? { wake_reason } : {}),
     });
@@ -1480,6 +1507,12 @@ server.registerTool(
       "read_my_messages",
       sid ?? null,
     );
+    // Durable owned-work signal: surface how many OPEN obligations this session
+    // holds, riding the one turn-boundary call every client (incl. a hookless
+    // Codex) already makes. Suppressed when zero so a quiet turn stays quiet.
+    // This is how a missed/mistimed wake strands nothing — the obligation is on
+    // disk and re-surfaces here whenever the owner next reads.
+    const openWorkCount = sid ? received.countOpenObligations(sid) : 0;
     return jsonResult({
       schema_version: 1,
       ok: true,
@@ -1488,7 +1521,299 @@ server.registerTool(
       messages,
       ...(deferredCount ? { deferred_count: deferredCount, budget_truncated: true } : {}),
       ...(skipped ? { mailboxes_skipped: skipped } : {}),
+      ...(openWorkCount > 0
+        ? {
+            open_work_count: openWorkCount,
+            open_work_hint: `You own ${openWorkCount} unfinished delegated obligation(s). Call my_open_work to list them, do the work, then close each with complete_work (or block_work). They persist until closed — wake timing does not matter.`,
+          }
+        : {}),
     });
+  },
+);
+
+// --- v0.19 durable delegation: owned-work reconciliation + completion --------
+// A peer send_message with action_required=true gives the RECEIVER a durable
+// OPEN OBLIGATION (its received-ledger line). Correctness lives on disk, off the
+// wake path: the owner rediscovers owed work via my_open_work / open_work_count
+// (no hook, no activity marker needed — first-class for Codex too) and closes it
+// via complete_work/block_work, which notify the requester. Wake only changes
+// WHEN reconciliation happens, never WHETHER the work is found.
+
+server.registerTool(
+  "my_open_work",
+  {
+    description: [
+      "List the durable DELEGATIONS you own but have not finished — the obligations created when a peer sent you an action_required message. This is the PULL source of truth for owned work: it reads your received-ledger, independent of the mailbox (already drained) and of whether any wake reached you, so a missed/mistimed/crossed wake never strands delegated work — you rediscover it here on your next turn. read_my_messages surfaces open_work_count; when it is >0, call this, do each item, then close it with complete_work (done) or block_work (can't). Each item carries age_seconds so a long-parked obligation is obvious. Safe and cheap at any turn boundary; returns an empty list when you owe nothing.",
+    ].join(" "),
+    inputSchema: {},
+  },
+  async () => {
+    const myId = entry.client.session_id;
+    if (!myId) {
+      return jsonResult({
+        schema_version: 1,
+        ok: false,
+        error: "no-session-id",
+        message:
+          "This session has not claimed a session_id, so it has no received-ledger and owns no obligations. Call claim_session first.",
+      });
+    }
+    const open = received.listOpenObligations(myId);
+    const now = Math.floor(Date.now() / 1000);
+    // Oldest-first: when the open set exceeds the budget, the MOST-AGED
+    // obligations (the ones most overdue / most likely stale-phantom) must be
+    // the ones shown, not hidden behind newer arrivals.
+    const ordered = [...open].sort((a, b) => a.enqueued_at - b.enqueued_at);
+    // BUDGETED like read_my_messages: cap by both count AND total body bytes, so
+    // a backlog of near-8KB obligation bodies can't blow the caller's context in
+    // one call (always at least one item). Over-budget items stay OPEN and
+    // surface on the next call once the shown ones are closed.
+    const shown: mailbox.Mailbox[] = [];
+    let bytes = 0;
+    let deferredCount = 0;
+    for (const m of ordered) {
+      const b = m.body_bytes ?? Buffer.byteLength(m.body, "utf8");
+      if (shown.length >= READ_MAX_MESSAGES || (shown.length > 0 && bytes + b > READ_MAX_BODY_BYTES)) {
+        deferredCount++;
+        continue;
+      }
+      shown.push(m);
+      bytes += b;
+    }
+    const items = shown.map((m) => ({
+      message_id: m.id,
+      from_session_id: m.from_session_id ?? null,
+      request_id: m.request_id ?? null,
+      body: m.body,
+      enqueued_at: m.enqueued_at,
+      age_seconds: Math.max(0, now - m.enqueued_at),
+      state: "open" as const,
+      required_action: `When finished: complete_work(message_id:"${m.id}", body:"<result>"). If you cannot: block_work(message_id:"${m.id}", reason:"<why>").`,
+    }));
+    return jsonResult({
+      schema_version: 1,
+      ok: true,
+      count: items.length,
+      open: items,
+      ...(deferredCount > 0 ? { deferred_count: deferredCount, budget_truncated: true } : {}),
+    });
+  },
+);
+
+// Close an obligation, CRASH-SAFELY. Ordering is DELIVER → then mark terminal
+// (claimObligation), so a crash/abort after delivery but before the mark leaves
+// the obligation OPEN (the owner re-discovers it via my_open_work and retries) —
+// never terminal-but-unnotified. The completion uses a DETERMINISTIC id derived
+// from the obligation's message_id, and duplicate suppression is LAYERED:
+//   - same drain: the receiver's idempotent recordReceived + drainMany/hook
+//     seenIds collapse same-id copies to one event;
+//   - across drains (crash-retry after the requester already drained): the
+//     receipt guard below skips re-delivery when a receipt for the completion id
+//     already exists.
+// Residual (acknowledged, Codex review): a narrow TOCTOU where a retry's
+// receipt-check races the requester's drain+receipt-write can still re-show the
+// completion once — but with the SAME id, so a consumer can dedup by
+// message_id/source_message_id. So this is exactly-once in the common path and
+// at-least-once under that crash-interleave, the same residual class as the
+// advisory-lock SIGSTOP cases. The invariant that always holds: a crash between
+// intent and delivery leaves the work open/retryable OR leaves a requester-
+// visible completion — never terminal-only. Requester + correlation come from the
+// inbound ledger record, so a still-polling ask_peer waiter correlates and a
+// timed-out one is pulled back via pending-ask.
+async function closeObligation(
+  message_id: string,
+  body: string,
+  state: received.ObligationState["state"],
+  wake: "off" | "auto" | undefined,
+): Promise<Record<string, unknown>> {
+  const myId = entry.client.session_id;
+  if (!myId) {
+    return {
+      ok: false,
+      error: "no-session-id",
+      message:
+        "This session has not claimed a session_id, so it has no received-ledger to close an obligation from. Call claim_session first.",
+    };
+  }
+  const inbound = received.lookupReceived(myId, message_id) as
+    | (mailbox.Mailbox & { obligation?: received.ObligationState })
+    | null;
+  if (!inbound) {
+    return {
+      ok: false,
+      error: "message-not-found",
+      message: `No received message ${message_id} in this session's ledger (it may have aged out, or predates this version). If you already handled it, no action is needed.`,
+    };
+  }
+  if (!inbound.action_required) {
+    return {
+      ok: false,
+      error: "not-an-obligation",
+      message: `Message ${message_id} is an ordinary message, not an action_required delegation — there is nothing to close. Use reply_to_message to reply to it.`,
+    };
+  }
+  if (inbound.obligation) {
+    // Already closed (a sequential retry, or a concurrent winner). Fast-path out
+    // without re-delivering — the requester already has the completion.
+    return {
+      ok: true,
+      message_id,
+      obligation_state: inbound.obligation.state,
+      already_closed: true,
+      note: "This obligation was already closed; no duplicate completion sent.",
+    };
+  }
+  const targetSid = inbound.from_session_id;
+  const replyTo = inbound.request_id;
+  if (!targetSid) {
+    // No requester identity to notify (the delegation came from an unclaimed
+    // sender). Just mark it terminal — there is no one to deliver to.
+    received.claimObligation(myId, message_id, state, body.slice(0, 280));
+    return {
+      ok: true,
+      message_id,
+      obligation_state: state,
+      note: "Obligation had no from_session_id (unclaimed sender); closed locally, no completion message sent.",
+    };
+  }
+  // Deterministic completion id: a crash-retry or a concurrent close mints the
+  // SAME id. Within one drain, the receiver's idempotent recordReceived +
+  // union-drain/hook seenIds collapse duplicates to one. 16 lowercase hex
+  // (FIELD_ORDER_PREFIX-safe).
+  const completionId = createHash("sha256")
+    .update(`oxtail-complete:${message_id}`)
+    .digest("hex")
+    .slice(0, 16);
+  // CROSS-DRAIN idempotency guard (Codex review): same-drain dedup does NOT stop
+  // a retry from re-appearing on a LATER drain. If a delivery RECEIPT for this
+  // completion id already exists, the requester has already SEEN this completion
+  // on a prior attempt (we crashed before marking terminal) — so do NOT re-append
+  // a copy it would re-drain; just mark terminal. Checked BEFORE resolveTarget so
+  // a requester that drained-then-went-unreachable still closes cleanly (the
+  // result already landed). Receipts are written recipient-side, same ~/.oxtail.
+  if (mailbox.readDeliveryReceipt(completionId)) {
+    received.claimObligation(myId, message_id, state, body.slice(0, 280));
+    return {
+      ok: true,
+      message_id,
+      obligation_state: state,
+      completion_message_id: completionId,
+      requester_session_id: targetSid,
+      already_delivered: true,
+      note: "Completion was already delivered to the requester on a prior attempt (receipt found); marked terminal without re-sending.",
+    };
+  }
+  const resolved = resolveTarget(targetSid, entry);
+  if (!resolved.ok) {
+    // Requester not resolvable right now — leave the obligation OPEN (we have not
+    // marked it) so it re-surfaces in my_open_work and the owner retries when the
+    // requester is back. Never close work whose result never reached the requester.
+    return {
+      ok: false,
+      error: "requester-unreachable",
+      requester_error: resolved.error,
+      message: `The requester (${targetSid}) is not reachable right now, so the completion was not delivered; the obligation is left OPEN — retry when it is back.`,
+    };
+  }
+  const peer = resolved.entry;
+  const fromSessionId = entry.client.session_id ?? undefined;
+  let msg: mailbox.Mailbox;
+  try {
+    // DELIVER FIRST (record-before-append durability), THEN mark terminal below.
+    msg = deliverToPeer(routeFor(peer), body, fromSessionId, {
+      reply_to: replyTo,
+      source_message_id: message_id,
+      id: completionId,
+    });
+  } catch (e) {
+    // Delivery threw — the obligation is still OPEN (unmarked); the owner retries.
+    return {
+      ok: false,
+      error: "delivery-failed",
+      message: `Delivering the completion failed (${String(e)}); the obligation is left OPEN — retry complete_work.`,
+    };
+  }
+  // Delivered durably — NOW stamp terminal. A crash before this leaves the
+  // obligation OPEN and the retry re-delivers the same completionId (deduped).
+  // A concurrent winner may have closed it already; either way the requester got
+  // exactly one completion (same id), so report success.
+  const claim = received.claimObligation(myId, message_id, state, body.slice(0, 280));
+  // A delegation outcome wants prompt pickup, so wake defaults to lenient "auto"
+  // (reaches an idle markerless Codex requester too) unless the caller overrides.
+  const effWake: "off" | "auto" | undefined = wake === undefined ? "auto" : wake;
+  const { wake_status, wake_reason } = await resolveSendWake(peer, effWake, replyTo);
+  if (wake_status) {
+    trace("wake_outcome", {
+      via: "complete_work",
+      wake_status,
+      target_session_id: peer.client.session_id,
+      client_type: peer.client.type,
+    });
+  }
+  return {
+    ok: true,
+    message_id,
+    obligation_state: state,
+    completion_message_id: msg.id,
+    requester_session_id: peer.client.session_id,
+    correlation: replyTo ? "correlated" : "uncorrelated",
+    ...(claim.result === "already-closed" ? { already_closed: true } : {}),
+    ...(wake_status ? { wake_status } : {}),
+    ...(wake_reason ? { wake_reason } : {}),
+  };
+}
+
+server.registerTool(
+  "complete_work",
+  {
+    description: [
+      "Close a durable DELEGATION you own (an action_required obligation from my_open_work) as DONE and notify the original requester in one step. Pass the obligation's message_id and your result/answer as body. This IS the natural reply path for delegated work: it delivers body to the requester (correlated when the delegation was an ask_peer), wakes them by default so they aren't left waiting (wake:\"auto\"; pass \"off\" to suppress), and stamps the obligation terminal so it leaves your my_open_work. Do NOT use an interim 'working on it' note here — that would close the obligation prematurely; only call this when the work is actually done. Fail-closed: an unknown id returns message-not-found; an ordinary message returns not-an-obligation (use reply_to_message instead).",
+    ].join(" "),
+    inputSchema: {
+      message_id: z
+        .string()
+        .min(1)
+        .describe("The obligation's message_id, as shown by my_open_work / read_my_messages."),
+      body: z
+        .string()
+        .min(1)
+        .refine((s) => Buffer.byteLength(s, "utf8") <= 8192, { message: "body exceeds 8192 UTF-8 bytes" })
+        .describe("The result/answer delivered to the requester, ≤8KB UTF-8. Verbatim."),
+      wake: z
+        .enum(["off", "auto"])
+        .optional()
+        .describe('Wake strategy for notifying the requester. Default "auto" (pull an idle requester back); "off" delivers without a nudge.'),
+    },
+  },
+  async ({ message_id, body, wake }) => {
+    return jsonResult({ schema_version: 1, ...(await closeObligation(message_id, body, "done", wake)) });
+  },
+);
+
+server.registerTool(
+  "block_work",
+  {
+    description: [
+      "Close a durable DELEGATION you own as BLOCKED — you cannot complete it — and tell the original requester why, in one step. Pass the obligation's message_id and a reason. Like complete_work it delivers the reason to the requester, wakes them by default, and stamps the obligation terminal so a blocked item leaves your my_open_work (instead of being mistaken for still-pending work). Use this rather than silently leaving an obligation open when you're stuck.",
+    ].join(" "),
+    inputSchema: {
+      message_id: z
+        .string()
+        .min(1)
+        .describe("The obligation's message_id, as shown by my_open_work / read_my_messages."),
+      reason: z
+        .string()
+        .min(1)
+        .refine((s) => Buffer.byteLength(s, "utf8") <= 8192, { message: "reason exceeds 8192 UTF-8 bytes" })
+        .describe("Why you cannot complete it, delivered to the requester, ≤8KB UTF-8."),
+      wake: z
+        .enum(["off", "auto"])
+        .optional()
+        .describe('Wake strategy for notifying the requester. Default "auto".'),
+    },
+  },
+  async ({ message_id, reason, wake }) => {
+    return jsonResult({ schema_version: 1, ...(await closeObligation(message_id, `[blocked] ${reason}`, "blocked", wake)) });
   },
 );
 

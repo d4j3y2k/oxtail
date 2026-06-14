@@ -54,3 +54,13 @@ Codex has no PreToolUse/Stop hook, so messages arrive via `read_my_messages` rat
 - When you reply, prefer `reply_to_message(message_id, …)` so the exchange stays correlated.
 
 In short: **idle is safe — trust the wake.** The *sender* owns prompt delivery (an autonomous flow must use `ask_peer` or `wake:auto`); you must not compensate for a wake-less send by polling. Idle-polling and blocking `ask_peer`s to "wait" for a peer are the main source of avoidable latency on the Codex side.
+
+## Owned work — durable delegation (standing convention)
+
+A peer can hand you durable work with `send_message({ action_required: true })`. That becomes an OPEN OBLIGATION on your side that **survives a missed or mistimed wake** — it lives on disk (your received-ledger), not on the wake reaching you. So you never have to poll to avoid dropping delegated work; you just reconcile it at a turn boundary:
+
+- `read_my_messages` includes **`open_work_count`** when you owe unfinished work. **When `open_work_count > 0`, call `my_open_work`**, do each item, then close it.
+- Close every item explicitly: **`complete_work(message_id, body)`** when done (this both delivers your result to the requester and clears the obligation), or **`block_work(message_id, reason)`** if you can't. Do **not** treat an interim "working on it" reply as completion — only `complete_work` closes it.
+- Forgetting to close leaves a phantom-open obligation that keeps showing up in `my_open_work` (with its age). The close tool *is* the natural reply path for delegated work — use it instead of a bare `reply_to_message`.
+
+Because the obligation is durable, this is the autonomy-safe way to take on long or hand-off work: a wake just tells you *sooner*; the work is found regardless.
