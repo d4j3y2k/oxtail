@@ -21,7 +21,7 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 **Claude Code** — add to `~/.claude.json` (global) or any project's `.mcp.json`:
 
 ```jsonc
-{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.19.0"] } } }
+{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.19.1"] } } }
 ```
 
 **Codex CLI** — add to `~/.codex/config.toml`:
@@ -29,14 +29,14 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 ```toml
 [mcp_servers.oxtail]
 command = "npx"
-args = ["-y", "oxtail@0.19.0"]
+args = ["-y", "oxtail@0.19.1"]
 ```
 
 **Claude slash command** (`/oxtail-join`) — optional once the hooks are installed (the v0.17 SessionStart hook auto-joins Claude Code sessions; see [How session_id resolution works](#how-session_id-resolution-works-v040)); still the explicit fallback:
 
 ```sh
 mkdir -p ~/.claude/commands
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.19.0/.claude/commands/oxtail-join.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.19.1/.claude/commands/oxtail-join.md \
   -o ~/.claude/commands/oxtail-join.md
 ```
 
@@ -44,9 +44,9 @@ curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.19.0/.claude/command
 
 ```sh
 mkdir -p ~/.codex/skills/oxtail-join/agents
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.19.0/integrations/codex/oxtail-join/SKILL.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.19.1/integrations/codex/oxtail-join/SKILL.md \
   -o ~/.codex/skills/oxtail-join/SKILL.md
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.19.0/integrations/codex/oxtail-join/agents/openai.yaml \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.19.1/integrations/codex/oxtail-join/agents/openai.yaml \
   -o ~/.codex/skills/oxtail-join/agents/openai.yaml
 ```
 
@@ -76,7 +76,7 @@ Contributing? `git clone https://github.com/d4j3y2k/oxtail && cd oxtail && npm i
 - `register_my_session` — pin this MCP server's `session_id` directly. Kept for debugging; prefer `claim_session`.
 - `get_my_session` — return this MCP server's own registry entry plus a per-strategy detection diagnosis. Useful for debugging.
 
-See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.19.0/AGENTS.md) for scope and architecture.
+See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.19.1/AGENTS.md) for scope and architecture.
 
 ## Usage from an agent
 
@@ -251,7 +251,7 @@ All wake paths funnel through one place, which **coalesces** rapid repeat wakes 
 If `ask_peer` returns an abort error before its built-in 60s timeout fires, your MCP client's tool-call ceiling is lower than 60s. Override the bound at server startup:
 
 ```sh
-OXTAIL_ASK_PEER_TIMEOUT_MS=30000 npx -y oxtail@0.19.0
+OXTAIL_ASK_PEER_TIMEOUT_MS=30000 npx -y oxtail@0.19.1
 ```
 
 The server reads the env var once at boot and uses it as the fixed timeout for all `ask_peer` calls in that session. Values must be positive numbers; anything else falls back to the 60000ms default.
@@ -330,8 +330,9 @@ A scheduled CI job (`.github/workflows/codex-drift.yml`, also runnable on demand
 
 ## Status
 
-v0.19.0. Makes delegated work **durable and owned**: a peer's `action_required` task survives a missed/mistimed wake because it lives on the receiver's ledger, not on the wake landing — discovered via `my_open_work` / `open_work_count` and closed via `complete_work` / `block_work`. Wake becomes a latency accelerator rather than the source of truth, which makes a hookless Codex peer first-class. Plus a hook-envelope reply-protocol modernization (lead with `reply_to_message(message_id)`).
+v0.19.1. Patch — fixes the subagent hook-swallow: a Claude Code Task subagent's tool call no longer drains the shared mailbox into its throwaway context (PreToolUse `agent_id` guard, hooks v12; re-run `npx oxtail install-hook` on upgrade). The v0.19.0 feature line: makes delegated work **durable and owned** — a peer's `action_required` task survives a missed/mistimed wake because it lives on the receiver's ledger, not on the wake landing — discovered via `my_open_work` / `open_work_count` and closed via `complete_work` / `block_work`. Wake becomes a latency accelerator rather than the source of truth, which makes a hookless Codex peer first-class. Plus a hook-envelope reply-protocol modernization (lead with `reply_to_message(message_id)`).
 
+- **Subagent hook-swallow fixed (v0.19.1, hooks v12).** A Task subagent's tool call fires the PreToolUse hook with the SAME `session_id` as the main loop (verified empirically: the subagent payload carries a top-level `agent_id`/`agent_type`, the main loop's doesn't). The session-keyed mailbox drain therefore ran *inside the subagent's* throwaway context, injecting peer messages it ignores and discards — silently lost from the main loop (received-ledger-only recovery). Fix: `pretooluse.sh` skips the drain on a non-empty `agent_id` (keeps the busy marker — the session IS busy); the mail waits for the main loop's next PreToolUse / Stop. Fail-safe (a wrong read only delays delivery, never loses); `agent_id`-alone keys against the false-negative that is the actual bug. Re-run `install-hook` after upgrading. Codex-reviewed APPROVE; 391 tests.
 - **Durable delegation — wake as accelerator, not source of truth (v0.19.0).** `send_message({ action_required: true })` makes the (claimed, obligations-capable) receiver's ledger line an OPEN OBLIGATION that survives a missed / mistimed / crossed wake: the owner rediscovers it via **`my_open_work`** + the **`open_work_count`** surfaced on `read_my_messages` (the one turn-boundary call even a hookless Codex makes), and closes it with **`complete_work`** / **`block_work`** — which deliver the outcome to the original requester (correlated when the delegation was an `ask_peer`), wake them, and stamp the obligation terminal. Correctness lives on the receiver's disk (record-before-append), entirely off the wake path — so Codex is first-class with **no new hook**. The close is crash-safe (deliver → *then* mark; a deterministic completion id + a delivery-receipt guard give exactly-once in the common path, at-least-once under a narrow documented TOCTOU), capability-gated (`capabilities.mailbox.obligations`; a pre-v0.19 peer degrades to ordinary mail rather than a phantom obligation), and the received-ledger prune **exempts** open obligations (never evicts owned work). `ask_peer` is unchanged (its pending-ask already covers long efforts); lease/reclaim of a wedged peer's work is deferred to a future slice. The hook envelope's reply instruction now also leads with `reply_to_message(message_id)` and drops the redundant rendered `reply_to`. Designed and reviewed entirely by oxtail's own autonomous multi-agent loop (a workflow judge-panel + the live Codex peer across BLOCK→AMEND→APPROVE rounds + a 3-lens compile-sim), with zero human relay — the framework dogfooding itself to build its own coordination primitive.
 
 - **Delivery receipts + in-band bootstrap (v0.18.0, hooks v11).** Two gaps the v0.17.1 live test session exposed, closed. (1) *Receipts*: every path that hands a message into an agent's context — the hook envelope (the hooks now pass `--sid`), `read_my_messages`, the `ask_peer` reply drain — writes a write-once delivery receipt (`~/.oxtail/receipts/<message_id>`), and the new **`message_status`** tool answers the question `read_session` never could: `"delivered"` (with `delivered_at`/`via`/recipient), `"pending"` (still queued — located via the sender's outbox record), or an honest `"unknown"` with the likely cause (pre-receipt peer, aged out). Mixed versions degrade structurally: old helpers discard the flag, old readers simply never write receipts. Receipts/outbox prune after ~7 days alongside the mailbox GC. (2) *Bootstrap*: target resolution no longer counts the **caller itself** toward name-target ambiguity — the live failure where the sole real peer (an unclaimed Codex) was unreachable because the only "candidate" offered was the requester. A sole unclaimed peer now resolves: `send_message` delivers to its pid box and `wake:"auto"` nudges its verified pane (response carries `bootstrap:true` + guidance), so "go claim_session" travels in-band instead of over a human tmux relay. `ask_peer` still requires a claimed target and now points at the bootstrap path.
