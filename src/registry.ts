@@ -56,6 +56,13 @@ export type RegistryCapabilities = {
     // drains pid boxes — senders must fall back to the legacy pid path or the
     // message would never be seen.
     session_keyed?: boolean;
+    // v0.19+: this peer understands durable-delegation OBLIGATIONS — it surfaces
+    // open_work_count / my_open_work and closes via complete_work / block_work.
+    // Absent/false = a pre-v0.19 peer that has no such tools, so a sender's
+    // action_required can't become an actionable obligation there; the send
+    // degrades to ordinary mail (obligation_durable:false), never a silent
+    // phantom-obligation the peer can't see or close.
+    obligations?: boolean;
   };
 };
 
@@ -65,6 +72,7 @@ export const CURRENT_CAPABILITIES: RegistryCapabilities = {
     provenance: true,
     push_budget: true,
     session_keyed: true,
+    obligations: true,
   },
 };
 

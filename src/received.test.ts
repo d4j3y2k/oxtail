@@ -16,7 +16,6 @@ import {
   countOpenObligations,
   listOpenObligations,
   lookupReceived,
-  reopenObligation,
   receivedFilePath,
   receivedMax,
   recordReceived,
@@ -317,20 +316,6 @@ test("obligations: claim is race-safe — a second claim returns already-closed 
   });
 });
 
-test("obligations: reopen reverts a claim back to OPEN (failed-delivery retry path)", () => {
-  withHome(() => {
-    const deleg = mailbox.enqueue(4242, "do X", SENDER, { request_id: "q", action_required: true });
-    recordReceived(RECEIVER, deleg);
-    assert.equal(claimObligation(RECEIVER, deleg.id, "done").result, "claimed");
-    assert.equal(countOpenObligations(RECEIVER), 0);
-
-    reopenObligation(RECEIVER, deleg.id);
-    assert.equal(countOpenObligations(RECEIVER), 1, "reopen restores it to the open set");
-    // And it can be claimed again (retry succeeds).
-    assert.equal(claimObligation(RECEIVER, deleg.id, "done").result, "claimed");
-  });
-});
-
 test("obligations: block closes it as blocked", () => {
   withHome(() => {
     const deleg = mailbox.enqueue(4242, "do Y", SENDER, { action_required: true });
@@ -436,6 +421,5 @@ test("obligations: empty session id is a graceful no-op", () => {
     assert.equal(countOpenObligations(""), 0);
     assert.deepEqual(listOpenObligations(""), []);
     assert.equal(claimObligation("", "x", "done").result, "not-found");
-    reopenObligation("", "x"); // must not throw
   });
 });

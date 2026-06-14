@@ -45,6 +45,12 @@ export type EnqueueOptions = {
   reply_to?: string;
   source_message_id?: string;
   action_required?: boolean;
+  // Optional explicit message id (must be 16 lowercase hex — the serializer's
+  // FIELD_ORDER_PREFIX enforces it). Default is a fresh random nonce. Used by
+  // complete_work to mint a DETERMINISTIC completion id so a crash-retry or a
+  // concurrent close re-delivers the same id and the receiver's dedup collapses
+  // it to exactly one event.
+  id?: string;
 };
 
 // A mailbox is addressed by a BoxId:
@@ -250,7 +256,7 @@ export function buildMessage(
 ): Mailbox {
   return {
     schema_version: 1,
-    id: randomBytes(8).toString("hex"),
+    id: options.id ?? randomBytes(8).toString("hex"),
     body,
     enqueued_at: Math.floor(Date.now() / 1000),
     body_bytes: Buffer.byteLength(body, "utf8"),

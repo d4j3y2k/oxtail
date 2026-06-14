@@ -381,30 +381,6 @@ export function claimObligation(
   }
 }
 
-// Revert a claimed obligation back to OPEN. Used when the completion DELIVERY
-// failed after we claimed it: the work's outcome never reached the requester, so
-// the obligation must re-surface in my_open_work for the owner to retry — never
-// close work whose result was never delivered. Locked, like every ledger write.
-export function reopenObligation(receiverSessionId: string, messageId: string): void {
-  if (!receiverSessionId || !messageId) return;
-  acquireLock(receiverSessionId);
-  try {
-    const lines = readLines(receiverSessionId);
-    for (let i = 0; i < lines.length; i++) {
-      if (lineMessageId(lines[i]) !== messageId) continue;
-      const rec = parseLedgerRecord(lines[i]);
-      if (!rec || !rec.obligation) break;
-      const { obligation: _drop, ...rest } = rec;
-      void _drop;
-      lines[i] = JSON.stringify(rest);
-      atomicWrite(ledgerPath(receiverSessionId), lines.join("\n") + "\n");
-      break;
-    }
-  } finally {
-    releaseLock(receiverSessionId);
-  }
-}
-
 export function receivedFilePath(sessionId: string): string {
   return ledgerPath(sessionId);
 }
