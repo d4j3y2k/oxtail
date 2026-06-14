@@ -1603,14 +1603,23 @@ server.registerTool(
 // Close an obligation, CRASH-SAFELY. Ordering is DELIVER → then mark terminal
 // (claimObligation), so a crash/abort after delivery but before the mark leaves
 // the obligation OPEN (the owner re-discovers it via my_open_work and retries) —
-// never terminal-but-unnotified. The completion is delivered with a
-// DETERMINISTIC id derived from the obligation's message_id, so a crash-retry OR
-// a concurrent close re-delivers the SAME id and the receiver's record-before-
-// append ledger + drain dedup collapse it to exactly one event. The invariant
-// (per Codex review): a crash between intent and delivery leaves the work
-// open/retryable OR leaves a requester-visible completion — never terminal-only.
-// Requester + correlation come from the inbound ledger record, so a still-polling
-// ask_peer waiter correlates and a timed-out one is pulled back via pending-ask.
+// never terminal-but-unnotified. The completion uses a DETERMINISTIC id derived
+// from the obligation's message_id, and duplicate suppression is LAYERED:
+//   - same drain: the receiver's idempotent recordReceived + drainMany/hook
+//     seenIds collapse same-id copies to one event;
+//   - across drains (crash-retry after the requester already drained): the
+//     receipt guard below skips re-delivery when a receipt for the completion id
+//     already exists.
+// Residual (acknowledged, Codex review): a narrow TOCTOU where a retry's
+// receipt-check races the requester's drain+receipt-write can still re-show the
+// completion once — but with the SAME id, so a consumer can dedup by
+// message_id/source_message_id. So this is exactly-once in the common path and
+// at-least-once under that crash-interleave, the same residual class as the
+// advisory-lock SIGSTOP cases. The invariant that always holds: a crash between
+// intent and delivery leaves the work open/retryable OR leaves a requester-
+// visible completion — never terminal-only. Requester + correlation come from the
+// inbound ledger record, so a still-polling ask_peer waiter correlates and a
+// timed-out one is pulled back via pending-ask.
 async function closeObligation(
   message_id: string,
   body: string,
