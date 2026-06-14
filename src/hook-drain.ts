@@ -125,10 +125,13 @@ function renderMessages(msgs: Mailbox[], maxBodyChars: number): RenderResult {
 // ONLY when the batch has an obligation, so ordinary traffic pays zero bytes
 // (v5 token budget). Inserted BEFORE the message bodies so it isn't buried below
 // up to maxBodyChars of text.
+// "in this batch" (not "above"/"below"): the steer is inserted into the
+// preamble, which renders BEFORE the message blocks — so positional words would
+// misdirect (Codex review nit).
 const OBLIGATION_STEER =
-  " One or more messages above are durable obligations (marked action_required): if you act on them, close each with complete_work(message_id, result) or block_work(message_id, reason) — not reply_to_message. my_open_work lists everything you still owe.";
+  " One or more messages in this batch are durable obligations (marked action_required): if you act on them, close each with complete_work(message_id, result) or block_work(message_id, reason) — not reply_to_message. my_open_work lists everything you still owe.";
 const OBLIGATION_STEER_TRUNCATED =
-  " (a body above was truncated/omitted — read it in full via my_open_work before closing.)";
+  " (a body in this batch was truncated/omitted — read it in full via my_open_work before closing.)";
 
 // One source of truth for the steer so the two renderers can't drift.
 function obligationSteer(msgs: Mailbox[], truncatedCount: number): string {
