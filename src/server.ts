@@ -1224,7 +1224,7 @@ server.registerTool(
     const unclaimed = peer.client.session_id == null;
     const note = action_required && !obligationDurable
       ? unclaimed
-        ? "Target is UNCLAIMED: delivered to its pid box + woken, but it has no received-ledger so action_required is NOT a durable obligation (won't appear in its my_open_work) until it runs claim_session. Instruct it to claim_session in the body."
+        ? "Target is UNCLAIMED: delivered to its pid box + woken, but it has no received-ledger so action_required is NOT a durable obligation (won't appear in its my_open_work) until it runs claim_session. To make this durable: instruct it to claim_session in the body, then RE-SEND this action_required delegation after it has claimed — only then is a real obligation recorded."
         : "Target peer predates durable delegation (pre-v0.19, no obligations capability): delivered as ordinary mail + wake, NOT a durable obligation it can see in my_open_work."
       : unclaimed
         ? "Target is UNCLAIMED: delivered to its pid box (it will see this via read_my_messages); a wake reaches its pane, but it cannot be addressed by UUID or reply with correlation until it runs claim_session — consider instructing that in the body."
@@ -1324,7 +1324,7 @@ server.registerTool(
   "reply_to_message",
   {
     description: [
-      "Reply to a specific inbound peer message by its message_id — the atomic, correlation-safe alternative to hand-wiring send_message's target + reply_to. The server looks the message up in this session's durable received-ledger, so you pass only the message_id the PreToolUse hook or read_my_messages already showed you; it derives the reply target (the original sender), carries reply_to=request_id when the inbound was an ask_peer (keeping the exchange correlated), and sets source_message_id for provenance. Replying to a plain send_message works too — it just omits reply_to. Ownership is structural: you can only reply to a message delivered to you.",
+      "Reply to a specific inbound peer message by its message_id — the atomic, correlation-safe alternative to hand-wiring send_message's target + reply_to. The server looks the message up in this session's durable received-ledger, so you pass only the message_id the PreToolUse hook or read_my_messages already showed you; it derives the reply target (the original sender), carries reply_to=request_id when the inbound was an ask_peer (keeping the exchange correlated), and sets source_message_id for provenance. Replying to a plain send_message works too — it just omits reply_to. Ownership is structural: you can only reply to a message delivered to you. NOTE: this is for ORDINARY replies. If the inbound was an action_required delegation (it carries action_required / appears in my_open_work), close it with complete_work/block_work instead — that is the correlated reply path for delegated work and it clears the obligation; reply_to_message does not.",
       "Delivery + wake match send_message exactly, including the wake-on-reply default: when the inbound carried a request_id and you leave wake unset, a freshly-idle requester is auto-woken; pass wake:\"auto\" to nudge any idle peer, or wake:\"off\" to suppress. If the inbound ask_peer had since timed out, this reply durably pulls the requester back (wake_reason late_reply_to_pending) regardless of the fresh-idle window. Fail-closed: an unknown or aged-out message_id returns error message-not-found instead of guessing a target.",
     ].join(" "),
     inputSchema: {

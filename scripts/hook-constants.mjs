@@ -75,10 +75,20 @@ export const HOOK_MARKER_KEY = "_oxtailHook";
 //       throwaway context (lost to the main loop). The session stays marked
 //       busy; the mail waits for the main loop's next PreToolUse / Stop. A stale
 //       pre-v12 hook just keeps the old (swallowing) behavior until re-install.
+//  v13: hook-path obligation surfacing. hook-drain.ts renders a per-message
+//       `| action_required` tag and, when a delivered batch carries an
+//       obligation, an obligation-steer clause (close via complete_work/
+//       block_work, not reply_to_message) inserted BEFORE the message bodies.
+//       Closes "hook-path obligation blindness": a hooked Claude could answer a
+//       delegation via reply_to_message and leave the obligation OPEN forever.
+//       Helper-only change — no .sh asset edits — so only hook-drain.js's hash
+//       drifts; the startup freshness nudge (NOT a protocol bump — argv contract
+//       and HOOK_DRAIN_PROTOCOL stay 1) drives the re-install. A stale pre-v13
+//       helper renders the prior envelope: degraded (no tag/steer), never wrong.
 // INVARIANT: any change to an assets/*.sh script or the helper sources MUST
 // bump this version, so existing installs are forced to re-install.
 // scripts/check-hook-version.mjs enforces this in CI.
-export const HOOK_MARKER_VERSION = 12;
+export const HOOK_MARKER_VERSION = 13;
 
 const HOOKS_DIR = path.join(os.homedir(), ".oxtail", "hooks");
 

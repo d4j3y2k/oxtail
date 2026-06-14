@@ -14,6 +14,8 @@ import {
   EXIT_NOTHING,
   isValidMailboxPath,
   parseArgs,
+  renderPreToolUse,
+  renderStop,
   runHookDrain,
 } from "./hook-drain.js";
 
@@ -178,4 +180,84 @@ test("hook-drain: a malformed --sid is dropped, an old-helper-style stray flag i
   assert.deepEqual(ok!.boxes, ["/a.jsonl"]);
   // Old helpers route unknown flags into boxes; isValidMailboxPath rejects them.
   assert.ok(!isValidMailboxPath("--sid", "/Users/x"));
+});
+
+// --- v13 obligation surfacing: render the functions DIRECTLY (they are exported)
+// rather than through runHookDrain, so these assertions don't entangle the
+// receipt/truncation side effects of the full drain (Realist review M4).
+function ordinaryMsg(over: Partial<mailbox.Mailbox> = {}): mailbox.Mailbox {
+  return {
+    schema_version: 1,
+    id: "00aa11bb22cc33dd",
+    body: "just saying hi",
+    enqueued_at: 1_700_000_000_000,
+    from_session_id: "sender-sid",
+    ...over,
+  };
+}
+function delegationMsg(over: Partial<mailbox.Mailbox> = {}): mailbox.Mailbox {
+  return ordinaryMsg({ id: "ff00ee11dd22cc33", body: "compute the thing", action_required: true, ...over });
+}
+
+const BIG = 24_000;
+
+test("hook-drain v13: ordinary traffic is unchanged — no tag, no obligation steer", () => {
+  for (const out of [renderPreToolUse([ordinaryMsg()], BIG), renderStop([ordinaryMsg()], BIG)]) {
+    // The byte-budget guard: a non-obligation batch must add ZERO obligation
+    // content. Anything else would mean ordinary traffic started paying for the
+    // steer (v5 token budget regression).
+    assert.ok(!out.includes("action_required"), "no per-message tag on ordinary mail");
+    assert.ok(!out.includes("complete_work"), "no obligation steer on ordinary mail");
+    assert.ok(!out.includes("block_work"));
+    assert.ok(!out.includes("my_open_work"));
+    // …but normal rendering still happened.
+    assert.ok(out.includes("message_id=00aa11bb22cc33dd"));
+    assert.ok(out.includes("just saying hi"));
+  }
+});
+
+test("hook-drain v13: a delegation renders the tag + steer, steer placed BEFORE the bodies", () => {
+  const ctx = renderPreToolUse([delegationMsg({ body: "BODYMARKER" })], BIG);
+  assert.ok(ctx.includes("| action_required"), "per-message obligation tag");
+  assert.ok(
+    ctx.includes("close each with complete_work(message_id, result) or block_work(message_id, reason)"),
+    "steer names both closing verbs",
+  );
+  assert.ok(ctx.includes("not reply_to_message"), "steer routes away from the ordinary reply path");
+  assert.ok(ctx.includes("my_open_work"), "steer points at the authoritative owed-work list");
+  // M1: the steer must precede the (up to 24k char) message bodies, or it gets buried.
+  assert.ok(
+    ctx.indexOf("durable obligations") < ctx.indexOf("BODYMARKER"),
+    "obligation steer renders before the message body",
+  );
+});
+
+test("hook-drain v13: the Stop envelope also carries the steer", () => {
+  const env = JSON.parse(renderStop([delegationMsg()], BIG));
+  assert.equal(env.decision, "block");
+  assert.ok(env.reason.includes("| action_required"));
+  assert.ok(env.reason.includes("close each with complete_work"));
+});
+
+test("hook-drain v13: a budget-omitted obligation body adds the my_open_work recovery note (M2)", () => {
+  // Body far exceeds the budget → renderMessages truncates it (truncatedCount>0)
+  // while hasObligation stays true: tell the receiver to read the full body via
+  // my_open_work before closing, rather than act on content it never saw.
+  const ctx = renderPreToolUse([delegationMsg({ body: "X".repeat(200) })], 10);
+  assert.ok(ctx.includes("truncated"), "body was truncated by the budget");
+  assert.ok(
+    ctx.includes("read it in full via my_open_work before closing"),
+    "truncated obligation gets the recovery instruction",
+  );
+});
+
+test("hook-drain v13: a mixed batch tags only the obligation but steers once", () => {
+  const ctx = renderPreToolUse([ordinaryMsg(), delegationMsg()], BIG);
+  // Exactly one per-message tag (on the delegation), one steer clause for the batch.
+  assert.equal(ctx.match(/\| action_required/g)?.length, 1, "only the delegation is tagged");
+  assert.equal(
+    ctx.match(/durable obligations \(marked action_required\)/g)?.length,
+    1,
+    "the batch-level steer appears once",
+  );
 });
