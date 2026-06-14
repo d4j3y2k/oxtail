@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -1344,6 +1345,50 @@ test("complete_work: fail-closed on unknown id; not-an-obligation on a plain mes
     });
     assert.equal(notOb.ok, false);
     assert.equal(notOb.error, "not-an-obligation");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("complete_work: cross-drain idempotency — a completion receipt skips re-delivery (crash-retry safe)", async () => {
+  const server = await spawnServer();
+  try {
+    const ownerSid = "0b11a700-0000-0000-0000-00000000000c";
+    const requesterSid = "1ec0e700-0000-0000-0000-00000000000d";
+    await callTool(server.client, "register_my_session", { session_id: ownerSid });
+    const obligationId = seedInbound(server.home, ownerSid, requesterSid, "do it", {
+      request_id: "deleg-crash",
+      action_required: true,
+    });
+    // The deterministic completion id (mirrors closeObligation).
+    const completionId = createHash("sha256")
+      .update(`oxtail-complete:${obligationId}`)
+      .digest("hex")
+      .slice(0, 16);
+
+    // Simulate a PRIOR attempt that DELIVERED (requester drained → receipt) but
+    // crashed before marking terminal: the obligation is still OPEN, yet a receipt
+    // for the completion id exists.
+    const prev = process.env.HOME;
+    process.env.HOME = server.home;
+    try {
+      recordDelivered([completionId], "read_my_messages", requesterSid);
+    } finally {
+      process.env.HOME = prev;
+    }
+
+    const res = await callTool<any>(server.client, "complete_work", {
+      message_id: obligationId,
+      body: "do it = done",
+      wake: "off",
+    });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    assert.equal(res.already_delivered, true, "receipt found → no re-delivery across drains");
+    assert.equal(res.obligation_state, "done");
+
+    // The obligation is now closed (marked terminal without re-sending a duplicate).
+    const open = await callTool<any>(server.client, "my_open_work", {});
+    assert.equal(open.count, 0, "obligation marked terminal without re-appending a duplicate");
   } finally {
     await server.cleanup();
   }

@@ -1667,6 +1667,33 @@ async function closeObligation(
       note: "Obligation had no from_session_id (unclaimed sender); closed locally, no completion message sent.",
     };
   }
+  // Deterministic completion id: a crash-retry or a concurrent close mints the
+  // SAME id. Within one drain, the receiver's idempotent recordReceived +
+  // union-drain/hook seenIds collapse duplicates to one. 16 lowercase hex
+  // (FIELD_ORDER_PREFIX-safe).
+  const completionId = createHash("sha256")
+    .update(`oxtail-complete:${message_id}`)
+    .digest("hex")
+    .slice(0, 16);
+  // CROSS-DRAIN idempotency guard (Codex review): same-drain dedup does NOT stop
+  // a retry from re-appearing on a LATER drain. If a delivery RECEIPT for this
+  // completion id already exists, the requester has already SEEN this completion
+  // on a prior attempt (we crashed before marking terminal) — so do NOT re-append
+  // a copy it would re-drain; just mark terminal. Checked BEFORE resolveTarget so
+  // a requester that drained-then-went-unreachable still closes cleanly (the
+  // result already landed). Receipts are written recipient-side, same ~/.oxtail.
+  if (mailbox.readDeliveryReceipt(completionId)) {
+    received.claimObligation(myId, message_id, state, body.slice(0, 280));
+    return {
+      ok: true,
+      message_id,
+      obligation_state: state,
+      completion_message_id: completionId,
+      requester_session_id: targetSid,
+      already_delivered: true,
+      note: "Completion was already delivered to the requester on a prior attempt (receipt found); marked terminal without re-sending.",
+    };
+  }
   const resolved = resolveTarget(targetSid, entry);
   if (!resolved.ok) {
     // Requester not resolvable right now — leave the obligation OPEN (we have not
@@ -1681,13 +1708,6 @@ async function closeObligation(
   }
   const peer = resolved.entry;
   const fromSessionId = entry.client.session_id ?? undefined;
-  // Deterministic completion id: a crash-retry or a concurrent close mints the
-  // SAME id, so the receiver's ledger (idempotent recordReceived) + union-drain
-  // dedup deliver it exactly once. 16 lowercase hex (FIELD_ORDER_PREFIX-safe).
-  const completionId = createHash("sha256")
-    .update(`oxtail-complete:${message_id}`)
-    .digest("hex")
-    .slice(0, 16);
   let msg: mailbox.Mailbox;
   try {
     // DELIVER FIRST (record-before-append durability), THEN mark terminal below.
