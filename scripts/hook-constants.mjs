@@ -71,7 +71,7 @@ export const HOOK_MARKER_KEY = "_oxtailHook";
 // INVARIANT: any change to an assets/*.sh script or the helper sources MUST
 // bump this version, so existing installs are forced to re-install.
 // scripts/check-hook-version.mjs enforces this in CI.
-export const HOOK_MARKER_VERSION = 11;
+export const HOOK_MARKER_VERSION = 12;
 
 const HOOKS_DIR = path.join(os.homedir(), ".oxtail", "hooks");
 
