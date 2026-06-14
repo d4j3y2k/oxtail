@@ -8,7 +8,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { readAll, register, type RegistryEntry } from "./registry.js";
 import { drain, enqueue, recordDelivered } from "./mailbox.js";
-import { recordReceived } from "./received.js";
+import { countOpenObligations, recordReceived } from "./received.js";
 import { recordPendingAsk } from "./pending-ask.js";
 
 const SERVER_ENTRY = resolve(import.meta.dirname, "server.ts");
@@ -1046,7 +1046,7 @@ function seedInbound(
   receiverSid: string,
   fromSid: string,
   body: string,
-  opts: { request_id?: string } = {},
+  opts: { request_id?: string; action_required?: boolean } = {},
 ): string {
   const prev = process.env.HOME;
   process.env.HOME = home;
@@ -1155,6 +1155,172 @@ test("reply_to_message: fail-closed on an unknown message_id", async () => {
     });
     assert.equal(reply.ok, false);
     assert.equal((reply as ReplyErr).error, "message-not-found");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+// --- v0.19 durable delegation: action_required + my_open_work + complete_work --
+
+test("send_message action_required: records a durable open obligation on the claimed receiver", async () => {
+  const server = await spawnServer();
+  try {
+    const senderSid = "5e0de700-0000-0000-0000-000000000006";
+    const receiverSid = "dec0e700-0000-0000-0000-000000000007";
+    await callTool(server.client, "register_my_session", { session_id: senderSid });
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: receiverSid,
+      tmux_session: "the-worker",
+      cwd: server.home,
+    });
+
+    const res = await callTool<any>(server.client, "send_message", {
+      target: receiverSid,
+      body: "please handle the migration",
+      action_required: true,
+      wake: "off",
+    });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    assert.equal(res.action_required, true);
+    assert.equal(res.obligation_durable, true, "claimed receiver → durable obligation");
+
+    const prev = process.env.HOME;
+    process.env.HOME = server.home;
+    try {
+      const drained = drain(process.pid);
+      assert.equal(drained.length, 1);
+      assert.equal(drained[0].action_required, true, "delivered envelope carries the flag");
+      // The obligation lives in the ledger, independent of the (now-drained) mailbox.
+      assert.equal(countOpenObligations(receiverSid), 1, "durable obligation recorded on the receiver");
+    } finally {
+      process.env.HOME = prev;
+    }
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("complete_work: lists then closes an obligation, delivering the result to the requester (correlated)", async () => {
+  const server = await spawnServer();
+  try {
+    const ownerSid = "0b11a700-0000-0000-0000-000000000001";
+    const requesterSid = "1ec0e700-0000-0000-0000-000000000002";
+    await callTool(server.client, "register_my_session", { session_id: ownerSid });
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: requesterSid,
+      tmux_session: "the-requester",
+      cwd: server.home,
+    });
+
+    // A peer delegated correlated work to us.
+    const obligationId = seedInbound(server.home, ownerSid, requesterSid, "compute the thing", {
+      request_id: "deleg-1",
+      action_required: true,
+    });
+
+    // my_open_work surfaces it with the required action.
+    const open = await callTool<any>(server.client, "my_open_work", {});
+    assert.equal(open.ok, true);
+    assert.equal(open.count, 1, `expected one open obligation: ${JSON.stringify(open)}`);
+    assert.equal(open.open[0].message_id, obligationId);
+    assert.equal(open.open[0].request_id, "deleg-1");
+    assert.equal(open.open[0].body, "compute the thing");
+    assert.ok(String(open.open[0].required_action).includes("complete_work"));
+
+    // Close it — delivers the result to the requester, marks terminal.
+    const done = await callTool<any>(server.client, "complete_work", {
+      message_id: obligationId,
+      body: "the thing = 42",
+      wake: "off",
+    });
+    assert.equal(done.ok, true, `complete_work must succeed: ${JSON.stringify(done)}`);
+    assert.equal(done.obligation_state, "done");
+    assert.equal(done.correlation, "correlated");
+    assert.equal(done.requester_session_id, requesterSid);
+
+    // The result landed in the requester's mailbox, correlated to the delegation.
+    const prev = process.env.HOME;
+    process.env.HOME = server.home;
+    try {
+      const drained = drain(process.pid);
+      assert.equal(drained.length, 1);
+      assert.equal(drained[0].body, "the thing = 42");
+      assert.equal(drained[0].reply_to, "deleg-1", "completion correlated to the delegation");
+      assert.equal(drained[0].from_session_id, ownerSid);
+      assert.equal(drained[0].source_message_id, obligationId);
+    } finally {
+      process.env.HOME = prev;
+    }
+
+    // The obligation is no longer open.
+    const after = await callTool<any>(server.client, "my_open_work", {});
+    assert.equal(after.count, 0, "obligation closed → no longer open");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("complete_work: fail-closed on unknown id; not-an-obligation on a plain message", async () => {
+  const server = await spawnServer();
+  try {
+    const ownerSid = "0b11a700-0000-0000-0000-000000000003";
+    const requesterSid = "1ec0e700-0000-0000-0000-000000000004";
+    await callTool(server.client, "register_my_session", { session_id: ownerSid });
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: requesterSid,
+      tmux_session: "plain-req",
+      cwd: server.home,
+    });
+
+    const unknown = await callTool<any>(server.client, "complete_work", {
+      message_id: "ffffffffffffffff",
+      body: "x",
+      wake: "off",
+    });
+    assert.equal(unknown.ok, false);
+    assert.equal(unknown.error, "message-not-found");
+
+    // A plain (non-action_required) inbound is not an obligation.
+    const plainId = seedInbound(server.home, ownerSid, requesterSid, "just fyi");
+    const notOb = await callTool<any>(server.client, "complete_work", {
+      message_id: plainId,
+      body: "x",
+      wake: "off",
+    });
+    assert.equal(notOb.ok, false);
+    assert.equal(notOb.error, "not-an-obligation");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("complete_work: unreachable requester reverts the obligation to OPEN for retry (no silent close)", async () => {
+  const server = await spawnServer();
+  try {
+    const ownerSid = "0b11a700-0000-0000-0000-000000000008";
+    // A delegation from a requester that has NO registry entry → resolveTarget fails.
+    const goneRequester = "9000e700-0000-0000-0000-000000000009";
+    await callTool(server.client, "register_my_session", { session_id: ownerSid });
+    const obligationId = seedInbound(server.home, ownerSid, goneRequester, "do the thing", {
+      request_id: "deleg-gone",
+      action_required: true,
+    });
+
+    const res = await callTool<any>(server.client, "complete_work", {
+      message_id: obligationId,
+      body: "result",
+      wake: "off",
+    });
+    assert.equal(res.ok, false, `must report failure: ${JSON.stringify(res)}`);
+    assert.equal(res.error, "requester-unreachable");
+
+    // The obligation must be left OPEN so the owner can retry — never silently closed.
+    const open = await callTool<any>(server.client, "my_open_work", {});
+    assert.equal(open.count, 1, "obligation reverted to OPEN after a failed delivery");
+    assert.equal(open.open[0].message_id, obligationId);
   } finally {
     await server.cleanup();
   }

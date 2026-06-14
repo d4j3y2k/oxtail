@@ -31,12 +31,20 @@ export type Mailbox = {
   request_id?: string;
   reply_to?: string;
   source_message_id?: string;
+  // v0.19: marks this delivery as a durable DELEGATION. When true, the
+  // receiver's ledger entry becomes an OPEN OBLIGATION (see received.ts) that
+  // survives a missed/mistimed wake — discoverable via my_open_work and closed
+  // via complete_work/block_work. Absent/false = an ordinary message (today's
+  // exact behavior). An optional envelope key (appended last in the serialized
+  // line) so a pre-v0.19 reader simply ignores it.
+  action_required?: boolean;
 };
 
 export type EnqueueOptions = {
   request_id?: string;
   reply_to?: string;
   source_message_id?: string;
+  action_required?: boolean;
 };
 
 // A mailbox is addressed by a BoxId:
@@ -150,6 +158,9 @@ export function serializeMailboxLine(msg: Mailbox): string {
   if (msg.request_id) obj.request_id = msg.request_id;
   if (msg.reply_to) obj.reply_to = msg.reply_to;
   if (msg.source_message_id) obj.source_message_id = msg.source_message_id;
+  // Appended LAST so the FIELD_ORDER_PREFIX invariant (schema_version,id,body)
+  // is untouched and a pre-v0.19 awk-parsing hook on a legacy pid box ignores it.
+  if (msg.action_required) obj.action_required = true;
   const line = JSON.stringify(obj) + "\n";
   if (!FIELD_ORDER_PREFIX.test(line)) {
     throw new Error(
@@ -248,6 +259,7 @@ export function buildMessage(
     ...(options.request_id ? { request_id: options.request_id } : {}),
     ...(options.reply_to ? { reply_to: options.reply_to } : {}),
     ...(options.source_message_id ? { source_message_id: options.source_message_id } : {}),
+    ...(options.action_required ? { action_required: true } : {}),
   };
 }
 

@@ -6,6 +6,28 @@ import { acquireDirLock, releaseDirLock } from "./locks.js";
 import type { Mailbox } from "./mailbox.js";
 import { trace } from "./trace.js";
 
+// v0.19 durable-delegation obligations.
+//
+// An inbound message carrying `action_required` is an OPEN OBLIGATION owned by
+// the receiver. The received-ledger is already the durable, per-session,
+// record-before-append index of every inbound message — so it is also the
+// natural source of truth for "actionable work I own that I haven't finished":
+// an obligation is OPEN iff its ledger line has action_required===true and no
+// terminal `obligation` field. complete_work/block_work stamp the terminal
+// field IN-PLACE on that same ledger line (single source of truth: no separate
+// obligations dir, so the 7-day delivery-artifact GC can never delete an open
+// obligation nor resurrect a completed one). Wake is irrelevant to all of this:
+// the obligation is on the owner's disk the instant delivery records it.
+export type ObligationState = {
+  state: "done" | "blocked";
+  at: number; // unix seconds
+  note?: string;
+};
+
+// What is actually stored on a ledger line: the inbound envelope plus the
+// receiver-side obligation outcome (absent until closed).
+export type LedgerRecord = Mailbox & { obligation?: ObligationState };
+
 // The received-message ledger: a durable, per-session index of every inbound
 // envelope, keyed by message_id. It exists because both delivery paths are
 // DESTRUCTIVE — mailbox.drain() truncates the queue to 0 after a read, and the
@@ -113,6 +135,41 @@ function lineMessageId(line: string): string | null {
   }
 }
 
+// Parse one ledger line into a record, or null if torn/invalid. Validates the
+// same minimal shape lookupReceived requires.
+function parseLedgerRecord(line: string): LedgerRecord | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (
+    parsed &&
+    typeof parsed === "object" &&
+    (parsed as Mailbox).schema_version === 1 &&
+    typeof (parsed as Mailbox).id === "string" &&
+    typeof (parsed as Mailbox).body === "string"
+  ) {
+    return parsed as LedgerRecord;
+  }
+  return null;
+}
+
+// An OPEN obligation: a delegation (action_required) the receiver has not yet
+// closed (no terminal obligation field).
+function isOpenObligation(rec: LedgerRecord): boolean {
+  return rec.action_required === true && !rec.obligation;
+}
+
+// The terminal obligation outcome already recorded on a ledger line, if any —
+// so a re-record of the SAME message_id (e.g. abort-recovery re-delivery) does
+// not resurrect a completed obligation back to OPEN.
+function lineObligation(line: string): ObligationState | undefined {
+  const rec = parseLedgerRecord(line);
+  return rec?.obligation;
+}
+
 // Append an inbound envelope to the receiver's ledger and prune to receivedMax()
 // (oldest dropped first). Called by delivery.ts BEFORE the mailbox append.
 // Idempotent by message_id: re-recording an id replaces its prior line.
@@ -127,19 +184,77 @@ export function recordReceived(receiverSessionId: string, msg: Mailbox): void {
     // surfacing as spurious reply_to_message "message-not-found" (M4). Drop any
     // prior line for this id, then append the latest. lookupReceived already
     // returns first-match newest-first, so behavior is unchanged for callers.
-    const deduped = msg.id ? lines.filter((l) => lineMessageId(l) !== msg.id) : lines;
-    deduped.push(JSON.stringify(msg));
+    //
+    // CARRY-FORWARD: if a prior line for this id had already been CLOSED
+    // (terminal obligation), preserve that outcome onto the re-recorded line so
+    // a re-delivery can't resurrect a completed obligation back to OPEN. In
+    // practice an action_required obligation is recorded exactly ONCE (via
+    // deliverToPeer at send time) — deliverExistingToPeer re-records only
+    // ask_peer replies to self, which are never action_required — so this is
+    // defense-in-depth for any future re-record path. Prefer ANY terminal
+    // outcome among matching lines: dedup keeps one line per id, but if that
+    // invariant is ever violated a closed outcome must win over an open one.
+    let carriedObligation: ObligationState | undefined;
+    const deduped: string[] = [];
+    for (const l of lines) {
+      if (msg.id && lineMessageId(l) === msg.id) {
+        const ob = lineObligation(l);
+        if (ob) carriedObligation = ob;
+        continue;
+      }
+      deduped.push(l);
+    }
+    const toStore: LedgerRecord = carriedObligation
+      ? { ...msg, obligation: carriedObligation }
+      : msg;
+    deduped.push(JSON.stringify(toStore));
+
+    // Prune to receivedMax(), oldest-first — but NEVER evict an OPEN obligation
+    // out of its own source of truth (that would orphan owned work the owner can
+    // never rediscover). Open obligations are exempt; everything else (plain
+    // messages, replies, and CLOSED obligations) prunes normally. complete_work
+    // marks an obligation terminal, which makes it prunable again, so the open
+    // set — and thus ledger growth — stays bounded by how much work is actually
+    // outstanding.
     const max = receivedMax();
     let pruned = deduped;
     if (deduped.length > max) {
-      pruned = deduped.slice(deduped.length - max);
-      // No silent caps: a dropped handle becomes reply_to_message
-      // "message-not-found", so surface that the bound bit.
-      trace("received_ledger_pruned", {
-        session_id: receiverSessionId,
-        dropped: deduped.length - max,
-        kept: max,
-      });
+      let toDrop = deduped.length - max;
+      const drop = new Set<number>();
+      for (let i = 0; i < deduped.length && toDrop > 0; i++) {
+        const rec = parseLedgerRecord(deduped[i]);
+        // Drop oldest-first. An OPEN obligation is exempt (never evict owned
+        // work). Everything else is prunable: plain messages, CLOSED
+        // obligations, AND torn/unparseable lines — a torn line carries no
+        // resolvable handle, so keeping it only leaks ledger space (it can't be
+        // an open obligation we could ever surface anyway).
+        if (!rec || !isOpenObligation(rec)) {
+          drop.add(i);
+          toDrop--;
+        }
+      }
+      if (drop.size > 0) {
+        pruned = deduped.filter((_, i) => !drop.has(i));
+        // No silent caps: a dropped handle becomes reply_to_message
+        // "message-not-found", so surface that the bound bit.
+        trace("received_ledger_pruned", {
+          session_id: receiverSessionId,
+          dropped: drop.size,
+          kept: pruned.length,
+        });
+      }
+      if (toDrop > 0) {
+        // The cap is exceeded purely by OPEN obligations we refused to evict —
+        // the ledger is over its soft cap because the owner is parking a large
+        // backlog of unfinished delegated work. Surface it loudly (an observable
+        // signal for a runaway delegator) rather than dropping owned work.
+        trace("received_ledger_over_cap_open_obligations", {
+          session_id: receiverSessionId,
+          kept: pruned.length,
+          soft_cap: max,
+          over_by: toDrop,
+        });
+      }
     }
     atomicWrite(ledgerPath(receiverSessionId), pruned.join("\n") + "\n");
   } finally {
@@ -178,6 +293,113 @@ export function lookupReceived(
       }
     }
     return null;
+  } finally {
+    releaseLock(receiverSessionId);
+  }
+}
+
+// List this session's OPEN obligations (action_required, not yet closed),
+// newest-first. Lock-free: atomicWrite renames a complete file into place, so a
+// reader never observes a torn ledger and a concurrent close just means this
+// read reflects the pre- or post-close state (both consistent). Read-only and
+// side-effect-free, so it is cheap to call at any turn boundary.
+export function listOpenObligations(receiverSessionId: string): Mailbox[] {
+  if (!receiverSessionId) return [];
+  const out: Mailbox[] = [];
+  const lines = readLines(receiverSessionId);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const rec = parseLedgerRecord(lines[i]);
+    if (!rec) {
+      // A torn line is invisible to the owner (can't be listed/closed). Trace it
+      // — mirrors the mailbox parser — so corruption is observable, not silent.
+      if (lines[i].length > 0) trace("received_ledger_skip_invalid", { session_id: receiverSessionId, op: "list_open" });
+      continue;
+    }
+    if (isOpenObligation(rec)) out.push(rec);
+  }
+  return out;
+}
+
+// Cheap count of OPEN obligations — the integer read_my_messages surfaces as
+// open_work_count so the one turn-boundary call already made by every client
+// (including a hookless Codex) reveals owned work with no extra discipline.
+export function countOpenObligations(receiverSessionId: string): number {
+  if (!receiverSessionId) return 0;
+  let n = 0;
+  for (const line of readLines(receiverSessionId)) {
+    const rec = parseLedgerRecord(line);
+    if (!rec) {
+      if (line.length > 0) trace("received_ledger_skip_invalid", { session_id: receiverSessionId, op: "count_open" });
+      continue;
+    }
+    if (isOpenObligation(rec)) n++;
+  }
+  return n;
+}
+
+export type ClaimObligationResult =
+  | { result: "claimed"; inbound: Mailbox }
+  | { result: "already-closed"; state: ObligationState["state"] }
+  | { result: "not-found" }
+  | { result: "not-an-obligation" };
+
+// Atomically CLAIM an open obligation and stamp it terminal, in one locked
+// read-modify-write — the single source of truth (no separate obligations file).
+// This is the compare-and-set that makes closing race-safe: only ONE caller can
+// flip an OPEN obligation to terminal, so a duplicate/concurrent complete_work
+// can't double-deliver — the loser gets "already-closed" and must NOT re-notify.
+// Returns the inbound record on a successful claim (so the caller can notify the
+// requester), "already-closed" with the prior state on a re-close, or
+// not-found / not-an-obligation. Mirrors recordReceived's lock so a concurrent
+// record/close can't interleave at the line level.
+export function claimObligation(
+  receiverSessionId: string,
+  messageId: string,
+  state: ObligationState["state"],
+  note?: string,
+): ClaimObligationResult {
+  if (!receiverSessionId || !messageId) return { result: "not-found" };
+  acquireLock(receiverSessionId);
+  try {
+    const lines = readLines(receiverSessionId);
+    for (let i = 0; i < lines.length; i++) {
+      if (lineMessageId(lines[i]) !== messageId) continue;
+      const rec = parseLedgerRecord(lines[i]);
+      if (!rec) continue; // torn line with a matching id — not a claimable obligation
+      if (!rec.action_required) return { result: "not-an-obligation" };
+      if (rec.obligation) return { result: "already-closed", state: rec.obligation.state };
+      const obligation: ObligationState = note
+        ? { state, at: Math.floor(Date.now() / 1000), note }
+        : { state, at: Math.floor(Date.now() / 1000) };
+      lines[i] = JSON.stringify({ ...rec, obligation });
+      atomicWrite(ledgerPath(receiverSessionId), lines.join("\n") + "\n");
+      return { result: "claimed", inbound: rec };
+    }
+    return { result: "not-found" };
+  } finally {
+    releaseLock(receiverSessionId);
+  }
+}
+
+// Revert a claimed obligation back to OPEN. Used when the completion DELIVERY
+// failed after we claimed it: the work's outcome never reached the requester, so
+// the obligation must re-surface in my_open_work for the owner to retry — never
+// close work whose result was never delivered. Locked, like every ledger write.
+export function reopenObligation(receiverSessionId: string, messageId: string): void {
+  if (!receiverSessionId || !messageId) return;
+  acquireLock(receiverSessionId);
+  try {
+    const lines = readLines(receiverSessionId);
+    for (let i = 0; i < lines.length; i++) {
+      if (lineMessageId(lines[i]) !== messageId) continue;
+      const rec = parseLedgerRecord(lines[i]);
+      if (!rec || !rec.obligation) break;
+      const { obligation: _drop, ...rest } = rec;
+      void _drop;
+      lines[i] = JSON.stringify(rest);
+      atomicWrite(ledgerPath(receiverSessionId), lines.join("\n") + "\n");
+      break;
+    }
   } finally {
     releaseLock(receiverSessionId);
   }
