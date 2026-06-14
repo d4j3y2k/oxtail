@@ -68,6 +68,13 @@ export const HOOK_MARKER_KEY = "_oxtailHook";
 //       the unknown flag into its box-path list where validation discards it
 //       (delivery intact, no receipts), and a new helper without --sid records
 //       receipts with a null recipient.
+//  v12: subagent-swallow guard. pretooluse.sh skips the mailbox drain when the
+//       payload carries a non-empty top-level `agent_id` — a Task subagent's
+//       tool call fires PreToolUse with the SAME session_id but that extra
+//       field, so draining there would inject peer mail into the subagent's
+//       throwaway context (lost to the main loop). The session stays marked
+//       busy; the mail waits for the main loop's next PreToolUse / Stop. A stale
+//       pre-v12 hook just keeps the old (swallowing) behavior until re-install.
 // INVARIANT: any change to an assets/*.sh script or the helper sources MUST
 // bump this version, so existing installs are forced to re-install.
 // scripts/check-hook-version.mjs enforces this in CI.
