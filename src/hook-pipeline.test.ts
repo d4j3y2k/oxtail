@@ -156,6 +156,63 @@ test("hook: stdin happy path — single message becomes additionalContext", asyn
   });
 });
 
+// Subagent guard: a Task subagent's tool call fires PreToolUse with the SAME
+// session_id but an extra top-level "agent_id" field. Draining here would inject
+// the peer message into the subagent's throwaway context (lost to the main loop),
+// so the hook must SKIP the drain — keeping the busy marker — and leave the mail
+// for the main loop's next PreToolUse / Stop. (Verified empirically: a subagent
+// Bash call carried agent_id + agent_type; the main loop's calls did not.)
+test("hook: subagent call (agent_id present) skips the drain but keeps busy marker", async () => {
+  await withHome(async (home) => {
+    const peerPid = 71050;
+    const sid = "5ba9e000-0000-4000-8000-000000000001";
+    const senderSid = "5e0de000-0000-4000-8000-000000000002";
+    register(fakeEntry(home, peerPid, sid));
+    enqueue(peerPid, "must NOT be drained by a subagent call", senderSid, { request_id: "req-sub" });
+
+    const stdin = JSON.stringify({
+      session_id: sid,
+      hook_event_name: "PreToolUse",
+      tool_name: "Bash",
+      agent_id: "aeb13f684ceb82c91",
+      agent_type: "Explore",
+    });
+    const r = await runHook({ HOME: home }, stdin);
+    assert.equal(r.code, 0, `stderr: ${r.stderr}`);
+    assert.equal(r.stdout, "", "a subagent call must NOT drain or emit an envelope");
+    // Mailbox preserved — the main loop's next PreToolUse / Stop will deliver it.
+    assert.ok(
+      readFileSync(mailboxFilePath(peerPid), "utf8").includes("must NOT be drained"),
+      "mailbox must be preserved on a subagent call",
+    );
+    // Busy marker IS still stamped — the session is genuinely busy during subagent work.
+    const safe = sid.replace(/[^A-Za-z0-9_-]/g, "_");
+    assert.equal(
+      readFileSync(join(home, ".oxtail", "activity", safe), "utf8"),
+      "busy",
+      "busy marker must still be stamped on a subagent call",
+    );
+  });
+});
+
+// Defensive: an empty agent_id must NOT trip the guard (it keys on a NON-EMPTY
+// value), so a main-loop call still drains normally.
+test("hook: empty agent_id does not trip the subagent guard (still drains)", async () => {
+  await withHome(async (home) => {
+    const peerPid = 71051;
+    const sid = "5ba9e000-0000-4000-8000-000000000003";
+    register(fakeEntry(home, peerPid, sid));
+    enqueue(peerPid, "main-loop message", "5e0de000-0000-4000-8000-000000000004");
+
+    const stdin = JSON.stringify({ session_id: sid, hook_event_name: "PreToolUse", agent_id: "" });
+    const r = await runHook({ HOME: home }, stdin);
+    assert.equal(r.code, 0, `stderr: ${r.stderr}`);
+    assert.ok(r.stdout.length > 0, "empty agent_id is a main-loop call → must drain");
+    assert.ok(r.stdout.includes("main-loop message"));
+    assert.equal(readFileSync(mailboxFilePath(peerPid), "utf8"), "", "mailbox drained on a main-loop call");
+  });
+});
+
 test("hook: body budget truncates (decoded chars; v8 helper counts decoded, not escaped)", async () => {
   await withHome(async (home) => {
     const peerPid = 71013;

@@ -66,6 +66,37 @@ safe_sid=$(printf '%s' "$sid" | tr -c 'A-Za-z0-9_-' '_')
   printf 'busy' > "$HOME/.oxtail/activity/$safe_sid" 2>/dev/null || true
 }
 
+# 2b. SUBAGENT GUARD. A Claude Code Task subagent's tool call fires THIS hook
+# with the SAME session_id as the main loop but an extra top-level "agent_id"
+# field (verified empirically + per the Claude Code hooks docs; main-loop calls
+# have no agent_id). If we drained the shared mailbox here, the hook-drain helper
+# would inject peer messages as additionalContext into the SUBAGENT's throwaway
+# context — which ignores them and dies, silently losing them from the main loop
+# (only the received-ledger could recover them). So on a subagent call we KEEP
+# the busy marker (the session IS busy) but SKIP the drain: the mail waits in the
+# mailbox for the main loop's next PreToolUse (no agent_id) or its Stop hook.
+# Cheap substring pre-filter, then confirm a NON-EMPTY value so a hypothetical
+# future agent_id:null on the main loop can't false-trigger.
+#
+# We deliberately key on agent_id ALONE (not also agent_type) and accept a narrow
+# imprecision: the grep scans the whole payload, so a MAIN-LOOP tool call whose
+# tool_input literally contains the JSON substring `"agent_id":"<nonempty>"`
+# (e.g. editing a captured hook payload / fixture) would also skip the drain.
+# That is FAIL-SAFE — the message simply waits for the next main-loop event, it
+# is never lost — and it is the right trade: the failure we must avoid is the
+# FALSE-NEGATIVE (not skipping on a real subagent call → the original swallow,
+# which loses the message from the main loop), and agent_id-alone is the most
+# reliable subagent signal for that. A full top-level-only JSON parse would cost
+# a node spawn on every tool call (defeating the quiet-inbox fast path) for a
+# self-correcting, already-fail-safe edge.
+case "$payload" in
+  *'"agent_id"'*)
+    if printf '%s' "$payload" | grep -Eq '"agent_id"[[:space:]]*:[[:space:]]*"[^"]'; then
+      exit 0
+    fi
+    ;;
+esac
+
 sessions_dir="$HOME/.oxtail/sessions"
 mailboxes_dir="$HOME/.oxtail/mailboxes"
 [ -d "$sessions_dir" ] || exit 0
