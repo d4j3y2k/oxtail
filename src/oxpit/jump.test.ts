@@ -59,37 +59,49 @@ function entry(over: Partial<RegistryEntry> = {}): RegistryEntry {
 // ── chooseClient (pure) ───────────────────────────────────────────────────────
 
 test("chooseClient: explicit --client wins", () => {
-  const r = chooseClient([{ name: "c1", tty: "/t1", session: "s" }], "c1", "override");
+  const r = chooseClient([{ name: "c1", tty: "/t1", session: "s" }], "c1", "override", "s");
   assert.deepEqual(r, { client: "override", ambiguous: false });
 });
 
-test("chooseClient: single other client is driven (cockpit stays put)", () => {
+test("chooseClient: single other client on the target session is driven", () => {
   const clients = [
-    { name: "cockpit", tty: "/t1", session: "oxpit" },
+    { name: "cockpit", tty: "/t1", session: "cockpit" },
     { name: "work", tty: "/t2", session: "proj" },
   ];
-  const r = chooseClient(clients, "cockpit", undefined);
+  const r = chooseClient(clients, "cockpit", undefined, "proj");
+  assert.deepEqual(r, { client: "work", ambiguous: false });
+});
+
+test("chooseClient: prefers the target-session client, ignores unrelated sessions", () => {
+  // David's real case: cockpit + the work terminal on oxtail + another project's
+  // terminal. Only the oxtail client is a valid jump target.
+  const clients = [
+    { name: "cockpit", tty: "/t0", session: "cockpit" },
+    { name: "work", tty: "/t1", session: "oxtail" },
+    { name: "other-proj", tty: "/t2", session: "matmole-air" },
+  ];
+  const r = chooseClient(clients, "cockpit", undefined, "oxtail");
   assert.deepEqual(r, { client: "work", ambiguous: false });
 });
 
 test("chooseClient: only self attached ⇒ drive self", () => {
-  const r = chooseClient([{ name: "self", tty: "/t", session: "s" }], "self", undefined);
+  const r = chooseClient([{ name: "self", tty: "/t", session: "s" }], "self", undefined, "s");
   assert.deepEqual(r, { client: "self", ambiguous: false });
 });
 
-test("chooseClient: multiple others ⇒ self + ambiguous flag", () => {
+test("chooseClient: multiple clients ON the target session ⇒ ambiguous", () => {
   const clients = [
-    { name: "self", tty: "/t0", session: "s" },
+    { name: "self", tty: "/t0", session: "cockpit" },
     { name: "a", tty: "/t1", session: "s" },
     { name: "b", tty: "/t2", session: "s" },
   ];
-  const r = chooseClient(clients, "self", undefined);
-  assert.equal(r.client, "self");
+  const r = chooseClient(clients, "self", undefined, "s");
   assert.equal(r.ambiguous, true);
+  assert.deepEqual(new Set(r.candidates), new Set(["a", "b"]));
 });
 
 test("chooseClient: no clients ⇒ null", () => {
-  assert.deepEqual(chooseClient([], "self", undefined), { client: null, ambiguous: false });
+  assert.deepEqual(chooseClient([], "self", undefined, "s"), { client: null, ambiguous: false });
 });
 
 // ── tmux output parsing ───────────────────────────────────────────────────────
@@ -208,10 +220,11 @@ test("jumpToAgent: outside tmux yields a manual command", () => {
   }
 });
 
-test("jumpToAgent: refuses (no mutation) when the client choice is ambiguous", () => {
+test("jumpToAgent: refuses (no mutation) when ≥2 clients view the target session", () => {
   const { run, calls } = fakeRunner({
     "list-panes": "%7\tproj\t@2\n",
-    "list-clients": "self\t/t0\toxpit\nwork1\t/t1\tproj\nwork2\t/t2\tother\n",
+    // two clients BOTH on the target session 'proj' ⇒ genuinely ambiguous
+    "list-clients": "self\t/t0\toxpit\nwork1\t/t1\tproj\nwork2\t/t2\tproj\n",
     "display-message": "self",
   });
   const r = jumpToAgent(agent(), {
@@ -221,7 +234,24 @@ test("jumpToAgent: refuses (no mutation) when the client choice is ambiguous", (
     verifyPane: () => "%7",
   });
   assert.equal(r.ok, false);
-  if (!r.ok) assert.match(r.reason, /multiple attached clients/);
+  if (!r.ok) assert.match(r.reason, /multiple terminals could be moved/);
   // Crucially, it must NOT have mutated tmux before refusing.
   assert.ok(!calls.some((c) => c[0] === "select-pane" || c[0] === "switch-client"));
+});
+
+test("jumpToAgent: an unrelated-session client does NOT cause ambiguity", () => {
+  // cockpit (self) + work on the target session + a 3rd terminal on another project.
+  const { run, calls } = fakeRunner({
+    "list-panes": "%7\tproj\t@2\n",
+    "list-clients": "cockpit\t/t0\tcockpit\nwork\t/t1\tproj\nother\t/t2\tmatmole\n",
+    "display-message": "cockpit",
+  });
+  const r = jumpToAgent(agent(), {
+    run,
+    inTmux: true,
+    resolveEntry: () => entry(),
+    verifyPane: () => "%7",
+  });
+  assert.equal(r.ok, true);
+  if (r.ok) assert.equal(r.client, "work"); // drove the oxtail/proj terminal, ignored 'other'
 });

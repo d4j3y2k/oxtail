@@ -111,22 +111,35 @@ export function selfClientName(run: TmuxRunner): string | null {
   }
 }
 
-// Pick which client to drive. Pure + unit-tested. Priority: explicit --client →
-// the single OTHER attached client (keep cockpit visible) → our own client
-// (single-terminal) → null (none attached; caller prints the manual command).
+// Pick which client to drive. Pure + unit-tested. Priority:
+//   explicit --client
+//   → the single OTHER client ALREADY VIEWING the target's session (the one a jump
+//     can actually move to the agent; clients on unrelated sessions — e.g. another
+//     project's tmux session — are never hijack targets)
+//   → our own client (single-terminal case)
+//   → ambiguous (caller refuses + lists candidates) when the choice is a guess.
+// `targetSession` is the session the agent's pane lives in.
 export function chooseClient(
   clients: ClientRow[],
   selfClient: string | null,
   explicit: string | undefined,
-): { client: string | null; ambiguous: boolean } {
+  targetSession: string,
+): { client: string | null; ambiguous: boolean; candidates?: string[] } {
   if (explicit) return { client: explicit, ambiguous: false };
   if (clients.length === 0) return { client: null, ambiguous: false };
   const others = clients.filter((c) => c.name !== selfClient);
-  if (others.length === 1) return { client: others[0].name, ambiguous: false };
-  if (others.length === 0) return { client: selfClient, ambiguous: false };
-  // More than one other client: ambiguous. Prefer self (the predictable choice)
-  // and let the caller surface that --client can disambiguate.
-  return { client: selfClient ?? others[0].name, ambiguous: true };
+  if (others.length === 0) return { client: selfClient, ambiguous: false }; // only us
+  // Prefer clients already on the target's session — those follow cleanly to the
+  // agent's window. Unrelated-session clients are excluded so a jump never drags
+  // another project's terminal across.
+  const onTarget = others.filter((c) => c.session === targetSession);
+  if (onTarget.length === 1) return { client: onTarget[0].name, ambiguous: false };
+  if (onTarget.length > 1) {
+    return { client: selfClient ?? onTarget[0].name, ambiguous: true, candidates: onTarget.map((c) => c.name) };
+  }
+  // No other client is viewing the target session: don't hijack an unrelated
+  // terminal — surface the choice (the candidates are the unrelated clients).
+  return { client: selfClient ?? others[0].name, ambiguous: true, candidates: others.map((c) => c.name) };
 }
 
 // Re-resolve the agent's CURRENT registry entry by session identity (handles MCP
@@ -205,15 +218,12 @@ export function jumpToAgent(agent: FleetAgent, deps: JumpDeps = {}): JumpResult 
   // arbitrary human's terminal — tell the operator to disambiguate with --client.
   const clients = listClients(run);
   const self = selfClientName(run);
-  const choice = chooseClient(clients, self, deps.client);
+  const choice = chooseClient(clients, self, deps.client, loc.session);
   if (choice.ambiguous && !deps.client) {
-    const others = clients
-      .filter((c) => c.name !== self)
-      .map((c) => c.name)
-      .join(", ");
+    const cand = (choice.candidates ?? []).join(", ");
     return {
       ok: false,
-      reason: `multiple attached clients (${others}); pass --client <name> to choose which terminal to move`,
+      reason: `multiple terminals could be moved (${cand}); pass --client <name> to choose which one`,
     };
   }
 
