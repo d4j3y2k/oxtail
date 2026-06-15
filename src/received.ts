@@ -404,3 +404,42 @@ export function listLedgerRequestPairs(
   }
   return out;
 }
+
+// A flattened, render-friendly view of one inbound ledger record (the obligation
+// outcome collapsed to its terminal state). Used by the oxpit comms-log.
+export type LedgerEntry = {
+  id: string;
+  from_session_id: string | null;
+  body: string;
+  enqueued_at: number;
+  request_id?: string;
+  reply_to?: string;
+  action_required?: boolean;
+  closed?: ObligationState["state"]; // "done" | "blocked" if the obligation was closed
+};
+
+// Canonical reader of a session's most-recent inbound messages (newest-first,
+// capped at `limit`). The oxpit comms-log merges these across the fleet into a
+// cross-agent message feed. Read-only, lock-free, tolerates torn lines — reuses
+// parseLedgerRecord (don't-fork-truth). A session's ledger is its RECEIVED inbox,
+// so each record's receiver is `sessionId` and its sender is `from_session_id`.
+export function listRecentLedgerRecords(sessionId: string, limit = 50): LedgerEntry[] {
+  if (!sessionId || limit <= 0) return [];
+  const out: LedgerEntry[] = [];
+  const lines = readLines(sessionId);
+  for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
+    const rec = parseLedgerRecord(lines[i]);
+    if (!rec) continue;
+    out.push({
+      id: rec.id,
+      from_session_id: rec.from_session_id ?? null,
+      body: rec.body,
+      enqueued_at: rec.enqueued_at,
+      request_id: rec.request_id,
+      reply_to: rec.reply_to,
+      action_required: rec.action_required,
+      closed: rec.obligation?.state,
+    });
+  }
+  return out;
+}

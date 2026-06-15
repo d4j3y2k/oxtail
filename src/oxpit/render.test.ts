@@ -1,7 +1,8 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { renderSnapshot } from "./render.js";
+import { computeAgentLabels, renderCommsLog, renderSnapshot } from "./render.js";
 import type { FleetAgent, FleetSnapshot } from "./snapshot.js";
+import type { CommsMessage } from "./comms.js";
 
 function agent(partial: Partial<FleetAgent>): FleetAgent {
   return {
@@ -42,6 +43,81 @@ function snap(agents: FleetAgent[], extra: Partial<FleetSnapshot> = {}): FleetSn
     ...extra,
   };
 }
+
+// ── comms-log ─────────────────────────────────────────────────────────────────
+
+function msg(over: Partial<CommsMessage>): CommsMessage {
+  return {
+    message_id: "m1",
+    from_session_id: "sa",
+    to_session_id: "sb",
+    body: "hello there",
+    at: 1000,
+    ...over,
+  };
+}
+const COMMS_LABELS = new Map([
+  ["sa", "main"],
+  ["sb", "codex"],
+]);
+
+test("renderCommsLog: from→to via labels, relative age, body", () => {
+  const out = renderCommsLog([msg({})], COMMS_LABELS, { color: false, nowSec: 1120 });
+  assert.match(out, /main → codex/);
+  assert.match(out, /2m/);
+  assert.match(out, /hello there/);
+});
+
+test("renderCommsLog: lifecycle/ask/reply markers", () => {
+  const base = { color: false, nowSec: 1000 };
+  assert.match(renderCommsLog([msg({ action_required: true })], COMMS_LABELS, base), /⚑/);
+  assert.match(
+    renderCommsLog([msg({ action_required: true, closed: "done" })], COMMS_LABELS, base),
+    /⚑✓/,
+  );
+  assert.match(
+    renderCommsLog([msg({ action_required: true, closed: "blocked" })], COMMS_LABELS, base),
+    /⚑✗/,
+  );
+  assert.match(renderCommsLog([msg({ request_id: "r1" })], COMMS_LABELS, base), /❓/);
+  assert.match(renderCommsLog([msg({ reply_to: "r1" })], COMMS_LABELS, base), /↩/);
+});
+
+test("renderCommsLog: unresolved sender → short id; null → operator", () => {
+  const a = renderCommsLog([msg({ from_session_id: "unknownsession" })], COMMS_LABELS, {
+    color: false,
+    nowSec: 1000,
+  });
+  assert.match(a, /unknowns → codex/); // first 8 chars of an unattributable sender
+  const b = renderCommsLog([msg({ from_session_id: null })], COMMS_LABELS, {
+    color: false,
+    nowSec: 1000,
+  });
+  assert.match(b, /operator → codex/);
+});
+
+test("renderCommsLog: empty feed and tail-honesty header", () => {
+  const out = renderCommsLog([], COMMS_LABELS, { color: false });
+  assert.match(out, /no inter-agent messages/);
+  assert.match(out, /not a full audit log/);
+});
+
+test("renderCommsLog: expand shows the full body, snippet truncates", () => {
+  const long = "x".repeat(400);
+  const collapsed = renderCommsLog([msg({ message_id: "big", body: long })], COMMS_LABELS, {
+    color: false,
+    nowSec: 1000,
+    width: 80,
+  });
+  assert.ok(!collapsed.includes(long), "snippet is truncated");
+  const expanded = renderCommsLog([msg({ message_id: "big", body: long })], COMMS_LABELS, {
+    color: false,
+    nowSec: 1000,
+    width: 80,
+    expandedId: "big",
+  });
+  assert.ok(expanded.replace(/\s/g, "").includes(long), "expanded contains the full body");
+});
 
 test("render: header counts agents and actives", () => {
   const out = renderSnapshot(

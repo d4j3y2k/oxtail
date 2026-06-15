@@ -5,6 +5,7 @@
 
 import { cell, clip, clipToWidth, displayWidth, fmtAge } from "./format.js";
 import type { FleetAgent, FleetSnapshot, Liveness } from "./snapshot.js";
+import type { CommsMessage } from "./comms.js";
 
 const C = {
   reset: "\x1b[0m",
@@ -203,6 +204,112 @@ function renderWaitGraph(
   return out;
 }
 
+// Human-facing labels for a fleet, shared by every renderer so an agent reads the
+// same everywhere. Label = the agent's tmux window name when present and unique;
+// collisions (or auto-named windows like "node") disambiguate with the short id;
+// no window name falls back to the short id. Returned keyed by both short_id (table
+// rows, wait-graph, badges) and session_id (comms-log from/to).
+export function computeAgentLabels(agents: ReadonlyArray<FleetAgent>): {
+  byShortId: Map<string, string>;
+  bySession: Map<string, string>;
+} {
+  const nameCount = new Map<string, number>();
+  for (const a of agents) {
+    if (a.window_name) nameCount.set(a.window_name, (nameCount.get(a.window_name) ?? 0) + 1);
+  }
+  const byShortId = new Map<string, string>();
+  const bySession = new Map<string, string>();
+  for (const a of agents) {
+    const l =
+      a.window_name && nameCount.get(a.window_name) === 1
+        ? a.window_name
+        : a.window_name
+          ? `${a.window_name}·${a.short_id.slice(0, 4)}`
+          : a.short_id;
+    byShortId.set(a.short_id, l);
+    if (a.session_id) bySession.set(a.session_id, l);
+  }
+  return { byShortId, bySession };
+}
+
+export type CommsRenderOptions = RenderOptions & {
+  nowSec?: number; // for relative ages; defaults to the wall clock
+  expandedId?: string; // message_id to render with its FULL body (⏎ expand)
+};
+
+// Render the comms-log feed (oldest→newest) as a string. Pure; names resolved via
+// the shared session→label map. Snippet bodies by default; the one message whose
+// id == expandedId shows its full (multi-line-flattened) body.
+export function renderCommsLog(
+  messages: ReadonlyArray<CommsMessage>,
+  bySession: Map<string, string>,
+  opts: CommsRenderOptions = {},
+): string {
+  const color = opts.color ?? false;
+  const width = Math.max(40, opts.width ?? 100);
+  const nowSec = opts.nowSec ?? Math.floor(Date.now() / 1000);
+  const paint = makePaint(color);
+  const name = (sid: string | null): string =>
+    (sid && bySession.get(sid)) || (sid ? sid.slice(0, 8) : "operator");
+
+  const lines: string[] = [];
+  lines.push(
+    paint("comms", C.bold) + paint("  recent message tail (not a full audit log)", C.dim),
+  );
+  if (messages.length === 0) {
+    lines.push(paint("  no inter-agent messages in ledgers yet", C.dim));
+  } else {
+    for (const m of messages) {
+      const age = fmtAge(Math.max(0, nowSec - m.at));
+      // Delegation lifecycle + ask/reply markers (badge idiom).
+      let mark = "";
+      if (m.action_required) mark = m.closed === "done" ? "⚑✓" : m.closed === "blocked" ? "⚑✗" : "⚑";
+      else if (m.reply_to) mark = "↩";
+      else if (m.request_id) mark = "❓";
+      const markStr = mark ? ` ${mark}` : "";
+      const head = `  ${cell(age, 4)} ${name(m.from_session_id)} → ${name(m.to_session_id)}${markStr}: `;
+      const expanded = m.message_id === opts.expandedId;
+      const bodyText = expanded ? m.body.replace(/\s+/g, " ").trim() : clip(m.body, 200);
+      if (expanded) {
+        lines.push(paint(head, C.dim));
+        // Full body, wrapped to width (each physical line clipped at the end).
+        for (const seg of wrap(bodyText, width - 4)) lines.push("    " + seg);
+      } else {
+        const remaining = width - head.length - 1;
+        const snippet = remaining >= 8 ? clip(bodyText, remaining) : "";
+        lines.push(paint(head, C.dim) + snippet);
+      }
+    }
+  }
+  return lines.map((l) => clipToWidth(l, width)).join("\n");
+}
+
+// Greedy word-wrap to `w` columns (full-body expand). Falls back to hard slices for
+// a single over-long token.
+function wrap(s: string, w: number): string[] {
+  if (w <= 0) return [s];
+  const out: string[] = [];
+  let line = "";
+  for (const word of s.split(" ")) {
+    if (word.length > w) {
+      if (line) {
+        out.push(line);
+        line = "";
+      }
+      for (let i = 0; i < word.length; i += w) out.push(word.slice(i, i + w));
+      continue;
+    }
+    if (!line) line = word;
+    else if (line.length + 1 + word.length <= w) line += " " + word;
+    else {
+      out.push(line);
+      line = word;
+    }
+  }
+  if (line) out.push(line);
+  return out.length ? out : [""];
+}
+
 // Render the full snapshot to a string. `selected` highlights a TUI row.
 export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): string {
   const color = opts.color ?? false;
@@ -221,24 +328,7 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
     paint(` (${active} active)`, C.green);
   lines.push(head);
 
-  // Human-facing label per agent (short_id → label): the tmux window name when
-  // present and unique; collisions (or auto-named windows like "node") disambiguate
-  // with the short id; no window name falls back to the short id. Built once and
-  // shared by the table, the badges, and the wait-graph so names are consistent.
-  const nameCount = new Map<string, number>();
-  for (const a of s.agents) {
-    if (a.window_name) nameCount.set(a.window_name, (nameCount.get(a.window_name) ?? 0) + 1);
-  }
-  const labels = new Map<string, string>();
-  for (const a of s.agents) {
-    const l =
-      a.window_name && nameCount.get(a.window_name) === 1
-        ? a.window_name
-        : a.window_name
-          ? `${a.window_name}·${a.short_id.slice(0, 4)}`
-          : a.short_id;
-    labels.set(a.short_id, l);
-  }
+  const { byShortId: labels } = computeAgentLabels(s.agents);
   const rowLabel = (a: FleetAgent): string => labels.get(a.short_id) ?? a.short_id;
 
   if (s.agents.length === 0) {
