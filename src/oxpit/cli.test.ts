@@ -36,6 +36,21 @@ test("parseStatusArgs: unknown flags are ignored (forward-compat)", () => {
   assert.equal(a.json, false); // didn't choke
 });
 
+test("parseStatusArgs: -h / --help", () => {
+  assert.equal(parseStatusArgs(["-h"]).help, true);
+  assert.equal(parseStatusArgs(["--help"]).help, true);
+  assert.equal(parseStatusArgs([]).help, false);
+});
+
+test("runStatus --help prints usage and skips the snapshot", () => {
+  const lines: string[] = [];
+  const code = runStatus(["--help"], (l) => lines.push(l));
+  assert.equal(code, 0);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /oxtail status/);
+  assert.match(lines[0], /oxpit keys/);
+});
+
 test("runStatus --json emits valid parseable JSON with the snapshot shape", () => {
   const lines: string[] = [];
   // allProjects keeps this deterministic-ish regardless of cwd scoping; we only

@@ -11,7 +11,23 @@ export type StatusArgs = {
   all: boolean;
   width: number | undefined;
   project: string | undefined;
+  help: boolean;
 };
+
+export const USAGE = `oxtail status — print the agent fleet once and exit
+oxtail oxpit  — live interactive fleet cockpit (separate terminal)
+
+status flags:
+  --json [--pretty]   machine-readable snapshot (CI / scripting)
+  --color | --no-color
+  --all               include agents from every project, not just this one
+  --width N           override output width
+  --project PATH      scope to a specific project root
+  -h, --help          this help
+
+oxpit keys:  ↑/k ↓/j move · ⏎ jump to pane · r refresh · ? help · q quit
+oxpit flags: --no-color, --all, --project PATH, --client NAME (which tmux
+             client the jump drives when several are attached)`;
 
 export function parseStatusArgs(argv: string[]): StatusArgs {
   const a: StatusArgs = {
@@ -21,10 +37,15 @@ export function parseStatusArgs(argv: string[]): StatusArgs {
     all: false,
     width: undefined,
     project: undefined,
+    help: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     switch (arg) {
+      case "-h":
+      case "--help":
+        a.help = true;
+        break;
       case "--json":
         a.json = true;
         break;
@@ -67,6 +88,10 @@ export function runStatus(
   out: (line: string) => void = (s) => process.stdout.write(s + "\n"),
 ): number {
   const a = parseStatusArgs(argv);
+  if (a.help) {
+    out(USAGE);
+    return 0;
+  }
   const snap = buildSnapshot({ allProjects: a.all, projectRoot: a.project });
   if (a.json) {
     out(JSON.stringify(snap, null, a.pretty ? 2 : 0));

@@ -18,7 +18,7 @@ import { buildSnapshot, type FleetAgent, type FleetSnapshot } from "./snapshot.j
 import { renderSnapshot } from "./render.js";
 import { clipToWidth } from "./format.js";
 import { jumpToAgent } from "./jump.js";
-import { parseStatusArgs } from "./cli.js";
+import { parseStatusArgs, USAGE } from "./cli.js";
 
 const ALT_ON = "\x1b[?1049h";
 const ALT_OFF = "\x1b[?1049l";
@@ -47,6 +47,10 @@ function clientFlag(argv: string[]): string | undefined {
 
 export async function runOxpit(argv: string[]): Promise<number> {
   const a = parseStatusArgs(argv);
+  if (a.help) {
+    process.stdout.write(USAGE + "\n");
+    return 0;
+  }
   const buildOpts = { allProjects: a.all, projectRoot: a.project };
 
   // No TTY (piped, CI, popup without -E pty): degrade to a one-shot snapshot.
