@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { computeAgentLabels, renderCommsLog, renderSnapshot } from "./render.js";
+import { commsBodyLines, computeAgentLabels, renderCommsLog, renderSnapshot } from "./render.js";
 import type { FleetAgent, FleetSnapshot } from "./snapshot.js";
 import type { CommsMessage } from "./comms.js";
 
@@ -103,6 +103,24 @@ test("renderCommsLog: null sender is 'operator' ONLY when origin says so, else '
   });
   assert.match(anon, /unknown → codex/);
   assert.ok(!/operator → codex/.test(anon), "null-from non-operator must NOT be labeled operator");
+});
+
+test("commsBodyLines: full mode word-wraps the whole body across lines", () => {
+  const long = "word ".repeat(60).trim(); // ~300 chars
+  const snippet = commsBodyLines([msg({ body: long })], COMMS_LABELS, {
+    color: false,
+    nowSec: 1000,
+    width: 60,
+  });
+  const full = commsBodyLines([msg({ body: long })], COMMS_LABELS, {
+    color: false,
+    nowSec: 1000,
+    width: 60,
+    full: true,
+  });
+  assert.equal(snippet.length, 1, "snippet is a single line");
+  assert.ok(full.length > snippet.length, "full wraps to multiple lines");
+  assert.ok(full.every((l) => l.length <= 60), "no wrapped line exceeds width");
 });
 
 test("renderCommsLog: empty feed and tail-honesty header", () => {

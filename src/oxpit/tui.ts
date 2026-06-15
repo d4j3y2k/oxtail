@@ -15,7 +15,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { buildSnapshot, type FleetAgent, type FleetSnapshot } from "./snapshot.js";
-import { computeAgentLabels, renderCommsLog, renderSnapshot } from "./render.js";
+import { commsBodyLines, computeAgentLabels, renderSnapshot } from "./render.js";
 import { buildCommsLog, type CommsMessage } from "./comms.js";
 import { clipToWidth } from "./format.js";
 import { jumpToAgent } from "./jump.js";
@@ -91,10 +91,11 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     let torndown = false;
     let helpOpen = false;
     let mode: "fleet" | "log" = "fleet";
-    let logOffset = 0; // messages scrolled up from the newest (0 = tail/live)
+    let logOffset = 0; // LINES scrolled up from the newest (0 = tail/live)
     let logFilterSelf = false; // scope the log to the fleet-selected agent
-    let logTotal = 0; // last-rendered comms count (for scroll clamping)
-    let logVisible = 0; // last-rendered visible message rows
+    let logFull = false; // word-wrap full message bodies (vs one-line snippets)
+    let logTotalLines = 0; // last-rendered total body lines (for scroll clamping)
+    let logAvail = 0; // last-rendered visible body lines
     let pendingNudgeKey: string | null = null; // agentKey awaiting 'y' to confirm a nudge
 
     const stdin = process.stdin;
@@ -121,7 +122,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (mode === "log") {
         const pos = logOffset === 0 ? "live" : `↑${logOffset}`;
         const filt = logFilterSelf ? " (on)" : "";
-        keys = `↑↓/jk scroll  f filter${filt}  l/Esc fleet  r refresh  q quit  [${pos}]`;
+        keys = `↑↓ scroll  w ${logFull ? "snippet" : "full"}  f filter${filt}  l/Esc fleet  q quit  [${pos}]`;
       } else {
         keys = "↑↓ move  ⏎ jump  n nudge  l log  r refresh  ? help  q quit";
       }
@@ -139,7 +140,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "  ↑/k  ↓/j      move selection (fleet) / scroll (log)",
         "  ⏎             jump to the selected agent's tmux pane",
         "  n             nudge the selected agent (operator message; y to confirm)",
-        "  l             toggle the comms-log (fleet ⇄ log); f filters to selection",
+        "  l             comms-log (fleet ⇄ log); in log: w full-text · f filter · ↑↓ scroll",
         "  r             force refresh    ?  toggle help    q / Ctrl-C  quit",
         "",
         d("  🟢 active   🟡 idle   ⚫ dead (exited / pid-reused)"),
@@ -178,29 +179,46 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       });
     }
 
-    // Comms-log body, windowed to terminal height and scroll-positioned by logOffset
-    // (0 = tail/live). Optionally filtered to the fleet-selected agent's traffic.
+    // Comms-log body, LINE-windowed to terminal height and scroll-positioned by
+    // logOffset (lines from the newest; 0 = tail/live). `w` toggles full word-wrap
+    // (readable) vs one-line snippets; `f` filters to the fleet-selected agent.
     function logFrame(width: number, rows: number): string {
       const { bySession } = computeAgentLabels(snapshot.agents);
       let comms: CommsMessage[] = buildCommsLog(snapshot.agents, { limit: LOG_FETCH });
+      let filterNote = "";
       if (logFilterSelf) {
         const sel = snapshot.agents[selectedIndex()];
         const sid = sel?.session_id;
-        if (sid) comms = comms.filter((m) => m.from_session_id === sid || m.to_session_id === sid);
+        if (sid) {
+          comms = comms.filter((m) => m.from_session_id === sid || m.to_session_id === sid);
+          filterNote = `  [${sel.window_name ?? sel.short_id}]`;
+        } else {
+          filterNote = "  [filter: no agent selected]";
+        }
       }
-      logTotal = comms.length;
-      const visible = Math.max(3, rows - 5); // header(1) + footer(2) + markers(1) + margin(1)
-      logVisible = visible;
-      const maxOffset = Math.max(0, comms.length - visible);
-      if (logOffset > maxOffset) logOffset = maxOffset;
-      const end = comms.length - logOffset;
-      const start = Math.max(0, end - visible);
-      const out = renderCommsLog(comms.slice(start, end), bySession, {
+      const bodyLines = commsBodyLines(comms, bySession, {
         color: opts.color,
         width,
+        full: logFull,
       });
-      const older = start > 0 ? `\n${dim(`  ↑ ${start} older`, opts.color)}` : "";
-      return out + older;
+      logTotalLines = bodyLines.length;
+      const avail = Math.max(3, rows - 5); // header(1) + footer(2) + 2 scroll markers
+      logAvail = avail;
+      const maxOffset = Math.max(0, bodyLines.length - avail);
+      if (logOffset > maxOffset) logOffset = maxOffset;
+      const end = bodyLines.length - logOffset;
+      const start = Math.max(0, end - avail);
+
+      const header =
+        (opts.color ? "\x1b[1m\x1b[36mcomms\x1b[0m" : "comms") +
+        dim(`  recent tail${logFull ? " · full" : ""}${filterNote}`, opts.color);
+      const out: string[] = [header];
+      if (start > 0) out.push(dim(`  ↑ ${start} more line${start === 1 ? "" : "s"}`, opts.color));
+      out.push(...bodyLines.slice(start, end));
+      if (end < bodyLines.length) {
+        out.push(dim(`  ↓ ${bodyLines.length - end} more`, opts.color));
+      }
+      return out.join("\n");
     }
 
     function paint(): void {
@@ -224,7 +242,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     }
 
     function logScroll(delta: number): void {
-      const maxOffset = Math.max(0, logTotal - logVisible);
+      const maxOffset = Math.max(0, logTotalLines - logAvail);
       const next = Math.min(maxOffset, Math.max(0, logOffset + delta));
       if (next === logOffset) return;
       logOffset = next;
@@ -371,6 +389,11 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         if (s === "\x1b") return toggleLog(); // Esc → back to fleet (lone ESC, not an arrow)
         if (s === "\x1b[A" || s === "k") return logScroll(1); // older
         if (s === "\x1b[B" || s === "j") return logScroll(-1); // newer
+        if (s === "w") {
+          logFull = !logFull; // toggle full word-wrap vs snippet
+          logOffset = 0;
+          return paint();
+        }
         if (s === "f") {
           logFilterSelf = !logFilterSelf;
           logOffset = 0;

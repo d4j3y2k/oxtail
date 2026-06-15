@@ -234,12 +234,53 @@ export function computeAgentLabels(agents: ReadonlyArray<FleetAgent>): {
 
 export type CommsRenderOptions = RenderOptions & {
   nowSec?: number; // for relative ages; defaults to the wall clock
-  expandedId?: string; // message_id to render with its FULL body (⏎ expand)
+  expandedId?: string; // message_id to render with its FULL body (single expand)
+  full?: boolean; // render EVERY message's body word-wrapped (TUI `w` toggle)
 };
 
-// Render the comms-log feed (oldest→newest) as a string. Pure; names resolved via
-// the shared session→label map. Snippet bodies by default; the one message whose
-// id == expandedId shows its full (multi-line-flattened) body.
+// The per-message comms lines (NO header). Each message is one snippet line by
+// default; FULL (head line + word-wrapped body) when opts.full or its id matches
+// opts.expandedId. Every line is width-clipped (ANSI-aware) so none wraps the
+// terminal. Returned as a line array so the TUI can line-window/scroll it.
+export function commsBodyLines(
+  messages: ReadonlyArray<CommsMessage>,
+  bySession: Map<string, string>,
+  opts: CommsRenderOptions = {},
+): string[] {
+  const color = opts.color ?? false;
+  const width = Math.max(40, opts.width ?? 100);
+  const nowSec = opts.nowSec ?? Math.floor(Date.now() / 1000);
+  const paint = makePaint(color);
+  const name = (sid: string): string => bySession.get(sid) ?? sid.slice(0, 8);
+  // null sender is "operator" ONLY when origin says so (a human cockpit send), else
+  // "unknown" (unclaimed/anon peer) — origin is the discriminator (codex review #3).
+  const fromLabel = (m: CommsMessage): string =>
+    m.from_session_id ? name(m.from_session_id) : m.origin === "operator" ? "operator" : "unknown";
+
+  const out: string[] = [];
+  for (const m of messages) {
+    const age = fmtAge(Math.max(0, nowSec - m.at));
+    let mark = "";
+    if (m.action_required) mark = m.closed === "done" ? "⚑✓" : m.closed === "blocked" ? "⚑✗" : "⚑";
+    else if (m.reply_to) mark = "↩";
+    else if (m.request_id) mark = "❓";
+    const markStr = mark ? ` ${mark}` : "";
+    const head = `  ${cell(age, 4)} ${fromLabel(m)} → ${name(m.to_session_id)}${markStr}: `;
+    if (opts.full || m.message_id === opts.expandedId) {
+      const body = m.body.replace(/\s+/g, " ").trim();
+      out.push(clipToWidth(paint(head, C.dim), width));
+      for (const seg of wrap(body, width - 4)) out.push(clipToWidth("    " + seg, width));
+    } else {
+      const remaining = width - head.length - 1;
+      const snippet = remaining >= 8 ? clip(m.body, remaining) : "";
+      out.push(clipToWidth(paint(head, C.dim) + snippet, width));
+    }
+  }
+  return out;
+}
+
+// Render the comms-log feed (oldest→newest): header + body lines. (`oxtail status
+// --log`; the TUI uses commsBodyLines directly so it can line-window/scroll.)
 export function renderCommsLog(
   messages: ReadonlyArray<CommsMessage>,
   bySession: Map<string, string>,
@@ -247,46 +288,18 @@ export function renderCommsLog(
 ): string {
   const color = opts.color ?? false;
   const width = Math.max(40, opts.width ?? 100);
-  const nowSec = opts.nowSec ?? Math.floor(Date.now() / 1000);
   const paint = makePaint(color);
-  // Resolve a session id to its label (window name / short id). A non-null id only.
-  const name = (sid: string): string => bySession.get(sid) ?? sid.slice(0, 8);
-  // The sender label: a real session → its label; a null sender is "operator" ONLY
-  // when origin says so (a human cockpit send), else "unknown" (an unclaimed/anon
-  // peer). Don't conflate the two — origin is the discriminator (codex review #3).
-  const fromLabel = (m: CommsMessage): string =>
-    m.from_session_id ? name(m.from_session_id) : m.origin === "operator" ? "operator" : "unknown";
-
-  const lines: string[] = [];
-  lines.push(
+  const header = clipToWidth(
     paint("comms", C.bold) + paint("  recent message tail (not a full audit log)", C.dim),
+    width,
   );
   if (messages.length === 0) {
-    lines.push(paint("  no inter-agent messages in ledgers yet", C.dim));
-  } else {
-    for (const m of messages) {
-      const age = fmtAge(Math.max(0, nowSec - m.at));
-      // Delegation lifecycle + ask/reply markers (badge idiom).
-      let mark = "";
-      if (m.action_required) mark = m.closed === "done" ? "⚑✓" : m.closed === "blocked" ? "⚑✗" : "⚑";
-      else if (m.reply_to) mark = "↩";
-      else if (m.request_id) mark = "❓";
-      const markStr = mark ? ` ${mark}` : "";
-      const head = `  ${cell(age, 4)} ${fromLabel(m)} → ${name(m.to_session_id)}${markStr}: `;
-      const expanded = m.message_id === opts.expandedId;
-      const bodyText = expanded ? m.body.replace(/\s+/g, " ").trim() : clip(m.body, 200);
-      if (expanded) {
-        lines.push(paint(head, C.dim));
-        // Full body, wrapped to width (each physical line clipped at the end).
-        for (const seg of wrap(bodyText, width - 4)) lines.push("    " + seg);
-      } else {
-        const remaining = width - head.length - 1;
-        const snippet = remaining >= 8 ? clip(bodyText, remaining) : "";
-        lines.push(paint(head, C.dim) + snippet);
-      }
-    }
+    return [
+      header,
+      clipToWidth(paint("  no inter-agent messages in ledgers yet", C.dim), width),
+    ].join("\n");
   }
-  return lines.map((l) => clipToWidth(l, width)).join("\n");
+  return [header, ...commsBodyLines(messages, bySession, opts)].join("\n");
 }
 
 // Greedy word-wrap to `w` columns (full-body expand). Falls back to hard slices for
