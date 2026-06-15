@@ -15,7 +15,7 @@ import { mkdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { deliverToPeer, type DeliveryRoute } from "../delivery.js";
-import { isAlive, readAllPassive, type RegistryEntry } from "../registry.js";
+import { isAlive, processStartSig, readAllPassive, type RegistryEntry } from "../registry.js";
 import { wakeForSend, type WakeStatus } from "../wake.js";
 
 export const OPERATOR_SOURCE = "oxpit";
@@ -38,30 +38,34 @@ function throttlePath(sessionId: string): string {
   return join(throttleDir(), createHash("sha256").update(sessionId).digest("hex").slice(0, 32));
 }
 
-// True ⇒ this target was woken too recently; SUPPRESS the wake (the message is
-// still delivered). Stamps a fresh record when it allows the wake through.
-function operatorWakeThrottled(sessionId: string | null, nowMs: number): boolean {
+// Read-only: was this target woken within the throttle window? (Split from the
+// stamp so we only stamp AFTER a wake actually fires — a failed/no-target wake must
+// NOT suppress a retry seconds later. codex review #4.)
+function recentlyWoken(sessionId: string | null, nowMs: number): boolean {
   if (!sessionId) return false; // unclaimed: no stable key to throttle on
   try {
-    const p = throttlePath(sessionId);
-    try {
-      if (nowMs - statSync(p).mtimeMs < WAKE_THROTTLE_MS) return true;
-    } catch {
-      // no prior record — fall through and stamp one
-    }
+    return nowMs - statSync(throttlePath(sessionId)).mtimeMs < WAKE_THROTTLE_MS;
+  } catch {
+    return false; // no record / store unusable — don't block the wake
+  }
+}
+
+// Stamp the throttle (mtime = nowMs, the supplied clock, so freshness is consistent
+// whether nowMs is wall-clock or injected). Called ONLY after a wake fired.
+function stampWake(sessionId: string | null, nowMs: number): void {
+  if (!sessionId) return;
+  try {
     mkdirSync(throttleDir(), { recursive: true, mode: 0o700 });
+    const p = throttlePath(sessionId);
     writeFileSync(p, "", { mode: 0o600 });
-    // Stamp mtime to nowMs (the supplied clock) so the freshness comparison is
-    // consistent whether nowMs is wall-clock (prod) or injected (tests).
     const t = nowMs / 1000;
     try {
       utimesSync(p, t, t);
     } catch {
-      // best effort — a failure only skews freshness by the real-vs-injected delta
+      // best effort
     }
-    return false;
   } catch {
-    return false; // store unusable — don't block the wake
+    // store unusable — throttle silently degrades (best-effort posture)
   }
 }
 
@@ -122,6 +126,17 @@ export async function sendOperatorMessage(
   if (!isAlive(entry.server_pid)) {
     return { ok: false, ...base, reason: "target process is not alive" };
   }
+  // PID-reuse guard BEFORE delivery (codex HIGH): isAlive alone can pass for a pid
+  // the OS recycled to an unrelated process; we must not write an operator message
+  // into a stranger's route. Mirror resolveTarget — refuse on a positively-different
+  // proc_sig. (Empty reading = transient ps failure → inconclusive, let it through;
+  // the wake path re-verifies the pane anyway.)
+  if (entry.proc_sig) {
+    const liveSig = processStartSig(entry.server_pid);
+    if (liveSig && liveSig !== entry.proc_sig) {
+      return { ok: false, ...base, reason: "target pid was recycled (proc_sig mismatch)" };
+    }
+  }
 
   const route: DeliveryRoute = {
     session_id: entry.client.session_id,
@@ -136,10 +151,13 @@ export async function sendOperatorMessage(
   let wake_status: OperatorWakeOutcome;
   if (opts.wake === false) {
     wake_status = "off";
-  } else if (operatorWakeThrottled(entry.client.session_id, nowMs)) {
+  } else if (recentlyWoken(entry.client.session_id, nowMs)) {
     wake_status = "skipped_throttled";
   } else {
     wake_status = await wake(entry);
+    // Stamp the throttle ONLY when the wake actually fired, so a failed/no-target
+    // wake leaves the door open for a retry.
+    if (wake_status === "fired") stampWake(entry.client.session_id, nowMs);
   }
 
   return {

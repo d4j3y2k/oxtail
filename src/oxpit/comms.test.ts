@@ -59,6 +59,17 @@ test("buildCommsLog dedups by message_id across ledgers", () => {
   assert.equal(out.length, 1);
 });
 
+test("buildCommsLog carries origin (operator vs peer) through", () => {
+  const out = buildCommsLog([{ session_id: "A" }], {
+    readLedger: () => [
+      entry({ id: "o1", from_session_id: null, origin: "operator", enqueued_at: 1 }),
+    ],
+  });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].origin, "operator");
+  assert.equal(out[0].from_session_id, null);
+});
+
 test("buildCommsLog skips agents with no session_id", () => {
   const out = buildCommsLog([{ session_id: null }], {
     readLedger: () => [entry({ id: "z", enqueued_at: 1 })],

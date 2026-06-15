@@ -95,7 +95,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     let logFilterSelf = false; // scope the log to the fleet-selected agent
     let logTotal = 0; // last-rendered comms count (for scroll clamping)
     let logVisible = 0; // last-rendered visible message rows
-    let pendingNudge = false; // awaiting 'y' to confirm an operator nudge
+    let pendingNudgeKey: string | null = null; // agentKey awaiting 'y' to confirm a nudge
 
     const stdin = process.stdin;
     const stdout = process.stdout;
@@ -285,11 +285,10 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       }
     }
 
-    // Send the canned operator nudge to the selected agent (confirmed via 'y').
-    function doNudge(): void {
-      const idx = selectedIndex();
-      if (idx < 0) return setStatus(warn("no agent selected", opts.color));
-      const agent = snapshot.agents[idx];
+    // Send the canned operator nudge to a SPECIFIC agent (bound at confirm time by
+    // session key, never re-resolved from the live selection — so fleet churn during
+    // the y-confirm can't mis-point it at a different agent).
+    function doNudge(agent: FleetAgent): void {
       if (agent.is_self) return setStatus(warn("can't nudge yourself", opts.color));
       const label = agent.window_name ?? agent.short_id;
       setStatus(dim(`nudging ${label}…`, opts.color));
@@ -299,10 +298,14 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         {},
       )
         .then((r) => {
+          if (torndown) return; // cockpit quit while the wake was in flight
           if (r.ok) setStatus(ok(`→ nudged ${r.target_short_id} (wake:${r.wake_status})`, opts.color));
           else setStatus(warn(`nudge failed: ${r.reason}`, opts.color));
         })
-        .catch((e) => setStatus(warn(`nudge error: ${e instanceof Error ? e.message : e}`, opts.color)));
+        .catch((e) => {
+          if (torndown) return;
+          setStatus(warn(`nudge error: ${e instanceof Error ? e.message : e}`, opts.color));
+        });
     }
 
     function teardown(code: number): void {
@@ -352,9 +355,14 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         return paint();
       }
       if (helpOpen) return; // swallow other keys while the help overlay is up
-      if (pendingNudge) {
-        pendingNudge = false;
-        if (s === "y") return doNudge();
+      if (pendingNudgeKey !== null) {
+        const key = pendingNudgeKey;
+        pendingNudgeKey = null;
+        if (s === "y") {
+          const agent = snapshot.agents.find((a) => agentKey(a) === key);
+          if (!agent) return setStatus(warn("selection changed — nudge cancelled", opts.color));
+          return doNudge(agent);
+        }
         return paint(); // any other key cancels the pending nudge
       }
       if (s === "l") return toggleLog();
@@ -379,7 +387,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         if (idx < 0) return;
         const agent = snapshot.agents[idx];
         if (agent.is_self) return setStatus(warn("can't nudge yourself", opts.color));
-        pendingNudge = true;
+        pendingNudgeKey = agentKey(agent); // bind identity now; confirm resolves THIS key
         return setStatus(
           warn(`nudge ${agent.window_name ?? agent.short_id}? press y to confirm`, opts.color),
         );

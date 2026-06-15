@@ -428,6 +428,8 @@ export type LedgerEntry = {
   from_session_id: string | null;
   body: string;
   enqueued_at: number;
+  origin?: "peer" | "operator"; // provenance; "operator" = sent from the oxpit cockpit
+  operator_source?: string;
   request_id?: string;
   reply_to?: string;
   action_required?: boolean;
@@ -451,6 +453,8 @@ export function listRecentLedgerRecords(sessionId: string, limit = 50): LedgerEn
       from_session_id: rec.from_session_id ?? null,
       body: rec.body,
       enqueued_at: rec.enqueued_at,
+      origin: rec.origin,
+      operator_source: rec.operator_source,
       request_id: rec.request_id,
       reply_to: rec.reply_to,
       action_required: rec.action_required,

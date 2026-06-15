@@ -249,8 +249,13 @@ export function renderCommsLog(
   const width = Math.max(40, opts.width ?? 100);
   const nowSec = opts.nowSec ?? Math.floor(Date.now() / 1000);
   const paint = makePaint(color);
-  const name = (sid: string | null): string =>
-    (sid && bySession.get(sid)) || (sid ? sid.slice(0, 8) : "operator");
+  // Resolve a session id to its label (window name / short id). A non-null id only.
+  const name = (sid: string): string => bySession.get(sid) ?? sid.slice(0, 8);
+  // The sender label: a real session → its label; a null sender is "operator" ONLY
+  // when origin says so (a human cockpit send), else "unknown" (an unclaimed/anon
+  // peer). Don't conflate the two — origin is the discriminator (codex review #3).
+  const fromLabel = (m: CommsMessage): string =>
+    m.from_session_id ? name(m.from_session_id) : m.origin === "operator" ? "operator" : "unknown";
 
   const lines: string[] = [];
   lines.push(
@@ -267,7 +272,7 @@ export function renderCommsLog(
       else if (m.reply_to) mark = "↩";
       else if (m.request_id) mark = "❓";
       const markStr = mark ? ` ${mark}` : "";
-      const head = `  ${cell(age, 4)} ${name(m.from_session_id)} → ${name(m.to_session_id)}${markStr}: `;
+      const head = `  ${cell(age, 4)} ${fromLabel(m)} → ${name(m.to_session_id)}${markStr}: `;
       const expanded = m.message_id === opts.expandedId;
       const bodyText = expanded ? m.body.replace(/\s+/g, " ").trim() : clip(m.body, 200);
       if (expanded) {

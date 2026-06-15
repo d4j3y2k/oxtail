@@ -83,17 +83,26 @@ test("renderCommsLog: lifecycle/ask/reply markers", () => {
   assert.match(renderCommsLog([msg({ reply_to: "r1" })], COMMS_LABELS, base), /↩/);
 });
 
-test("renderCommsLog: unresolved sender → short id; null → operator", () => {
+test("renderCommsLog: unresolved sender → short id", () => {
   const a = renderCommsLog([msg({ from_session_id: "unknownsession" })], COMMS_LABELS, {
     color: false,
     nowSec: 1000,
   });
   assert.match(a, /unknowns → codex/); // first 8 chars of an unattributable sender
-  const b = renderCommsLog([msg({ from_session_id: null })], COMMS_LABELS, {
+});
+
+test("renderCommsLog: null sender is 'operator' ONLY when origin says so, else 'unknown'", () => {
+  const op = renderCommsLog([msg({ from_session_id: null, origin: "operator" })], COMMS_LABELS, {
     color: false,
     nowSec: 1000,
   });
-  assert.match(b, /operator → codex/);
+  assert.match(op, /operator → codex/);
+  const anon = renderCommsLog([msg({ from_session_id: null })], COMMS_LABELS, {
+    color: false,
+    nowSec: 1000,
+  });
+  assert.match(anon, /unknown → codex/);
+  assert.ok(!/operator → codex/.test(anon), "null-from non-operator must NOT be labeled operator");
 });
 
 test("renderCommsLog: empty feed and tail-honesty header", () => {

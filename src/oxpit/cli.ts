@@ -251,8 +251,11 @@ export async function runMessage(
       out("no live, claimed agents to broadcast to in scope");
       return 1;
     }
-    if (targets.length > a.cap) {
-      out(`refusing broadcast: ${targets.length} recipients exceeds cap ${a.cap} (raise with --cap N)`);
+    // A malformed --cap (NaN / ≤0) must FAIL CLOSED to the default, not disable the
+    // storm guard: `N > NaN` is always false, which would uncap the broadcast.
+    const cap = Number.isFinite(a.cap) && a.cap > 0 ? a.cap : BROADCAST_CAP_DEFAULT;
+    if (targets.length > cap) {
+      out(`refusing broadcast: ${targets.length} recipients exceeds cap ${cap} (raise with --cap N)`);
       return 1;
     }
     const names = targets.map((t) => t.window_name ?? t.short_id).join(", ");

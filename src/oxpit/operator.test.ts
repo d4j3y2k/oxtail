@@ -24,10 +24,13 @@ async function withHome<T>(fn: (home: string) => Promise<T> | T): Promise<T> {
   }
 }
 
-function entry(o: { session_id?: string | null; server_pid?: number } = {}): RegistryEntry {
+function entry(
+  o: { session_id?: string | null; server_pid?: number; proc_sig?: string } = {},
+): RegistryEntry {
   return {
     server_pid: o.server_pid ?? process.pid, // live by default
     started_at: 1,
+    proc_sig: o.proc_sig,
     client: {
       type: "claude-code",
       session_id: o.session_id ?? "s1",
@@ -113,6 +116,22 @@ test("sendOperatorMessage: dead target pid refused", async () => {
     });
     assert.equal(r.ok, false);
     assert.match(r.reason!, /not alive/);
+  });
+});
+
+test("sendOperatorMessage: refuses on proc_sig mismatch (pid-reuse guard)", async () => {
+  await withHome(async () => {
+    const { deliver, calls } = captureDeliver();
+    // Live pid (process.pid) but a proc_sig that won't match the real one ⇒ the
+    // pid was recycled to an unrelated process; must refuse before delivering.
+    const r = await sendOperatorMessage(TARGET, "hi", {}, {
+      resolveEntry: () => entry({ proc_sig: "stale-sig-that-will-not-match" }),
+      deliver,
+      wake: async () => "fired",
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.reason!, /recycled|proc_sig/);
+    assert.equal(calls.length, 0, "nothing delivered to a recycled pid");
   });
 });
 

@@ -304,6 +304,31 @@ test("mailbox: field-order invariant — schema_version, id, body in order on ev
   });
 });
 
+test("mailbox: operator-origin serialization — origin/operator_source, no from, prefix intact", () => {
+  withHome(() => {
+    const pid = 88889;
+    // Operator send: no from_session_id, origin=operator + operator_source.
+    mailbox.enqueue(pid, "ping", undefined, { origin: "operator", operator_source: "oxpit" });
+    const firstLine = readFileSync(mailbox.mailboxFilePath(pid), "utf8").split("\n")[0];
+    // FIELD_ORDER_PREFIX still holds for an operator line (legacy awk hooks safe).
+    assert.match(firstLine, /^\{"schema_version":1,"id":"[0-9a-f]{16}","body":"/);
+    const parsed = JSON.parse(firstLine);
+    assert.equal(parsed.origin, "operator");
+    assert.equal(parsed.operator_source, "oxpit");
+    assert.equal(parsed.from_session_id, undefined, "operator messages carry no from_session_id");
+    // operator_source comes after origin, before any action_required.
+    assert.deepEqual(Object.keys(parsed), [
+      "schema_version",
+      "id",
+      "body",
+      "enqueued_at",
+      "body_bytes",
+      "origin",
+      "operator_source",
+    ]);
+  });
+});
+
 // ────────────────────────────────────────────────────────────────────────────
 // drainMatchingSession (v0.6 — ask_peer reply pickup)
 // ────────────────────────────────────────────────────────────────────────────

@@ -11,10 +11,13 @@ import { listRecentLedgerRecords } from "../received.js";
 
 export type CommsMessage = {
   message_id: string;
-  from_session_id: string | null; // sender (null = unattributed / system)
+  from_session_id: string | null; // sender (null = operator OR unclaimed/anon peer)
   to_session_id: string; // receiver = the ledger owner
   body: string;
   at: number; // enqueued_at, unix seconds
+  // Provenance: "operator" = sent from the oxpit cockpit (no agent identity).
+  // Distinguishes a real operator message from a null-from unclaimed/anon peer.
+  origin?: "peer" | "operator";
   request_id?: string; // present ⇒ this was an ask_peer
   reply_to?: string; // present ⇒ this is a reply correlating to a request_id
   action_required?: boolean; // a durable delegation
@@ -53,6 +56,7 @@ export function buildCommsLog(
         to_session_id: a.session_id,
         body: r.body,
         at: r.enqueued_at,
+        origin: r.origin,
         request_id: r.request_id,
         reply_to: r.reply_to,
         action_required: r.action_required,
