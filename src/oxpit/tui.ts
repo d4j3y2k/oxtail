@@ -19,6 +19,7 @@ import { computeAgentLabels, renderCommsLog, renderSnapshot } from "./render.js"
 import { buildCommsLog, type CommsMessage } from "./comms.js";
 import { clipToWidth } from "./format.js";
 import { jumpToAgent } from "./jump.js";
+import { NUDGE_TEXT, sendOperatorMessage } from "./operator.js";
 import { parseStatusArgs, USAGE } from "./cli.js";
 
 const ALT_ON = "\x1b[?1049h";
@@ -94,6 +95,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     let logFilterSelf = false; // scope the log to the fleet-selected agent
     let logTotal = 0; // last-rendered comms count (for scroll clamping)
     let logVisible = 0; // last-rendered visible message rows
+    let pendingNudge = false; // awaiting 'y' to confirm an operator nudge
 
     const stdin = process.stdin;
     const stdout = process.stdout;
@@ -121,7 +123,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         const filt = logFilterSelf ? " (on)" : "";
         keys = `↑↓/jk scroll  f filter${filt}  l/Esc fleet  r refresh  q quit  [${pos}]`;
       } else {
-        keys = "↑↓/jk move  ⏎ jump  l comms-log  r refresh  ? help  q quit";
+        keys = "↑↓ move  ⏎ jump  n nudge  l log  r refresh  ? help  q quit";
       }
       const now = Date.now();
       const msg = now < statusUntil && status ? "  " + status : "";
@@ -136,6 +138,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "",
         "  ↑/k  ↓/j      move selection (fleet) / scroll (log)",
         "  ⏎             jump to the selected agent's tmux pane",
+        "  n             nudge the selected agent (operator message; y to confirm)",
         "  l             toggle the comms-log (fleet ⇄ log); f filters to selection",
         "  r             force refresh    ?  toggle help    q / Ctrl-C  quit",
         "",
@@ -282,6 +285,26 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       }
     }
 
+    // Send the canned operator nudge to the selected agent (confirmed via 'y').
+    function doNudge(): void {
+      const idx = selectedIndex();
+      if (idx < 0) return setStatus(warn("no agent selected", opts.color));
+      const agent = snapshot.agents[idx];
+      if (agent.is_self) return setStatus(warn("can't nudge yourself", opts.color));
+      const label = agent.window_name ?? agent.short_id;
+      setStatus(dim(`nudging ${label}…`, opts.color));
+      sendOperatorMessage(
+        { session_id: agent.session_id, server_pid: agent.server_pid, short_id: label },
+        NUDGE_TEXT,
+        {},
+      )
+        .then((r) => {
+          if (r.ok) setStatus(ok(`→ nudged ${r.target_short_id} (wake:${r.wake_status})`, opts.color));
+          else setStatus(warn(`nudge failed: ${r.reason}`, opts.color));
+        })
+        .catch((e) => setStatus(warn(`nudge error: ${e instanceof Error ? e.message : e}`, opts.color)));
+    }
+
     function teardown(code: number): void {
       if (torndown) return;
       torndown = true;
@@ -329,6 +352,11 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         return paint();
       }
       if (helpOpen) return; // swallow other keys while the help overlay is up
+      if (pendingNudge) {
+        pendingNudge = false;
+        if (s === "y") return doNudge();
+        return paint(); // any other key cancels the pending nudge
+      }
       if (s === "l") return toggleLog();
       if (s === "r") return refresh(true);
       if (mode === "log") {
@@ -346,6 +374,16 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (s === "\x1b[A" || s === "k") return move(-1);
       if (s === "\x1b[B" || s === "j") return move(1);
       if (s === "\r" || s === "\n") return doJump();
+      if (s === "n") {
+        const idx = selectedIndex();
+        if (idx < 0) return;
+        const agent = snapshot.agents[idx];
+        if (agent.is_self) return setStatus(warn("can't nudge yourself", opts.color));
+        pendingNudge = true;
+        return setStatus(
+          warn(`nudge ${agent.window_name ?? agent.short_id}? press y to confirm`, opts.color),
+        );
+      }
       // ignore everything else
     }
 

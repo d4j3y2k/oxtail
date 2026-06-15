@@ -85,6 +85,10 @@ import {
     const { runStatus } = await import("./oxpit/cli.js");
     process.exit(runStatus(process.argv.slice(3)));
   }
+  if (sub === "message") {
+    const { runMessage } = await import("./oxpit/cli.js");
+    process.exit(await runMessage(process.argv.slice(3)));
+  }
   if (sub === "oxpit") {
     const { runOxpit } = await import("./oxpit/tui.js");
     try {

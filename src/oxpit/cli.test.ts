@@ -1,6 +1,25 @@
 import { strict as assert } from "node:assert";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
-import { parseStatusArgs, runStatus } from "./cli.js";
+import { parseMessageArgs, parseStatusArgs, runMessage, runStatus } from "./cli.js";
+
+async function withHome<T>(fn: () => Promise<T> | T): Promise<T> {
+  const home = mkdtempSync(join(tmpdir(), "oxtail-climsg-"));
+  const prev = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    return await fn();
+  } finally {
+    process.env.HOME = prev;
+    try {
+      rmSync(home, { recursive: true, force: true });
+    } catch {
+      // best effort
+    }
+  }
+}
 
 test("parseStatusArgs: defaults", () => {
   const a = parseStatusArgs([]);
@@ -49,6 +68,57 @@ test("runStatus --help prints usage and skips the snapshot", () => {
   assert.equal(lines.length, 1);
   assert.match(lines[0], /oxtail status/);
   assert.match(lines[0], /oxpit keys/);
+});
+
+test("parseMessageArgs: positionals + flags", () => {
+  const a = parseMessageArgs(["max", "hello", "world", "--no-wake"]);
+  assert.deepEqual(a.positionals, ["max", "hello", "world"]);
+  assert.equal(a.noWake, true);
+  assert.equal(a.broadcast, false);
+});
+
+test("parseMessageArgs: broadcast / yes / cap / nudge", () => {
+  const a = parseMessageArgs(["--broadcast", "--yes", "--cap", "3", "--nudge"]);
+  assert.equal(a.broadcast, true);
+  assert.equal(a.yes, true);
+  assert.equal(a.cap, 3);
+  assert.equal(a.nudge, true);
+});
+
+test("runMessage: no target prints usage and returns 1", async () => {
+  await withHome(async () => {
+    const lines: string[] = [];
+    const code = await runMessage([], (l) => lines.push(l));
+    assert.equal(code, 1);
+    assert.match(lines.join("\n"), /oxtail message/);
+  });
+});
+
+test("runMessage: empty body is refused", async () => {
+  await withHome(async () => {
+    const lines: string[] = [];
+    const code = await runMessage(["max"], (l) => lines.push(l)); // target, no body
+    assert.equal(code, 1);
+    assert.match(lines.join("\n"), /empty message/);
+  });
+});
+
+test("runMessage: unknown target errors (empty fleet)", async () => {
+  await withHome(async () => {
+    const lines: string[] = [];
+    const code = await runMessage(["nobody", "hi"], (l) => lines.push(l));
+    assert.equal(code, 1);
+    assert.match(lines.join("\n"), /no agent matches/);
+  });
+});
+
+test("runMessage: broadcast with no live agents returns 1", async () => {
+  await withHome(async () => {
+    const lines: string[] = [];
+    const code = await runMessage(["--broadcast", "hi"], (l) => lines.push(l));
+    assert.equal(code, 1);
+    assert.match(lines.join("\n"), /no live|--yes/);
+  });
 });
 
 test("runStatus --json emits valid parseable JSON with the snapshot shape", () => {

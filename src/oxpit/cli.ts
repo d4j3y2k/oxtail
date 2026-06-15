@@ -4,6 +4,13 @@
 import { buildSnapshot } from "./snapshot.js";
 import { computeAgentLabels, renderCommsLog, renderSnapshot } from "./render.js";
 import { buildCommsLog } from "./comms.js";
+import {
+  NUDGE_TEXT,
+  sendOperatorMessage,
+  type OperatorSendResult,
+  type OperatorTarget,
+} from "./operator.js";
+import type { FleetAgent } from "./snapshot.js";
 
 export type StatusArgs = {
   json: boolean;
@@ -126,4 +133,159 @@ export function runStatus(
     out(renderCommsLog(buildCommsLog(snap.agents, { limit }), bySession, { color, width }));
   }
   return 0;
+}
+
+// ── oxtail message — operator send (act-from-cockpit, one-shot) ────────────────
+
+export const MESSAGE_USAGE = `oxtail message <target> <message…>   — send a human-authorized message to one agent
+oxtail message <target> --nudge       — send the canned "check your work" nudge
+oxtail message --broadcast --yes <message…>  — send to every live agent in scope
+
+target: a session id, short id, or tmux window name (see oxtail status)
+flags:  --nudge   --no-wake   --broadcast --yes [--cap N]   --all   --project PATH
+
+Operator messages are human-authorized but untrusted transport: they carry no agent
+identity (origin=operator), are one-way (the recipient cannot reply to them), and
+reuse the same delivery + wake path as peer messages.`;
+
+const BROADCAST_CAP_DEFAULT = 10;
+
+type MessageArgs = {
+  positionals: string[];
+  nudge: boolean;
+  noWake: boolean;
+  broadcast: boolean;
+  yes: boolean;
+  cap: number;
+  all: boolean;
+  project: string | undefined;
+  help: boolean;
+};
+
+export function parseMessageArgs(argv: string[]): MessageArgs {
+  const a: MessageArgs = {
+    positionals: [],
+    nudge: false,
+    noWake: false,
+    broadcast: false,
+    yes: false,
+    cap: BROADCAST_CAP_DEFAULT,
+    all: false,
+    project: undefined,
+    help: false,
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "-h" || arg === "--help") a.help = true;
+    else if (arg === "--nudge") a.nudge = true;
+    else if (arg === "--no-wake") a.noWake = true;
+    else if (arg === "--broadcast") a.broadcast = true;
+    else if (arg === "--yes" || arg === "-y") a.yes = true;
+    else if (arg === "--all") a.all = true;
+    else if (arg === "--cap") a.cap = Number(argv[++i]);
+    else if (arg.startsWith("--cap=")) a.cap = Number(arg.slice("--cap=".length));
+    else if (arg === "--project") a.project = argv[++i];
+    else if (arg.startsWith("--project=")) a.project = arg.slice("--project=".length);
+    else a.positionals.push(arg);
+  }
+  return a;
+}
+
+function targetOf(ag: FleetAgent): OperatorTarget {
+  return {
+    session_id: ag.session_id,
+    server_pid: ag.server_pid,
+    short_id: ag.window_name ?? ag.short_id,
+  };
+}
+
+// Resolve a target string to exactly one in-scope agent: session_id, then short_id,
+// then window name. Ambiguity is surfaced, never guessed.
+function resolveAgent(
+  agents: FleetAgent[],
+  target: string,
+): { agent?: FleetAgent; error?: string } {
+  for (const key of [
+    (a: FleetAgent) => a.session_id === target,
+    (a: FleetAgent) => a.short_id === target,
+    (a: FleetAgent) => a.window_name === target,
+  ]) {
+    const m = agents.filter(key);
+    if (m.length === 1) return { agent: m[0] };
+    if (m.length > 1) {
+      return {
+        error: `ambiguous target '${target}' — matches ${m.length} agents; address it by session id`,
+      };
+    }
+  }
+  return { error: `no agent matches '${target}' in scope — see 'oxtail status' for ids/names` };
+}
+
+function formatResult(r: OperatorSendResult): string {
+  if (!r.ok) return `✗ ${r.target_short_id}: ${r.reason}`;
+  const wake = r.wake_status ? ` · wake:${r.wake_status}` : "";
+  const unc = r.unclaimed ? " · unclaimed (pid-box, no reply handle)" : "";
+  return `✓ operator → ${r.target_short_id}  (${r.message_id})${wake}${unc}`;
+}
+
+export async function runMessage(
+  argv: string[],
+  out: (line: string) => void = (s) => process.stdout.write(s + "\n"),
+): Promise<number> {
+  const a = parseMessageArgs(argv);
+  if (a.help) {
+    out(MESSAGE_USAGE);
+    return 0;
+  }
+  const snap = buildSnapshot({ allProjects: a.all, projectRoot: a.project });
+
+  if (a.broadcast) {
+    const body = a.nudge ? NUDGE_TEXT : a.positionals.join(" ");
+    if (!body.trim()) {
+      out("error: empty message (give text or --nudge)");
+      return 1;
+    }
+    // Live + claimed only; dead/unclaimed excluded by default (codex guardrail).
+    const targets = snap.agents.filter((ag) => ag.liveness !== "dead" && ag.session_id);
+    if (targets.length === 0) {
+      out("no live, claimed agents to broadcast to in scope");
+      return 1;
+    }
+    if (targets.length > a.cap) {
+      out(`refusing broadcast: ${targets.length} recipients exceeds cap ${a.cap} (raise with --cap N)`);
+      return 1;
+    }
+    const names = targets.map((t) => t.window_name ?? t.short_id).join(", ");
+    if (!a.yes) {
+      out(`broadcast to ${targets.length} agent(s): ${names}`);
+      out("re-run with --yes to send.");
+      return 1;
+    }
+    let failures = 0;
+    for (const ag of targets) {
+      const r = await sendOperatorMessage(targetOf(ag), body, { wake: !a.noWake });
+      if (!r.ok) failures++;
+      out(formatResult(r));
+    }
+    return failures === 0 ? 0 : 1;
+  }
+
+  const target = a.positionals[0];
+  if (!target) {
+    out(MESSAGE_USAGE);
+    return 1;
+  }
+  const body = a.nudge ? NUDGE_TEXT : a.positionals.slice(1).join(" ");
+  if (!body.trim()) {
+    out("error: empty message (give text or --nudge)");
+    return 1;
+  }
+  const res = resolveAgent(snap.agents, target);
+  if (!res.agent) {
+    out("error: " + res.error);
+    return 1;
+  }
+  const r = await sendOperatorMessage(targetOf(res.agent), body, { wake: !a.noWake });
+  out(formatResult(r));
+  return r.ok ? 0 : 1;
 }
