@@ -15,7 +15,8 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { buildSnapshot, type FleetAgent, type FleetSnapshot } from "./snapshot.js";
-import { renderSnapshot } from "./render.js";
+import { computeAgentLabels, renderCommsLog, renderSnapshot } from "./render.js";
+import { buildCommsLog, type CommsMessage } from "./comms.js";
 import { clipToWidth } from "./format.js";
 import { jumpToAgent } from "./jump.js";
 import { parseStatusArgs, USAGE } from "./cli.js";
@@ -32,6 +33,7 @@ const WATCH_DIRS = ["sessions", "mailboxes", "received", "pending-ask"];
 const DEBOUNCE_MS = 200;
 const SLOW_TICK_MS = 1500;
 const MAX_WAIT_ROWS = 8;
+const LOG_FETCH = 200; // comms messages pulled for the log view (windowed to fit)
 
 function agentKey(a: FleetAgent): string {
   return a.session_id ?? `pid:${a.server_pid}`;
@@ -87,6 +89,11 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     let slowTick: NodeJS.Timeout | null = null;
     let torndown = false;
     let helpOpen = false;
+    let mode: "fleet" | "log" = "fleet";
+    let logOffset = 0; // messages scrolled up from the newest (0 = tail/live)
+    let logFilterSelf = false; // scope the log to the fleet-selected agent
+    let logTotal = 0; // last-rendered comms count (for scroll clamping)
+    let logVisible = 0; // last-rendered visible message rows
 
     const stdin = process.stdin;
     const stdout = process.stdout;
@@ -108,7 +115,14 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     }
 
     function footer(): string {
-      const keys = "↑↓/jk move  ⏎ jump  r refresh  ? help  q quit";
+      let keys: string;
+      if (mode === "log") {
+        const pos = logOffset === 0 ? "live" : `↑${logOffset}`;
+        const filt = logFilterSelf ? " (on)" : "";
+        keys = `↑↓/jk scroll  f filter${filt}  l/Esc fleet  r refresh  q quit  [${pos}]`;
+      } else {
+        keys = "↑↓/jk move  ⏎ jump  l comms-log  r refresh  ? help  q quit";
+      }
       const now = Date.now();
       const msg = now < statusUntil && status ? "  " + status : "";
       return "\n" + dim("  " + keys, opts.color) + msg;
@@ -120,13 +134,15 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       const L = [
         b("oxpit — help"),
         "",
-        "  ↑/k  ↓/j      move selection",
+        "  ↑/k  ↓/j      move selection (fleet) / scroll (log)",
         "  ⏎             jump to the selected agent's tmux pane",
+        "  l             toggle the comms-log (fleet ⇄ log); f filters to selection",
         "  r             force refresh    ?  toggle help    q / Ctrl-C  quit",
         "",
         d("  🟢 active   🟡 idle   ⚫ dead (exited / pid-reused)"),
         d("  ✉N unread   ⚑N open obligations   ⏳ awaiting a peer reply"),
         d("  ⛔ DEADLOCK (live cycle)   ⚠ stale/possible cycle   † orphaned (target dead)"),
+        d("  comms: ⚑ delegation  ⚑✓ done  ⚑✗ blocked  ❓ ask  ↩ reply"),
         "",
         d("  press ? or q to return"),
       ];
@@ -148,6 +164,42 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       return 1 + 1 + 2 + wgLines + snapshot.warnings.length + 2 + 1;
     }
 
+    function fleetFrame(width: number, rows: number): string {
+      const maxAgentRows = Math.max(3, rows - reservedRows());
+      return renderSnapshot(snapshot, {
+        color: opts.color,
+        width,
+        selected: selectedIndex(),
+        maxAgentRows,
+        maxWaitRows: MAX_WAIT_ROWS,
+      });
+    }
+
+    // Comms-log body, windowed to terminal height and scroll-positioned by logOffset
+    // (0 = tail/live). Optionally filtered to the fleet-selected agent's traffic.
+    function logFrame(width: number, rows: number): string {
+      const { bySession } = computeAgentLabels(snapshot.agents);
+      let comms: CommsMessage[] = buildCommsLog(snapshot.agents, { limit: LOG_FETCH });
+      if (logFilterSelf) {
+        const sel = snapshot.agents[selectedIndex()];
+        const sid = sel?.session_id;
+        if (sid) comms = comms.filter((m) => m.from_session_id === sid || m.to_session_id === sid);
+      }
+      logTotal = comms.length;
+      const visible = Math.max(3, rows - 5); // header(1) + footer(2) + markers(1) + margin(1)
+      logVisible = visible;
+      const maxOffset = Math.max(0, comms.length - visible);
+      if (logOffset > maxOffset) logOffset = maxOffset;
+      const end = comms.length - logOffset;
+      const start = Math.max(0, end - visible);
+      const out = renderCommsLog(comms.slice(start, end), bySession, {
+        color: opts.color,
+        width,
+      });
+      const older = start > 0 ? `\n${dim(`  ↑ ${start} older`, opts.color)}` : "";
+      return out + older;
+    }
+
     function paint(): void {
       if (torndown) return;
       const width = stdout.columns || 100;
@@ -156,24 +208,30 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         return;
       }
       const rows = stdout.rows || 24;
-      const maxAgentRows = Math.max(3, rows - reservedRows());
-      const frame =
-        renderSnapshot(snapshot, {
-          color: opts.color,
-          width,
-          selected: selectedIndex(),
-          maxAgentRows,
-          maxWaitRows: MAX_WAIT_ROWS,
-        }) + footer();
+      const frame = (mode === "log" ? logFrame(width, rows) : fleetFrame(width, rows)) + footer();
       // Clip every physical line to the terminal width (ANSI-aware) so none wraps —
       // a wrapped line would push the cursor-home repaint out of sync and corrupt
-      // the screen. renderSnapshot already clips its own lines; this also covers the
-      // footer and is idempotent.
+      // the screen. The renderers already clip their lines; this covers the footer
+      // and is idempotent.
       const body = frame
         .split("\n")
         .map((l) => clipToWidth(l, width) + CLEAR_EOL)
         .join("\n");
       stdout.write(HOME + body + CLEAR_BELOW);
+    }
+
+    function logScroll(delta: number): void {
+      const maxOffset = Math.max(0, logTotal - logVisible);
+      const next = Math.min(maxOffset, Math.max(0, logOffset + delta));
+      if (next === logOffset) return;
+      logOffset = next;
+      paint();
+    }
+
+    function toggleLog(): void {
+      mode = mode === "log" ? "fleet" : "log";
+      logOffset = 0;
+      paint();
     }
 
     function refresh(full: boolean): void {
@@ -271,10 +329,23 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         return paint();
       }
       if (helpOpen) return; // swallow other keys while the help overlay is up
+      if (s === "l") return toggleLog();
+      if (s === "r") return refresh(true);
+      if (mode === "log") {
+        if (s === "\x1b") return toggleLog(); // Esc → back to fleet (lone ESC, not an arrow)
+        if (s === "\x1b[A" || s === "k") return logScroll(1); // older
+        if (s === "\x1b[B" || s === "j") return logScroll(-1); // newer
+        if (s === "f") {
+          logFilterSelf = !logFilterSelf;
+          logOffset = 0;
+          return paint();
+        }
+        return; // ignore other keys in log mode
+      }
+      // fleet mode
       if (s === "\x1b[A" || s === "k") return move(-1);
       if (s === "\x1b[B" || s === "j") return move(1);
       if (s === "\r" || s === "\n") return doJump();
-      if (s === "r") return refresh(true);
       // ignore everything else
     }
 
