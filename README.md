@@ -328,6 +328,28 @@ to get a summary — counts by `wake_status`, broken down by tool — so "is the
 
 A scheduled CI job (`.github/workflows/codex-drift.yml`, also runnable on demand) fetches Codex's upstream `PASTE_ENTER_SUPPRESS_WINDOW` and fails if it drifts past oxtail's 500ms Codex wake gap — so a future Codex release that would break the wake surfaces as a red job rather than a silent field regression.
 
+## Fleet cockpit — `oxtail status` / `oxtail oxpit` (experimental)
+
+A mission-control view of every agent in a project, for a separate terminal. Two entry points over one engine:
+
+- **`oxtail status`** — print the fleet once and exit. Scriptable (`watch -n1 oxtail status`), CI-friendly (`--json`), no TTY required.
+- **`oxtail oxpit`** — a live interactive cockpit (raw-ANSI, zero deps): `↑↓`/`jk` to select, `⏎` to **jump** to that agent's tmux pane, `r` to refresh, `q` to quit. It refreshes event-driven (`fs.watch` on `~/.oxtail` + debounce) with a slow fallback tick, and restores the terminal on every exit path — including uncaught errors.
+
+```
+oxpit  oxtail  3 agents (1 active)
+     agent     type    status        work / purpose
+ 🟢 0f74e56a* claude  active 4s       refactoring the mailbox dedup path
+ 🟡 4493e788  claude  idle 3m       ✉1 ⚑2 ⏳codex 45s   reviewing oxpit
+ 🟡 019ec959  codex   idle 12m      ✉1
+
+wait-graph
+  ⏳ 4493e788 awaiting reply from codex (45s)
+```
+
+Per agent: a **liveness glyph** (🟢 active / 🟡 idle / ⚫ dead) with the raw age always shown (the glyph is never the only signal), plus an independent **badge set** — `✉N` unread, `⚑N` open obligations, `⏳` awaiting a peer reply. The **wait-graph** is the headline: it renders who is awaiting whom and flags a `⛔ DEADLOCK` only when every member of a wait cycle is alive (a stale/abandoned cycle shows as `⚠ possible wait cycle`), and an orphaned wait when its target has died — the one thing you cannot see by tabbing through panes. `state.purpose` is shown as a caption but cross-checked against transcript activity (grayed when stale).
+
+Design: oxpit is a **read-only VIEW**. It never drains a mailbox or takes a lock, and it consumes the same canonical modules the hooks and MCP tools use (`registry`, `received`, `pending-ask`, `mailbox`) rather than re-deriving their semantics — so it cannot silently drift from the truth. Liveness, work, and waits are **inferred from observed facts** (transcript mtime, `proc_sig`, the obligation ledger, the pending-ask registry); self-reported state is a cross-checked hint, never authority. `jump` re-validates the target pane live at action time (the same `proc_sig` + process-tree guard the wake path uses) and drives an explicit tmux client — refusing rather than guessing when multiple clients are attached (`--client <name>` to choose). Flags: `--json` / `--pretty`, `--no-color`, `--all` (all projects, not just the current one), `--width N`, `--project PATH`.
+
 ## Status
 
 v0.20.0. Minor — closes **hook-path obligation blindness**, the top friction from the v0.19 durable-delegation live test. The PreToolUse/Stop hook envelope now tags each `action_required` message and, when a delivered batch carries an obligation, steers the receiver to close it with `complete_work` / `block_work` (not `reply_to_message`) — inserted *before* the message bodies so it isn't buried. Previously a hooked Claude's primary delivery path never surfaced the obligation, so it could answer a delegation and leave it OPEN forever on its ledger; only a hookless Codex (which must call `read_my_messages`, where `open_work_count` already shows) was well served. Hooks **v13** — re-run `npx oxtail install-hook` on upgrade (helper-only change; the startup freshness check nudges you). Also: `reply_to_message` cross-links to the obligation-close path, and the unclaimed-peer send note steers senders to re-send after the peer claims.

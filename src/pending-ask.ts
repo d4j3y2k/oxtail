@@ -24,6 +24,7 @@ import {
   mkdirSync,
   openSync,
   readdirSync,
+  readFileSync,
   statSync,
   unlinkSync,
   utimesSync,
@@ -163,6 +164,58 @@ export function consumePendingAsk(
     return false;
   }
   return withinTtl;
+}
+
+export type LivePendingAsk = {
+  sessionId: string;
+  requestId: string;
+  ageS: number;
+  mtimeMs: number;
+};
+
+// Canonical read-only listing of every LIVE (within-TTL) pending ask. A read-only
+// consumer (the oxpit cockpit) uses this instead of re-scanning the dir and
+// re-deriving the TTL-liveness rule itself — keeping the staleness semantics in
+// ONE place (don't-fork-truth). mtime is the source of truth (driven by the
+// injected nowMs in tests). Best-effort: a broken store / torn record yields a
+// shorter list, never throws.
+export function listLivePendingAsks(
+  dir: string,
+  nowMs: number,
+  ttlMs: number = PENDING_ASK_TTL_MS,
+): LivePendingAsk[] {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const out: LivePendingAsk[] = [];
+  for (const name of names) {
+    if (name[0] !== "p") continue;
+    const p = join(dir, name);
+    let mtimeMs: number;
+    try {
+      mtimeMs = statSync(p).mtimeMs;
+    } catch {
+      continue;
+    }
+    if (nowMs - mtimeMs >= ttlMs) continue; // stale → not a live wait
+    let body: { sessionId?: string; requestId?: string };
+    try {
+      body = JSON.parse(readFileSync(p, "utf8")) as { sessionId?: string; requestId?: string };
+    } catch {
+      continue;
+    }
+    if (!body.sessionId || !body.requestId) continue;
+    out.push({
+      sessionId: body.sessionId,
+      requestId: body.requestId,
+      ageS: Math.max(0, Math.floor((nowMs - mtimeMs) / 1000)),
+      mtimeMs,
+    });
+  }
+  return out;
 }
 
 // Remove pending-ask records older than the TTL. Cheap, low-volume dir; run

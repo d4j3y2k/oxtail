@@ -81,6 +81,22 @@ import {
     const { runDiagnose } = await import("./diagnose.js");
     process.exit(runDiagnose(process.env.MCP_TRACE_FILE));
   }
+  if (sub === "status") {
+    const { runStatus } = await import("./oxpit/cli.js");
+    process.exit(runStatus(process.argv.slice(3)));
+  }
+  if (sub === "oxpit") {
+    const { runOxpit } = await import("./oxpit/tui.js");
+    try {
+      process.exit(await runOxpit(process.argv.slice(3)));
+    } catch (e) {
+      // Backstop: restore the screen (cursor + leave alt-buffer) before dying, in
+      // case anything escaped the TUI's own handlers.
+      process.stdout.write("\x1b[?25h\x1b[?1049l");
+      console.error(e);
+      process.exit(1);
+    }
+  }
 }
 import {
   readClaudeTranscript,

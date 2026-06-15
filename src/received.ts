@@ -384,3 +384,23 @@ export function claimObligation(
 export function receivedFilePath(sessionId: string): string {
   return ledgerPath(sessionId);
 }
+
+// Canonical extraction of (request_id, from_session_id) pairs from a session's
+// ledger — every inbound ask_peer is recorded here keyed by request_id. The oxpit
+// cockpit consumes this to resolve which peer an ask_peer waiter is blocked on,
+// instead of re-implementing ledger parsing (don't-fork-truth: parseLedgerRecord
+// stays the one parser). Read-only, lock-free (atomicWrite renames a whole file
+// into place, so a reader never sees a torn ledger), tolerates torn lines.
+export function listLedgerRequestPairs(
+  sessionId: string,
+): Array<{ request_id: string; from_session_id: string }> {
+  if (!sessionId) return [];
+  const out: Array<{ request_id: string; from_session_id: string }> = [];
+  for (const line of readLines(sessionId)) {
+    const rec = parseLedgerRecord(line);
+    if (rec?.request_id && rec.from_session_id) {
+      out.push({ request_id: rec.request_id, from_session_id: rec.from_session_id });
+    }
+  }
+  return out;
+}

@@ -470,7 +470,7 @@ export function unregister(pid = process.pid): void {
   }
 }
 
-function isAlive(pid: number): boolean {
+export function isAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
@@ -540,6 +540,26 @@ export function dedupeBySessionId(entries: RegistryEntry[]): RegistryEntry[] {
 
 export function findByTmuxSession(name: string): RegistryEntry[] {
   return readAll().filter((e) => e.tmux_session === name);
+}
+
+// Like readAll() but a PASSIVE, read-only VIEW: it never reaps/unlinks dead
+// entries and never filters them out — it returns every registered agent (live
+// AND dead), deduped by session_id. A read-only consumer (the oxpit cockpit) uses
+// this so it can render a recently-exited agent as ⚫dead and detect waits
+// orphaned on it, instead of the agent silently vanishing (which readAll() causes
+// by reaping). Mutation — reaping, GC, mailbox migration — stays in the writer
+// paths (register/readAll); a viewer must never have side effects on the registry
+// it observes. Liveness of each returned entry is the caller's call (isAlive).
+export function readAllPassive(): RegistryEntry[] {
+  const dir = registryDir();
+  if (!existsSync(dir)) return [];
+  const all: RegistryEntry[] = [];
+  for (const file of readdirSync(dir)) {
+    const entry = readEntryFile(dir, file);
+    if (!entry) continue; // non-<pid>.json, parse error, or forged server_pid
+    all.push(entry);
+  }
+  return dedupeBySessionId(all);
 }
 
 // Every MCP-child pid that has a registry file on disk under this session_id,
