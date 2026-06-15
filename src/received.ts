@@ -405,6 +405,22 @@ export function listLedgerRequestPairs(
   return out;
 }
 
+// Every reply_to value in a session's ledger — i.e. the request_ids this session
+// has RECEIVED a reply for. (An ask_peer reply is delivered to the requester, so it
+// lands in the requester's OWN ledger correlated by reply_to == request_id.) The
+// oxpit wait-graph uses this to confirm an ask was answered from observed message
+// evidence and suppress a stale pending-ask "wait" (kills the 1h-lingering H1
+// phantom). Read-only, lock-free, torn-tolerant; reuses parseLedgerRecord.
+export function listLedgerReplyTargets(sessionId: string): string[] {
+  if (!sessionId) return [];
+  const out: string[] = [];
+  for (const line of readLines(sessionId)) {
+    const rec = parseLedgerRecord(line);
+    if (rec?.reply_to) out.push(rec.reply_to);
+  }
+  return out;
+}
+
 // A flattened, render-friendly view of one inbound ledger record (the obligation
 // outcome collapsed to its terminal state). Used by the oxpit comms-log.
 export type LedgerEntry = {

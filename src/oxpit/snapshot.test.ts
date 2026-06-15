@@ -6,6 +6,7 @@ import { test } from "node:test";
 import type { ClientType } from "../clients.js";
 import * as mailbox from "../mailbox.js";
 import { recordReceived } from "../received.js";
+import { defaultPendingAskDir, recordPendingAsk } from "../pending-ask.js";
 import type { RegistryEntry } from "../registry.js";
 import {
   buildSnapshot,
@@ -334,6 +335,42 @@ test("detectWaitCycles: no cycle for a linear chain", () => {
   const cycles = detectWaitCycles([A, B, C]);
   assert.equal(cycles.length, 0);
   assert.equal(A.waiting!.in_cycle, false);
+});
+
+test("wait-graph: an ask with an observed reply is NOT a wait (H1 killer)", () => {
+  withHome(() => {
+    const W = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+    recordPendingAsk(defaultPendingAskDir(), W, "askreq1", NOW_MS); // file says "waiting"
+    // ...but the reply is observable in the requester's own ledger.
+    recordReceived(W, mailbox.buildMessage("answer", "peer", { reply_to: "askreq1" }));
+    const snap = buildSnapshot({
+      readEntries: () => [makeEntry({ client: { session_id: W, transcript_path: null } as never })],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      resolveWindowNames: () => new Map(),
+    });
+    assert.equal(snap.agents.length, 1);
+    assert.equal(snap.agents[0].waiting, null, "an answered ask must not render as waiting");
+  });
+});
+
+test("wait-graph: an ask with no observed reply still shows as waiting", () => {
+  withHome(() => {
+    const W = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+    recordPendingAsk(defaultPendingAskDir(), W, "askreq2", NOW_MS);
+    const snap = buildSnapshot({
+      readEntries: () => [makeEntry({ client: { session_id: W, transcript_path: null } as never })],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      resolveWindowNames: () => new Map(),
+    });
+    assert.equal(snap.agents.length, 1);
+    assert.ok(snap.agents[0].waiting, "an unanswered ask shows as waiting");
+  });
 });
 
 test("buildSnapshot: empty registry ⇒ no agents, no throw", () => {
