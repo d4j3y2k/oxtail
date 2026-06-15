@@ -167,6 +167,48 @@ test("render: empty fleet", () => {
   assert.match(out, /no agents registered/);
 });
 
+function manyAgents(n: number, over: (i: number) => Partial<FleetAgent> = () => ({})): FleetAgent[] {
+  return Array.from({ length: n }, (_, i) =>
+    agent({ short_id: `a${i}`, session_id: `s${i}`, ...over(i) }),
+  );
+}
+
+test("render: windows agent rows around the selection (top)", () => {
+  const out = renderSnapshot(snap(manyAgents(10)), { color: false, maxAgentRows: 4, selected: 0 });
+  assert.match(out, /a0\b/);
+  assert.match(out, /a3\b/);
+  assert.ok(!/a4\b/.test(out), "rows beyond the window are hidden");
+  assert.match(out, /6 more below/);
+  assert.ok(!/more above/.test(out));
+});
+
+test("render: window keeps the selected row visible (bottom)", () => {
+  const out = renderSnapshot(snap(manyAgents(10)), { color: false, maxAgentRows: 4, selected: 9 });
+  assert.match(out, /a9\b/);
+  assert.match(out, /6 more above/);
+  assert.ok(!/more below/.test(out));
+});
+
+test("render: no window markers when the fleet fits", () => {
+  const out = renderSnapshot(snap(manyAgents(3)), { color: false, maxAgentRows: 10 });
+  assert.ok(!/more (above|below)/.test(out));
+});
+
+test("render: wait-graph caps body lines with a summary", () => {
+  const agents = manyAgents(6, () => ({
+    waiting: {
+      target_session_id: "t",
+      target_short_id: "tgt",
+      age_s: 5,
+      orphaned: false,
+      in_cycle: false,
+      cycle_all_live: false,
+    },
+  }));
+  const out = renderSnapshot(snap(agents), { color: false, maxWaitRows: 3 });
+  assert.match(out, /⋯ 3 more waits/);
+});
+
 test("render: color codes only when enabled", () => {
   const plain = renderSnapshot(snap([agent({ liveness: "active" })]), { color: false });
   const colored = renderSnapshot(snap([agent({ liveness: "active" })]), { color: true });

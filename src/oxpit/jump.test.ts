@@ -147,6 +147,32 @@ test("jumpToAgent: happy path switches the chosen client", () => {
   assert.deepEqual(switched, ["switch-client", "-c", "work", "-t", "proj"]);
 });
 
+test("jumpToAgent: dryRun resolves the plan but mutates nothing", () => {
+  const { run, calls } = fakeRunner({
+    "list-panes": "%7\tproj\t@2\n",
+    "list-clients": "cockpit\t/t1\toxpit\nwork\t/t2\tproj\n",
+    "display-message": "cockpit",
+  });
+  const r = jumpToAgent(agent(), {
+    run,
+    inTmux: true,
+    dryRun: true,
+    resolveEntry: () => entry(),
+    verifyPane: () => "%7",
+  });
+  assert.equal(r.ok, true);
+  if (r.ok) {
+    assert.equal(r.dryRun, true);
+    assert.equal(r.pane, "%7");
+    assert.equal(r.session, "proj");
+    assert.equal(r.client, "work");
+  }
+  assert.ok(
+    !calls.some((c) => c[0] === "select-pane" || c[0] === "switch-client"),
+    "dry run must not mutate tmux",
+  );
+});
+
 test("jumpToAgent: refuses when the pane can't be verified", () => {
   const { run } = fakeRunner({});
   const r = jumpToAgent(agent(), {

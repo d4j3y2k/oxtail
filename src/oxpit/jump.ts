@@ -32,6 +32,7 @@ export type JumpResult =
       session: string;
       window: string;
       client: string | null; // client we switched; null when only select-pane ran
+      dryRun?: boolean; // true ⇒ resolved the plan but mutated nothing
       manual?: never;
     }
   | { ok: false; reason: string; manual?: string };
@@ -129,6 +130,10 @@ export type JumpDeps = {
   run?: TmuxRunner;
   inTmux?: boolean;
   client?: string;
+  // Resolve + validate the full plan (pane, client) but mutate NOTHING — no
+  // select-pane / switch-client. Lets a caller preview a jump, and lets the live
+  // switch-client path be verified against a real fleet without disturbing it.
+  dryRun?: boolean;
   // injectable for tests
   resolveEntry?: (agent: FleetAgent) => RegistryEntry | null;
   verifyPane?: (entry: RegistryEntry) => string | null;
@@ -190,6 +195,12 @@ export function jumpToAgent(agent: FleetAgent, deps: JumpDeps = {}): JumpResult 
       ok: false,
       reason: `multiple attached clients (${others}); pass --client <name> to choose which terminal to move`,
     };
+  }
+
+  // Dry run: the plan is fully resolved and validated — report it without touching
+  // tmux. (Used to preview a jump and to verify the live path non-destructively.)
+  if (deps.dryRun) {
+    return { ok: true, pane, session: loc.session, window: loc.window, client: choice.client, dryRun: true };
   }
 
   // Focus the target pane within its window/session, then move the chosen client.

@@ -24,6 +24,14 @@ export type RenderOptions = {
   width?: number;
   // Index of the selected row (TUI); -1/undefined = none. Selected row gets a ›.
   selected?: number;
+  // Max agent rows to render. When the fleet is larger, a window that always keeps
+  // the selected row visible is shown, with "⋯ N more above/below" markers — so a
+  // big fleet can't overflow the terminal and desync the TUI repaint. Unset (or
+  // <=0) = render all (the `oxtail status` one-shot default).
+  maxAgentRows?: number;
+  // Max wait-graph body lines (cycles + non-cycle waiters) to render; extras are
+  // summarized as "⋯ N more waits". Unset = render all.
+  maxWaitRows?: number;
 };
 
 type Paint = (s: string, ...codes: string[]) => string;
@@ -140,23 +148,19 @@ function renderAgentRow(
   return line;
 }
 
-function renderWaitGraph(s: FleetSnapshot, paint: Paint): string[] {
+function renderWaitGraph(s: FleetSnapshot, paint: Paint, maxWaitRows?: number): string[] {
   const waiters = s.agents.filter((a) => a.waiting);
   if (waiters.length === 0 && s.cycles.length === 0) return [];
-  const out: string[] = [];
-  out.push("");
-  out.push(paint("wait-graph", C.bold));
-  if (s.cycles.length > 0) {
-    for (const c of s.cycles) {
-      const chain = c.members.concat(c.members[0] ?? "").join(" → ");
-      // Only a cycle whose members are ALL alive is a credible deadlock; a stale
-      // cycle (a member exited / ask aged toward the 1h GC) is shown as "possible"
-      // so the cockpit never cries a false DEADLOCK (max H1).
-      if (c.all_live) {
-        out.push("  " + paint(`⛔ DEADLOCK: ${chain}`, C.red, C.bold));
-      } else {
-        out.push("  " + paint(`⚠ possible wait cycle (stale): ${chain}`, C.yellow));
-      }
+  const body: string[] = [];
+  for (const c of s.cycles) {
+    const chain = c.members.concat(c.members[0] ?? "").join(" → ");
+    // Only a cycle whose members are ALL alive is a credible deadlock; a stale
+    // cycle (a member exited / ask aged toward the 1h GC) is shown as "possible"
+    // so the cockpit never cries a false DEADLOCK (max H1).
+    if (c.all_live) {
+      body.push("  " + paint(`⛔ DEADLOCK: ${chain}`, C.red, C.bold));
+    } else {
+      body.push("  " + paint(`⚠ possible wait cycle (stale): ${chain}`, C.yellow));
     }
   }
   for (const a of waiters) {
@@ -164,14 +168,22 @@ function renderWaitGraph(s: FleetSnapshot, paint: Paint): string[] {
     const tgt = a.waiting!.target_short_id ?? "?";
     const age = fmtAge(a.waiting!.age_s);
     if (a.waiting!.orphaned) {
-      out.push(
+      body.push(
         "  " + paint(`⛔ ${a.short_id} awaiting reply from ${tgt} (${age}) — target is dead`, C.red),
       );
     } else if (a.waiting!.target_short_id) {
-      out.push("  " + paint(`⏳ ${a.short_id} awaiting reply from ${tgt} (${age})`, C.yellow));
+      body.push("  " + paint(`⏳ ${a.short_id} awaiting reply from ${tgt} (${age})`, C.yellow));
     } else {
-      out.push("  " + paint(`⏳ ${a.short_id} awaiting reply (${age}, peer unresolved)`, C.yellow));
+      body.push("  " + paint(`⏳ ${a.short_id} awaiting reply (${age}, peer unresolved)`, C.yellow));
     }
+  }
+  const out: string[] = ["", paint("wait-graph", C.bold)];
+  const cap = maxWaitRows && maxWaitRows > 0 ? maxWaitRows : body.length;
+  if (body.length <= cap) {
+    out.push(...body);
+  } else {
+    out.push(...body.slice(0, cap));
+    out.push("  " + paint(`⋯ ${body.length - cap} more waits`, C.dim));
   }
   return out;
 }
@@ -204,12 +216,26 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
         C.dim,
       ),
     );
-    for (let i = 0; i < s.agents.length; i++) {
-      lines.push(renderAgentRow(s.agents[i], i, paint, width, selected));
+    const total = s.agents.length;
+    const cap = opts.maxAgentRows && opts.maxAgentRows > 0 ? opts.maxAgentRows : total;
+    if (total <= cap) {
+      for (let i = 0; i < total; i++) {
+        lines.push(renderAgentRow(s.agents[i], i, paint, width, selected));
+      }
+    } else {
+      // Window that always keeps the selected row visible (centered when possible).
+      const sel = selected >= 0 ? selected : 0;
+      const start = Math.max(0, Math.min(sel - Math.floor(cap / 2), total - cap));
+      const end = start + cap;
+      if (start > 0) lines.push(paint(`  ⋯ ${start} more above`, C.dim));
+      for (let i = start; i < end; i++) {
+        lines.push(renderAgentRow(s.agents[i], i, paint, width, selected));
+      }
+      if (end < total) lines.push(paint(`  ⋯ ${total - end} more below`, C.dim));
     }
   }
 
-  lines.push(...renderWaitGraph(s, paint));
+  lines.push(...renderWaitGraph(s, paint, opts.maxWaitRows));
 
   for (const w of s.warnings) {
     lines.push(paint(`  ⚠ ${w}`, C.yellow));

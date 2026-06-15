@@ -31,6 +31,7 @@ const CLEAR_EOL = "\x1b[K";
 const WATCH_DIRS = ["sessions", "mailboxes", "received", "pending-ask"];
 const DEBOUNCE_MS = 200;
 const SLOW_TICK_MS = 1500;
+const MAX_WAIT_ROWS = 8;
 
 function agentKey(a: FleetAgent): string {
   return a.session_id ?? `pid:${a.server_pid}`;
@@ -81,6 +82,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     const watchers: FSWatcher[] = [];
     let slowTick: NodeJS.Timeout | null = null;
     let torndown = false;
+    let helpOpen = false;
 
     const stdin = process.stdin;
     const stdout = process.stdout;
@@ -102,18 +104,63 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     }
 
     function footer(): string {
-      const keys = "↑↓/jk move  ⏎ jump  r refresh  q quit";
+      const keys = "↑↓/jk move  ⏎ jump  r refresh  ? help  q quit";
       const now = Date.now();
       const msg = now < statusUntil && status ? "  " + status : "";
       return "\n" + dim("  " + keys, opts.color) + msg;
     }
 
+    function helpFrame(width: number): string {
+      const b = (s: string) => (opts.color ? `\x1b[1m\x1b[36m${s}\x1b[0m` : s);
+      const d = (s: string) => dim(s, opts.color);
+      const L = [
+        b("oxpit — help"),
+        "",
+        "  ↑/k  ↓/j      move selection",
+        "  ⏎             jump to the selected agent's tmux pane",
+        "  r             force refresh    ?  toggle help    q / Ctrl-C  quit",
+        "",
+        d("  🟢 active   🟡 idle   ⚫ dead (exited / pid-reused)"),
+        d("  ✉N unread   ⚑N open obligations   ⏳ awaiting a peer reply"),
+        d("  ⛔ DEADLOCK (live cycle)   ⚠ stale/possible cycle   † orphaned (target dead)"),
+        "",
+        d("  press ? or q to return"),
+      ];
+      return L.map((l) => clipToWidth(l, width) + CLEAR_EOL).join("\n");
+    }
+
+    // Lines of fixed chrome around the agent table, so the table can be windowed to
+    // fit the terminal height (paging) — a large fleet can't overflow and desync
+    // the cursor-home repaint.
+    function reservedRows(): number {
+      const waiters = snapshot.agents.filter((a) => a.waiting);
+      const wgBody = snapshot.cycles.length + waiters.filter((a) => !a.waiting?.in_cycle).length;
+      const wgLines =
+        waiters.length || snapshot.cycles.length
+          ? 2 + Math.min(wgBody, MAX_WAIT_ROWS) + (wgBody > MAX_WAIT_ROWS ? 1 : 0)
+          : 0;
+      // header(1) + column header(1) + footer(2) + wait-graph + warnings + window
+      // markers(2) + margin(1)
+      return 1 + 1 + 2 + wgLines + snapshot.warnings.length + 2 + 1;
+    }
+
     function paint(): void {
       if (torndown) return;
       const width = stdout.columns || 100;
+      if (helpOpen) {
+        stdout.write(HOME + helpFrame(width) + CLEAR_BELOW);
+        return;
+      }
+      const rows = stdout.rows || 24;
+      const maxAgentRows = Math.max(3, rows - reservedRows());
       const frame =
-        renderSnapshot(snapshot, { color: opts.color, width, selected: selectedIndex() }) +
-        footer();
+        renderSnapshot(snapshot, {
+          color: opts.color,
+          width,
+          selected: selectedIndex(),
+          maxAgentRows,
+          maxWaitRows: MAX_WAIT_ROWS,
+        }) + footer();
       // Clip every physical line to the terminal width (ANSI-aware) so none wraps —
       // a wrapped line would push the cursor-home repaint out of sync and corrupt
       // the screen. renderSnapshot already clips its own lines; this also covers the
@@ -215,6 +262,11 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       const s = buf.toString();
       // Handle the common keys. Escape sequences for arrows arrive as one chunk.
       if (s === "\x03" || s === "q") return teardown(0); // Ctrl-C / q
+      if (s === "?") {
+        helpOpen = !helpOpen;
+        return paint();
+      }
+      if (helpOpen) return; // swallow other keys while the help overlay is up
       if (s === "\x1b[A" || s === "k") return move(-1);
       if (s === "\x1b[B" || s === "j") return move(1);
       if (s === "\r" || s === "\n") return doJump();
