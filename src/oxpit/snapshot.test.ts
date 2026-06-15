@@ -83,6 +83,7 @@ function buildOne(entry: RegistryEntry): FleetAgent {
     nowMs: NOW_MS,
     checkProcSig: false,
     selfSessionId: null,
+    resolveWindowNames: () => new Map(), // hermetic — don't hit the real tmux
   });
   assert.equal(snap.agents.length, 1, "expected exactly one agent");
   return snap.agents[0];
@@ -185,6 +186,21 @@ test("liveness: a not-alive server_pid ⇒ dead/exited", () => {
   });
 });
 
+test("window_name: resolved from the agent's pane via the injected resolver", () => {
+  withHome(() => {
+    const snap = buildSnapshot({
+      readEntries: () => [makeEntry({ tmux_pane: "%9", client: { transcript_path: null } as never })],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      resolveWindowNames: () => new Map([["%9", "max"]]),
+    });
+    assert.equal(snap.agents.length, 1);
+    assert.equal(snap.agents[0].window_name, "max");
+  });
+});
+
 test("open_work: counts open obligations from the received ledger", () => {
   withHome(() => {
     const sid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -201,6 +217,7 @@ function fleetAgent(over: Partial<FleetAgent>): FleetAgent {
   return {
     session_id: over.session_id ?? null,
     short_id: over.short_id ?? "xxxxxxxx",
+    window_name: null,
     client_type: "claude-code",
     server_pid: 1,
     cwd: "/proj",

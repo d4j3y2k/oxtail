@@ -14,6 +14,7 @@ function agent(over: Partial<FleetAgent> = {}): FleetAgent {
   return {
     session_id: "11111111-1111-1111-1111-111111111111",
     short_id: "11111111",
+    window_name: null,
     client_type: "claude-code",
     server_pid: 4242,
     cwd: "/proj",

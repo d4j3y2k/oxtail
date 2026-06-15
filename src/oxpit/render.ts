@@ -65,7 +65,11 @@ function statusText(a: FleetAgent): string {
 // Free-form badge cluster: ✉ unread, ⚑ open-work, ⏳ waiting (with deadlock/orphan
 // flags). Returns the painted string (already colored) plus its visible length so
 // the caller can budget the trailing purpose column.
-function badges(a: FleetAgent, paint: Paint): { text: string; len: number } {
+function badges(
+  a: FleetAgent,
+  paint: Paint,
+  labels: Map<string, string>, // short_id → display label
+): { text: string; len: number } {
   const parts: string[] = [];
   let len = 0;
   const add = (raw: string, painted: string) => {
@@ -82,7 +86,8 @@ function badges(a: FleetAgent, paint: Paint): { text: string; len: number } {
   }
   if (a.waiting) {
     const w = a.waiting;
-    const tgt = w.target_short_id ?? "?";
+    const tgt =
+      (w.target_short_id && labels.get(w.target_short_id)) || w.target_short_id || "?";
     // Default framing is "awaiting reply" — a timed-out ask_peer is parked for a
     // late reply, NOT synchronously blocked. Hard DEADLOCK only for a live cycle.
     let raw = `⏳${tgt} ${fmtAge(w.age_s)}`;
@@ -106,7 +111,7 @@ function badges(a: FleetAgent, paint: Paint): { text: string; len: number } {
   return { text: parts.join(" "), len: len > 0 ? len - 1 : 0 };
 }
 
-const ID_W = 9;
+const ID_W = 14;
 const TYPE_W = 7;
 const STATUS_W = 13;
 
@@ -123,14 +128,16 @@ function renderAgentRow(
   paint: Paint,
   width: number,
   selected: number,
+  label: string,
+  labels: Map<string, string>,
 ): string {
   const marker = i === selected ? paint("›", C.cyan, C.bold) : " ";
   const glyph = GLYPH[a.liveness];
-  const idText = a.short_id + (a.is_self ? "*" : "");
+  const idText = label + (a.is_self ? "*" : "");
   const id = paint(cell(idText, ID_W), a.is_self ? C.bold : C.reset);
   const type = paint(cell(agentLabel(a.client_type), TYPE_W), C.dim);
   const status = paint(cell(statusText(a), STATUS_W), livenessColor(a.liveness));
-  const b = badges(a, paint);
+  const b = badges(a, paint, labels);
 
   // Fixed prefix visible width: marker(1) sp glyph(2) sp id sp type sp status sp
   const prefixLen = 1 + 1 + 2 + 1 + ID_W + 1 + TYPE_W + 1 + STATUS_W + 1;
@@ -148,12 +155,19 @@ function renderAgentRow(
   return line;
 }
 
-function renderWaitGraph(s: FleetSnapshot, paint: Paint, maxWaitRows?: number): string[] {
+function renderWaitGraph(
+  s: FleetSnapshot,
+  paint: Paint,
+  labels: Map<string, string>, // short_id → display label
+  maxWaitRows?: number,
+): string[] {
   const waiters = s.agents.filter((a) => a.waiting);
   if (waiters.length === 0 && s.cycles.length === 0) return [];
+  const lbl = (shortId: string): string => labels.get(shortId) ?? shortId;
   const body: string[] = [];
   for (const c of s.cycles) {
-    const chain = c.members.concat(c.members[0] ?? "").join(" → ");
+    const named = c.members.map(lbl);
+    const chain = named.concat(named[0] ?? "").join(" → ");
     // Only a cycle whose members are ALL alive is a credible deadlock; a stale
     // cycle (a member exited / ask aged toward the 1h GC) is shown as "possible"
     // so the cockpit never cries a false DEADLOCK (max H1).
@@ -165,16 +179,17 @@ function renderWaitGraph(s: FleetSnapshot, paint: Paint, maxWaitRows?: number): 
   }
   for (const a of waiters) {
     if (a.waiting!.in_cycle) continue; // shown in the cycle line above
-    const tgt = a.waiting!.target_short_id ?? "?";
+    const who = lbl(a.short_id);
+    const tgt = a.waiting!.target_short_id ? lbl(a.waiting!.target_short_id) : "?";
     const age = fmtAge(a.waiting!.age_s);
     if (a.waiting!.orphaned) {
       body.push(
-        "  " + paint(`⛔ ${a.short_id} awaiting reply from ${tgt} (${age}) — target is dead`, C.red),
+        "  " + paint(`⛔ ${who} awaiting reply from ${tgt} (${age}) — target is dead`, C.red),
       );
     } else if (a.waiting!.target_short_id) {
-      body.push("  " + paint(`⏳ ${a.short_id} awaiting reply from ${tgt} (${age})`, C.yellow));
+      body.push("  " + paint(`⏳ ${who} awaiting reply from ${tgt} (${age})`, C.yellow));
     } else {
-      body.push("  " + paint(`⏳ ${a.short_id} awaiting reply (${age}, peer unresolved)`, C.yellow));
+      body.push("  " + paint(`⏳ ${who} awaiting reply (${age}, peer unresolved)`, C.yellow));
     }
   }
   const out: string[] = ["", paint("wait-graph", C.bold)];
@@ -206,6 +221,26 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
     paint(` (${active} active)`, C.green);
   lines.push(head);
 
+  // Human-facing label per agent (short_id → label): the tmux window name when
+  // present and unique; collisions (or auto-named windows like "node") disambiguate
+  // with the short id; no window name falls back to the short id. Built once and
+  // shared by the table, the badges, and the wait-graph so names are consistent.
+  const nameCount = new Map<string, number>();
+  for (const a of s.agents) {
+    if (a.window_name) nameCount.set(a.window_name, (nameCount.get(a.window_name) ?? 0) + 1);
+  }
+  const labels = new Map<string, string>();
+  for (const a of s.agents) {
+    const l =
+      a.window_name && nameCount.get(a.window_name) === 1
+        ? a.window_name
+        : a.window_name
+          ? `${a.window_name}·${a.short_id.slice(0, 4)}`
+          : a.short_id;
+    labels.set(a.short_id, l);
+  }
+  const rowLabel = (a: FleetAgent): string => labels.get(a.short_id) ?? a.short_id;
+
   if (s.agents.length === 0) {
     lines.push(paint("  no agents registered in this project scope", C.dim));
   } else {
@@ -220,7 +255,7 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
     const cap = opts.maxAgentRows && opts.maxAgentRows > 0 ? opts.maxAgentRows : total;
     if (total <= cap) {
       for (let i = 0; i < total; i++) {
-        lines.push(renderAgentRow(s.agents[i], i, paint, width, selected));
+        lines.push(renderAgentRow(s.agents[i], i, paint, width, selected, rowLabel(s.agents[i]), labels));
       }
     } else {
       // Window that always keeps the selected row visible (centered when possible).
@@ -229,13 +264,13 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
       const end = start + cap;
       if (start > 0) lines.push(paint(`  ⋯ ${start} more above`, C.dim));
       for (let i = start; i < end; i++) {
-        lines.push(renderAgentRow(s.agents[i], i, paint, width, selected));
+        lines.push(renderAgentRow(s.agents[i], i, paint, width, selected, rowLabel(s.agents[i]), labels));
       }
       if (end < total) lines.push(paint(`  ⋯ ${total - end} more below`, C.dim));
     }
   }
 
-  lines.push(...renderWaitGraph(s, paint, opts.maxWaitRows));
+  lines.push(...renderWaitGraph(s, paint, labels, opts.maxWaitRows));
 
   for (const w of s.warnings) {
     lines.push(paint(`  ⚠ ${w}`, C.yellow));

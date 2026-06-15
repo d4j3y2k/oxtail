@@ -7,6 +7,7 @@ function agent(partial: Partial<FleetAgent>): FleetAgent {
   return {
     session_id: "11111111-1111-1111-1111-111111111111",
     short_id: "11111111",
+    window_name: null,
     client_type: "claude-code",
     server_pid: 1234,
     cwd: "/proj",
@@ -80,6 +81,34 @@ test("render: self marker and badges", () => {
   assert.match(out, /⚑3/);
 });
 
+test("render: uses the tmux window name as the agent label", () => {
+  const out = renderSnapshot(
+    snap([agent({ short_id: "0f74e56a", window_name: "main", is_self: true })]),
+    { color: false },
+  );
+  assert.match(out, /main\*/); // window name + self marker, not the hex id
+  assert.ok(!/0f74e56a/.test(out), "hex id replaced by the window name");
+});
+
+test("render: disambiguates colliding window names with the short id", () => {
+  const out = renderSnapshot(
+    snap([
+      agent({ short_id: "aaaaaaaa", session_id: "a", window_name: "node" }),
+      agent({ short_id: "bbbbbbbb", session_id: "b", window_name: "node" }),
+    ]),
+    { color: false },
+  );
+  assert.match(out, /node·aaaa/);
+  assert.match(out, /node·bbbb/);
+});
+
+test("render: falls back to short id when there is no window name", () => {
+  const out = renderSnapshot(snap([agent({ short_id: "deadbeef", window_name: null })]), {
+    color: false,
+  });
+  assert.match(out, /deadbeef/);
+});
+
 test("render: low-confidence unread gets a ?", () => {
   const out = renderSnapshot(
     snap([agent({ unread: 5, unread_confidence: "low" })]),
@@ -109,6 +138,26 @@ test("render: waiting edge and purpose caption", () => {
   assert.match(out, /⏳codex 45s/);
   assert.match(out, /doing a thing/);
   assert.match(out, /⏳ waiter awaiting reply from codex \(45s\)/); // wait-graph block
+});
+
+test("render: wait-graph and badge use window-name labels for both ends", () => {
+  const target = agent({ short_id: "tc", session_id: "stc", window_name: "codex" });
+  const waiter = agent({
+    short_id: "w",
+    session_id: "sw",
+    window_name: "main",
+    waiting: {
+      target_session_id: "stc",
+      target_short_id: "tc",
+      age_s: 30,
+      orphaned: false,
+      in_cycle: false,
+      cycle_all_live: false,
+    },
+  });
+  const out = renderSnapshot(snap([waiter, target]), { color: false });
+  assert.match(out, /main awaiting reply from codex/); // names, not short ids
+  assert.ok(!/awaiting reply from tc\b/.test(out), "target shown by name, not short id");
 });
 
 test("render: deadlock cycle headline", () => {

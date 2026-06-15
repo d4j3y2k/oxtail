@@ -62,6 +62,26 @@ export function listPanes(run: TmuxRunner): PaneRow[] {
   return rows;
 }
 
+// Map live pane_id → its tmux window name, in one batched call. The cockpit uses
+// this for the human-facing AGENT label (you `rename-window main/max/codex` and it
+// shows that instead of a hex session id). Pure display — identity/jump stay keyed
+// on session_id, so a rename can never mis-target. Empty map when tmux is absent.
+export function paneWindowNames(run: TmuxRunner = realTmux): Map<string, string> {
+  let out: string;
+  try {
+    out = run(["list-panes", "-a", "-F", "#{pane_id}\t#{window_name}"]);
+  } catch {
+    return new Map();
+  }
+  const m = new Map<string, string>();
+  for (const line of out.split("\n")) {
+    if (!line) continue;
+    const [pane, name] = line.split("\t");
+    if (pane && name) m.set(pane, name);
+  }
+  return m;
+}
+
 type ClientRow = { name: string; tty: string; session: string };
 
 export function listClients(run: TmuxRunner): ClientRow[] {

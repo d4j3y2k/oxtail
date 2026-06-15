@@ -337,16 +337,16 @@ A mission-control view of every agent in a project, for a separate terminal. Two
 
 ```
 oxpit  oxtail  3 agents (1 active)
-     agent     type    status        work / purpose
- 🟢 0f74e56a* claude  active 4s       refactoring the mailbox dedup path
- 🟡 4493e788  claude  idle 3m       ✉1 ⚑2 ⏳codex 45s   reviewing oxpit
- 🟡 019ec959  codex   idle 12m      ✉1
+     agent          type    status        work / purpose
+ 🟢 main*          claude  active 4s       refactoring the mailbox dedup path
+ 🟡 max            claude  idle 3m       ✉1 ⚑2 ⏳codex 45s   reviewing oxpit
+ 🟡 codex          codex   idle 12m      ✉1
 
 wait-graph
-  ⏳ 4493e788 awaiting reply from codex (45s)
+  ⏳ max awaiting reply from codex (45s)
 ```
 
-Per agent: a **liveness glyph** (🟢 active / 🟡 idle / ⚫ dead) with the raw age always shown (the glyph is never the only signal), plus an independent **badge set** — `✉N` unread, `⚑N` open obligations, `⏳` awaiting a peer reply. The **wait-graph** is the headline: it renders who is awaiting whom and flags a `⛔ DEADLOCK` only when every member of a wait cycle is alive (a stale/abandoned cycle shows as `⚠ possible wait cycle`), and an orphaned wait when its target has died — the one thing you cannot see by tabbing through panes. `state.purpose` is shown as a caption but cross-checked against transcript activity (grayed when stale).
+The **agent label** is its tmux window name (so `rename-window max` makes the row, badges, and wait-graph read `max`), falling back to the short session id when a window is unnamed or names collide. Per agent: a **liveness glyph** (🟢 active / 🟡 idle / ⚫ dead) with the raw age always shown (the glyph is never the only signal), plus an independent **badge set** — `✉N` unread, `⚑N` open obligations, `⏳` awaiting a peer reply. The **wait-graph** is the headline: it renders who is awaiting whom and flags a `⛔ DEADLOCK` only when every member of a wait cycle is alive (a stale/abandoned cycle shows as `⚠ possible wait cycle`), and an orphaned wait when its target has died — the one thing you cannot see by tabbing through panes. `state.purpose` is shown as a caption but cross-checked against transcript activity (grayed when stale).
 
 Design: oxpit is a **read-only VIEW**. It never drains a mailbox or takes a lock, and it consumes the same canonical modules the hooks and MCP tools use (`registry`, `received`, `pending-ask`, `mailbox`) rather than re-deriving their semantics — so it cannot silently drift from the truth. Liveness, work, and waits are **inferred from observed facts** (transcript mtime, `proc_sig`, the obligation ledger, the pending-ask registry); self-reported state is a cross-checked hint, never authority. `jump` re-validates the target pane live at action time (the same `proc_sig` + process-tree guard the wake path uses) and drives an explicit tmux client — refusing rather than guessing when multiple clients are attached (`--client <name>` to choose). Flags: `--json` / `--pretty`, `--no-color`, `--all` (all projects, not just the current one), `--width N`, `--project PATH`, `--client NAME` (oxpit), `-h` / `--help`.
 
