@@ -108,11 +108,11 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     let torndown = false;
     let helpOpen = false;
     let mode: "fleet" | "log" = "fleet";
-    let logOffset = 0; // LINES scrolled up from the newest (0 = tail/live)
     let logFilterSelf = false; // scope the log to the fleet-selected agent
-    let logFull = false; // word-wrap full message bodies (vs one-line snippets)
-    let logTotalLines = 0; // last-rendered total body lines (for scroll clamping)
-    let logAvail = 0; // last-rendered visible body lines
+    let logExpanded = false; // `w` — expand the cursor'd message's full body
+    let logCursorFromEnd = 0; // comms cursor: 0 = latest message, +1 = one older, …
+    let logMsgCount = 0; // last-rendered message count (for cursor clamping)
+    let logAvail = 0; // last-rendered visible body lines (for cursor paging)
     let pendingNudgeKey: string | null = null; // agentKey awaiting 'y' to confirm a nudge
     let composing = false; // typing a custom operator message in the TUI
     let composeBuf = ""; // the message being typed
@@ -171,8 +171,8 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "  m             compose a message (Enter send · ⌥⏎/⌃J newline · ⌃X unattach · Esc cancel)",
         "                attach: drag a file then ⌃A · ⌃V pastes a clipboard image (copy then ⌃V)",
         "  l             toggle the comms-log bottom panel (fleet stays visible above)",
-        "  w             open the selected agent's full thread in the panel (per-agent)",
-        "                in the panel: ↑↓ scroll · j/k walk agents · Space/b page · w full · f filter · ⏎ jump",
+        "  w             open the selected agent's thread in the panel (per-agent)",
+        "                in the panel: ↑↓ move the › cursor · w expand that message · j/k walk agents · f filter · ⏎ jump",
         "  r             force refresh    ?  toggle help    q / Ctrl-C  quit",
         "",
         d("  🟢 active   🟡 idle   ⚫ dead (exited / pid-reused)"),
@@ -279,58 +279,17 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       paint();
     }
 
-    // Comms-log body, LINE-windowed to terminal height and scroll-positioned by
-    // logOffset (lines from the newest; 0 = tail/live). `w` toggles full word-wrap
-    // (readable) vs one-line snippets; `f` filters to the fleet-selected agent.
-    function logFrame(width: number, rows: number): string {
-      const { bySession } = computeAgentLabels(snapshot.agents);
-      let comms: CommsMessage[] = buildCommsLog(snapshot.agents, { limit: LOG_FETCH });
-      let filterNote = "";
-      if (logFilterSelf) {
-        const sel = snapshot.agents[selectedIndex()];
-        const sid = sel?.session_id;
-        if (sid) {
-          comms = comms.filter((m) => m.from_session_id === sid || m.to_session_id === sid);
-          filterNote = `  [${sel.window_name ?? sel.short_id}]`;
-        } else {
-          filterNote = "  [filter: no agent selected]";
-        }
-      }
-      const bodyLines = commsBodyLines(comms, bySession, {
-        color: opts.color,
-        width,
-        full: logFull,
-      });
-      logTotalLines = bodyLines.length;
-      const avail = Math.max(3, rows - 5); // header(1) + footer(2) + 2 scroll markers
-      logAvail = avail;
-      const maxOffset = Math.max(0, bodyLines.length - avail);
-      if (logOffset > maxOffset) logOffset = maxOffset;
-      const end = bodyLines.length - logOffset;
-      const start = Math.max(0, end - avail);
-
-      const header =
-        (opts.color ? "\x1b[1m\x1b[36mcomms\x1b[0m" : "comms") +
-        dim(`  recent tail${logFull ? " · full" : ""}${filterNote}`, opts.color);
-      const out: string[] = [header];
-      if (start > 0) out.push(dim(`  ↑ ${start} more line${start === 1 ? "" : "s"}`, opts.color));
-      out.push(...bodyLines.slice(start, end));
-      if (end < bodyLines.length) {
-        out.push(dim(`  ↓ ${bodyLines.length - end} more`, opts.color));
-      }
-      return out.join("\n");
-    }
-
-    // Comms panel rendered as the BOTTOM region (item 3): a separator, the comms
-    // header, the windowed body (scroll-positioned by logOffset), and a footer of
-    // panel keys — EXACTLY `rows` lines so the caller can pin it to the foot with the
-    // fleet table above. `w`/`f` toggle full-text / selected-agent filter; when
-    // filtered it follows the live fleet selection (the per-agent thread, item 4).
+    // Comms panel rendered as the BOTTOM region (items 3+4): a separator, the comms
+    // header, the windowed body, and a footer of panel keys — EXACTLY `rows` lines so
+    // the caller can pin it to the foot with the fleet table above. A › CURSOR marks
+    // the selected message (default = the latest); ↑↓ move it, the window follows, and
+    // `w` expands the cursor'd message's full body (David's model). `f` filters to the
+    // fleet selection (the per-agent thread, item 4).
     function logPanelLines(width: number, rows: number): string[] {
       const d = (s: string) => dim(s, opts.color);
       const sep = d("─".repeat(Math.max(4, width)));
       const footerKeys = d(
-        `  ↑↓ scroll · jk agents · w ${logFull ? "snippet" : "full"} · f filter${logFilterSelf ? "*" : ""} · ⏎ jump · l global · Esc close`,
+        `  ↑↓ select · w ${logExpanded ? "collapse" : "expand"} · jk agents · f filter${logFilterSelf ? "*" : ""} · ⏎ jump · l global · Esc close`,
       );
       const { bySession } = computeAgentLabels(snapshot.agents);
       let comms: CommsMessage[] = buildCommsLog(snapshot.agents, { limit: LOG_FETCH });
@@ -345,32 +304,61 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
           filterNote = "  [no agent selected]";
         }
       }
-      const bodyLines = commsBodyLines(comms, bySession, { color: opts.color, width, full: logFull });
-      logTotalLines = bodyLines.length;
+      const n = comms.length;
+      logMsgCount = n;
       // Fixed line budget: sep(1) + header(1) + up-marker(1) + body(avail) +
-      // down-marker(1) + footer(1) = avail + 5. Markers are always emitted (blank
+      // down-marker(1) + footer(1) = avail + 5 = rows (markers always emitted, blank
       // when nothing's hidden) so the panel is a constant `rows` lines — no desync.
       const avail = Math.max(1, rows - 5);
       logAvail = avail;
-      const maxOffset = Math.max(0, bodyLines.length - avail);
-      if (logOffset > maxOffset) logOffset = maxOffset;
-      const end = bodyLines.length - logOffset;
-      const start = Math.max(0, end - avail);
+
+      let allLines: string[];
+      let cursorStart = 0;
+      let cursorLen = 0;
+      if (n === 0) {
+        allLines = [d("  no inter-agent messages yet")];
+      } else {
+        if (logCursorFromEnd > n - 1) logCursorFromEnd = n - 1;
+        if (logCursorFromEnd < 0) logCursorFromEnd = 0;
+        const cursorIdx = n - 1 - logCursorFromEnd; // absolute index (0=oldest, n-1=newest)
+        const cursorId = comms[cursorIdx].message_id;
+        // Render each message as its own group so we know the cursor message's line
+        // span (for windowing); the cursor message is marked + expanded (if `w`).
+        const groups = comms.map((m, i) =>
+          commsBodyLines([m], bySession, {
+            color: opts.color,
+            width,
+            cursorId: i === cursorIdx ? cursorId : undefined,
+            expandedId: i === cursorIdx && logExpanded ? cursorId : undefined,
+          }),
+        );
+        for (let i = 0; i < cursorIdx; i++) cursorStart += groups[i].length;
+        cursorLen = groups[cursorIdx].length;
+        allLines = groups.flat();
+      }
+
+      // Window the body to keep the cursor message visible (centered when it fits).
+      let winStart = cursorStart - Math.floor((avail - cursorLen) / 2);
+      const maxStart = Math.max(0, allLines.length - avail);
+      winStart = Math.max(0, Math.min(winStart, maxStart));
+      if (cursorStart < winStart) winStart = cursorStart;
+      if (cursorStart + cursorLen > winStart + avail) {
+        winStart = Math.max(0, cursorStart + cursorLen - avail);
+      }
+      const winEnd = winStart + avail;
+
       const header =
         (opts.color ? "\x1b[1m\x1b[36mcomms\x1b[0m" : "comms") +
-        d(`  recent tail${logFull ? " · full" : ""}${filterNote}`);
+        d(`  ${n} msg${filterNote}`);
       const out: string[] = [sep, header];
-      out.push(start > 0 ? d(`  ↑ ${start} more`) : "");
-      const window = bodyLines.slice(start, end);
-      out.push(...window);
-      // pad the body region to `avail` so the footer pins to the bottom
-      for (let i = window.length; i < avail; i++) out.push("");
-      out.push(end < bodyLines.length ? d(`  ↓ ${bodyLines.length - end} more`) : "");
+      out.push(winStart > 0 ? d(`  ↑ ${winStart} more`) : "");
+      const win = allLines.slice(winStart, winEnd);
+      out.push(...win);
+      for (let i = win.length; i < avail; i++) out.push(""); // pad so the footer pins
+      out.push(winEnd < allLines.length ? d(`  ↓ ${allLines.length - winEnd} more`) : "");
       out.push(footerKeys);
-      // Normalize to EXACTLY `rows` lines for ANY height (codex MEDIUM): on a tiny
-      // terminal the fixed 5-line chrome can't all fit, so trim from the TOP while
-      // always preserving the footer (last line) — never returns ≠ rows, so the
-      // caller never has to .slice() and the panel can't desync the repaint.
+      // Normalize to EXACTLY `rows` lines for ANY height (codex MEDIUM): trim from the
+      // top while always preserving the footer, so the panel can never desync.
       if (rows <= 0) return [];
       if (out.length > rows) return [...out.slice(0, rows - 1), out[out.length - 1]];
       while (out.length < rows) out.push("");
@@ -438,7 +426,8 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         // region to the remaining rows and pad so the field is pinned to the foot.
         const bar = composerBar(width).map((l) => clipToWidth(l, width) + CLEAR_EOL);
         const avail = Math.max(1, rows - bar.length);
-        const topStr = mode === "log" ? logFrame(width, avail) : fleetFrame(width, avail);
+        const topStr =
+          mode === "log" ? logPanelLines(width, avail).join("\n") : fleetFrame(width, avail);
         const top = topStr
           .split("\n")
           .slice(0, avail)
@@ -475,23 +464,23 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       stdout.write(HOME + body + CLEAR_BELOW);
     }
 
-    function logScroll(delta: number): void {
-      const maxOffset = Math.max(0, logTotalLines - logAvail);
-      const next = Math.min(maxOffset, Math.max(0, logOffset + delta));
-      if (next === logOffset) return;
-      logOffset = next;
-      paint();
-    }
-
     function closeLog(): void {
       mode = "fleet";
       paint();
     }
 
-    // A "page" for PgUp/PgDn/Space/b — nearly a full panel of body lines (logAvail is
-    // set by the last logPanelLines render). Minus one for visual overlap.
-    function logPageSize(): number {
-      return Math.max(1, logAvail - 1);
+    // Move the comms cursor by `delta` messages (+ = older, − = newer); clamps to
+    // [0, n-1] and repaints. logMsgCount is set by the last logPanelLines render.
+    function logCursorMove(delta: number): void {
+      const next = Math.max(0, Math.min(logMsgCount - 1, logCursorFromEnd + delta));
+      if (next === logCursorFromEnd) return;
+      logCursorFromEnd = next;
+      paint();
+    }
+
+    // A "page" of messages for Space/b/PgUp/PgDn — about a panel's worth.
+    function logCursorPage(): number {
+      return Math.max(1, Math.floor(logAvail / 2));
     }
 
     function refresh(full: boolean): void {
@@ -529,7 +518,10 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (idx < 0) idx = 0;
       idx = (idx + delta + snapshot.agents.length) % snapshot.agents.length;
       selectedKey = agentKey(snapshot.agents[idx]);
-      logOffset = 0; // tail the newly-selected agent's thread (item 4 follow-selection)
+      // Walking the fleet re-points the per-agent thread → reset the comms cursor to
+      // that agent's latest message + collapse (item 4 follow-selection).
+      logCursorFromEnd = 0;
+      logExpanded = false;
       paint();
       maybeCaptureSelected(true); // capture the newly-selected pane immediately
     }
@@ -829,33 +821,34 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         else {
           mode = "log";
           logFilterSelf = false;
-          logOffset = 0;
+          logCursorFromEnd = 0; // start on the latest message
+          logExpanded = false;
         }
         return paint();
       }
       if (s === "r") return refresh(true);
       if (mode === "log") {
         if (s === "\x1b") return closeLog(); // Esc → close the panel (lone ESC, not an arrow)
-        // ↑↓ SCROLL the log (what you're reading) — PLAIN arrows, reliable everywhere
-        // (macOS Terminal eats Shift+arrows for its own scrollback, so those never
-        // arrive). j/k still WALK the fleet (panel follows when filtered) so the
-        // master-detail model is preserved for power users. Space/b and PgUp/PgDn
-        // (Fn+↑↓ on a Mac) page.
-        if (s === "\x1b[A") return logScroll(1); // ↑ — older
-        if (s === "\x1b[B") return logScroll(-1); // ↓ — newer
+        // ↑↓ move the › message CURSOR (plain arrows, reliable everywhere — macOS
+        // Terminal eats Shift+arrows for its own scrollback). ↑ = older, ↓ = newer;
+        // the window follows. Space/b + PgUp/PgDn (Fn+↑↓ on a Mac) page the cursor.
+        // j/k still WALK the fleet (panel follows when filtered). `w` expands the
+        // cursor'd message's full body.
+        if (s === "\x1b[A") return logCursorMove(1); // ↑ — older
+        if (s === "\x1b[B") return logCursorMove(-1); // ↓ — newer
         if (s === "k") return move(-1); // walk the fleet up (panel follows when filtered)
         if (s === "j") return move(1); // walk the fleet down
-        if (s === " " || s === "\x1b[6~") return logScroll(-logPageSize()); // Space/PgDn — page newer
-        if (s === "b" || s === "\x1b[5~") return logScroll(logPageSize()); // b/PgUp — page older
+        if (s === " " || s === "\x1b[6~") return logCursorMove(-logCursorPage()); // page newer
+        if (s === "b" || s === "\x1b[5~") return logCursorMove(logCursorPage()); // page older
         if (s === "\r" || s === "\n") return doJump(); // jump to the selected agent
         if (s === "w") {
-          logFull = !logFull; // toggle full word-wrap vs snippet
-          logOffset = 0;
+          logExpanded = !logExpanded; // expand/collapse the cursor'd message's full body
           return paint();
         }
         if (s === "f") {
           logFilterSelf = !logFilterSelf;
-          logOffset = 0;
+          logCursorFromEnd = 0; // re-anchor on the latest of the new view
+          logExpanded = false;
           return paint();
         }
         if (s === "m") return startCompose(); // compose to the selected agent
@@ -877,12 +870,12 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       }
       if (s === "m") return startCompose();
       if (s === "w") {
-        // item 4: open the selected row's full per-agent thread (filtered + full
-        // bodies) in the bottom log panel. ↑↓ then walks agents, the panel follows.
+        // item 4: open the selected agent's thread (filtered) in the bottom panel,
+        // cursor on its latest message. ↑↓ then move the cursor; w expands it.
         if (selectedIndex() < 0) return;
         logFilterSelf = true;
-        logFull = true;
-        logOffset = 0;
+        logCursorFromEnd = 0;
+        logExpanded = false;
         mode = "log";
         return paint();
       }

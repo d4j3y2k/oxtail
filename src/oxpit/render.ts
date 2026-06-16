@@ -441,6 +441,7 @@ export type CommsRenderOptions = RenderOptions & {
   nowSec?: number; // for relative ages; defaults to the wall clock
   expandedId?: string; // message_id to render with its FULL body (single expand)
   full?: boolean; // render EVERY message's body word-wrapped (TUI `w` toggle)
+  cursorId?: string; // message_id to mark with a › cursor + brightened head (TUI nav)
 };
 
 // The per-message comms lines (NO header). Each message is one snippet line by
@@ -470,18 +471,22 @@ export function commsBodyLines(
     else if (m.reply_to) mark = "↩";
     else if (m.request_id) mark = "❓";
     const markStr = mark ? ` ${mark}` : "";
-    const head = `  ${cell(age, 4)} ${fromLabel(m)} → ${name(m.to_session_id)}${markStr}: `;
+    // The cursor'd message (TUI nav) gets a › marker in place of the leading space +
+    // a brightened (non-dim) head so the eye lands on the selected message.
+    const isCursor = opts.cursorId != null && m.message_id === opts.cursorId;
+    const head = `${isCursor ? "›" : " "} ${cell(age, 4)} ${fromLabel(m)} → ${name(m.to_session_id)}${markStr}: `;
+    const headCodes: string[] = isCursor ? [C.cyan, C.bold] : [C.dim];
     // Message bodies are UNTRUSTED peer text — scrub the ESC/C0/C1/bidi injection
     // vector before render (clip/clipToWidth only handle whitespace + width).
     const safeBody = scrubBufferText(m.body, false);
     if (opts.full || m.message_id === opts.expandedId) {
       const body = safeBody.replace(/\s+/g, " ").trim();
-      out.push(clipToWidth(paint(head, C.dim), width));
+      out.push(clipToWidth(paint(head, ...headCodes), width));
       for (const seg of wrap(body, width - 4)) out.push(clipToWidth("    " + seg, width));
     } else {
       const remaining = width - head.length - 1;
       const snippet = remaining >= 8 ? clip(safeBody, remaining) : "";
-      out.push(clipToWidth(paint(head, C.dim) + snippet, width));
+      out.push(clipToWidth(paint(head, ...headCodes) + snippet, width));
     }
   }
   return out;
