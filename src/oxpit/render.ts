@@ -5,6 +5,7 @@
 
 import { cell, clip, clipToWidth, displayWidth, fmtAge } from "./format.js";
 import type { FleetAgent, FleetSnapshot, Liveness } from "./snapshot.js";
+import type { ToolKind } from "./activity.js";
 import type { CommsMessage } from "./comms.js";
 
 const C = {
@@ -58,6 +59,47 @@ function livenessColor(l: Liveness): string {
   return l === "active" ? C.green : l === "idle" ? C.yellow : C.gray;
 }
 
+// Tool-family glyphs for the live activity badge. Deliberately 1-column text-
+// presentation symbols (NOT emoji w/ VS16) so displayWidth counts them right and
+// no line under-measures and wraps — clipToWidth remains the backstop regardless.
+const TOOL_GLYPH: Record<ToolKind, string> = {
+  oxtail: "↔",
+  bash: "⚙",
+  edit: "✎",
+  read: "▤",
+  search: "⌕",
+  web: "↗",
+  task: "⎇",
+  plan: "☰",
+  tool: "•",
+};
+
+function toolColor(k: ToolKind): string {
+  switch (k) {
+    case "oxtail":
+      return C.cyan;
+    case "bash":
+      return C.blue;
+    case "edit":
+      return C.magenta;
+    case "search":
+      return C.yellow;
+    case "web":
+      return C.green;
+    case "task":
+      return C.cyan;
+    default:
+      return C.gray;
+  }
+}
+
+// Display label for the "tool" (unknown family) bucket: strip an mcp__ prefix and
+// take the last path segment so a raw "mcp__foo__do_thing" reads as "thing".
+function shortRawTool(raw: string): string {
+  const tail = raw.replace(/^mcp__/, "").split(/[._]/).filter(Boolean).pop() ?? raw;
+  return tail.length > 12 ? tail.slice(0, 12) : tail;
+}
+
 // "active 4s" / "idle 3m" / "dead·pid-reused". Raw age always shown — the glyph is
 // never the only signal.
 function statusText(a: FleetAgent): string {
@@ -83,6 +125,14 @@ function badges(
     parts.push(painted);
     len += displayWidth(raw) + 1; // +1 for the joining space; width-aware (emoji=2)
   };
+  // Live tool sub-state FIRST — "what it's doing right now". Bright (family color +
+  // bold) while the call is in-flight; dim once it has returned ("last did X").
+  if (a.activity) {
+    const act = a.activity;
+    const label = act.tool === "tool" ? shortRawTool(act.tool_raw) : act.tool;
+    const raw = `${TOOL_GLYPH[act.tool]}${label}${act.tool_running ? "…" : ""}`;
+    add(raw, paint(raw, ...(act.tool_running ? [toolColor(act.tool), C.bold] : [C.dim])));
+  }
   if (a.unread > 0) {
     const raw = `✉${a.unread}${a.unread_confidence === "low" ? "?" : ""}`;
     add(raw, paint(raw, C.cyan, C.bold));

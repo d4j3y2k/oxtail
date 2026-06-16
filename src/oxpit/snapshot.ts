@@ -42,6 +42,7 @@ import {
 import { defaultPendingAskDir, listLivePendingAsks } from "../pending-ask.js";
 import { inferProjectRoot, pathBelongsToProjectScope, safeRealpath } from "../scope.js";
 import { paneWindowNames } from "./jump.js";
+import { scanLatestTool, type AgentActivity } from "./activity.js";
 
 function envPosInt(name: string, def: number, env: NodeJS.ProcessEnv = process.env): number {
   const v = env[name];
@@ -129,6 +130,13 @@ export type FleetAgent = {
   purpose_stale: boolean; // caption older than last activity ⇒ probably outdated
   possibly_stalled: boolean; // declared work but transcript cold ⇒ likely hung
 
+  // Transcript path (display/activity only; jump RE-RESOLVES identity separately).
+  transcript_path: string | null;
+  // Real-time read-class sub-state: the latest tool the agent invoked + whether
+  // it's still running. Populated only when buildSnapshot's readActivity flag is
+  // set (a bounded transcript-tail read); null otherwise / for dead agents.
+  activity: AgentActivity | null;
+
   // Work badges (independent; can coexist).
   unread: number;
   unread_confidence: Confidence;
@@ -169,6 +177,11 @@ export type BuildSnapshotOptions = {
   // Run the per-agent proc_sig pid-reuse check (one `ps` per agent). Default true.
   // The TUI can disable it on fast fs-watch ticks and refresh it on a slow tick.
   checkProcSig?: boolean;
+  // Read each agent's bounded transcript tail for the latest-tool sub-state badge
+  // (FleetAgent.activity). Default FALSE — a read-class cost mirroring checkProcSig:
+  // the TUI enables it on the slow tick + `oxtail status` enables it, but the 200ms
+  // fast fs-debounce leaves it off so unrelated mailbox events stay cheap.
+  readActivity?: boolean;
   // Correlate pending-ask request_ids against ledgers to resolve wait targets.
   // Default true; set false to skip the (cheap, bounded) ledger scan.
   resolveWaitTargets?: boolean;
@@ -360,6 +373,7 @@ type AgentCtx = {
   selfSessionId: string | null;
   pending: Map<string, PendingAsk>;
   checkProcSig: boolean;
+  readActivity: boolean;
   windowNames: Map<string, string>;
 };
 
@@ -450,6 +464,20 @@ function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
     }
   }
 
+  // Read-class real-time sub-state (latest tool + running). Bounded transcript-tail
+  // read, gated by readActivity. Skipped for dead agents — a dead agent's last
+  // tool_use often has no result (died mid-call) and would render a misleading
+  // "running" badge; the ⚫ glyph already tells that story.
+  const transcriptPath = e.client.transcript_path ?? null;
+  let activity: AgentActivity | null = null;
+  if (ctx.readActivity && transcriptPath && liveness !== "dead") {
+    try {
+      activity = scanLatestTool(transcriptPath, e.client.type);
+    } catch {
+      activity = null; // tail read failed — leave the badge off
+    }
+  }
+
   const pend = sid ? ctx.pending.get(sid) : undefined;
   const waiting: WaitEdge | null = pend
     ? {
@@ -478,6 +506,8 @@ function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
     purpose_age_s: purposeAgeS,
     purpose_stale: purposeStale,
     possibly_stalled: possiblyStalled,
+    transcript_path: transcriptPath,
+    activity,
     unread,
     unread_confidence: unreadConfidence,
     open_work: openWork,
@@ -540,6 +570,7 @@ export function buildSnapshot(opts: BuildSnapshotOptions = {}): FleetSnapshot {
         null;
   const activeWindowS = opts.activeWindowS ?? ACTIVE_WINDOW_S;
   const checkProcSig = opts.checkProcSig ?? true;
+  const readActivity = opts.readActivity ?? false;
   const warnings: string[] = [];
 
   let entries: RegistryEntry[];
@@ -596,6 +627,7 @@ export function buildSnapshot(opts: BuildSnapshotOptions = {}): FleetSnapshot {
     selfSessionId,
     pending,
     checkProcSig,
+    readActivity,
     windowNames,
   };
 

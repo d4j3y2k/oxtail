@@ -59,6 +59,31 @@ export function displayWidth(s: string): number {
   return w;
 }
 
+// Strip terminal-dangerous characters from text that will be rendered RAW and/or
+// sent VERBATIM to a peer (the TUI compose buffer, an ⌃X-restored attachment path,
+// captured pane text). The one shared sanitizer — every untrusted-text path funnels
+// through here so a hostile filename / pane line (ANSI/C0/C1/bidi/zero-width) can't
+// corrupt the operator's terminal or reach a peer's context. Newlines survive only
+// when keepNewline (a multi-line paste or an explicit newline key).
+export function scrubBufferText(s: string, keepNewline: boolean): string {
+  let out = "";
+  for (const ch of s) {
+    if (keepNewline && ch === "\n") {
+      out += ch;
+      continue;
+    }
+    const c = ch.codePointAt(0) ?? 0;
+    if (c < 0x20 || c === 0x7f || (c >= 0x80 && c <= 0x9f)) continue; // C0 / DEL / C1
+    if (c >= 0x200b && c <= 0x200f) continue; // zero-width + bidi marks
+    if (c === 0x2028 || c === 0x2029) continue; // line / paragraph separators
+    if (c >= 0x202a && c <= 0x202e) continue; // bidi embeddings / overrides
+    if (c >= 0x2066 && c <= 0x2069) continue; // bidi isolates
+    if (c === 0xfeff) continue; // BOM / zero-width no-break space
+    out += ch;
+  }
+  return out;
+}
+
 // Truncate a (possibly ANSI-colored) string to at most `width` display columns,
 // preserving escape sequences and closing any open SGR with a reset. The TUI's
 // safety net against wrap: every physical line is passed through this before the

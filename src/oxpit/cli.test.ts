@@ -29,6 +29,11 @@ test("parseStatusArgs: defaults", () => {
   assert.equal(a.all, false);
   assert.equal(a.width, undefined);
   assert.equal(a.project, undefined);
+  assert.equal(a.noActivity, false); // real-time activity ON by default
+});
+
+test("parseStatusArgs: --no-activity", () => {
+  assert.equal(parseStatusArgs(["--no-activity"]).noActivity, true);
 });
 
 test("parseStatusArgs: flags", () => {

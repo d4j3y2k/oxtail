@@ -23,6 +23,7 @@ export type StatusArgs = {
   log: boolean; // append the comms-log (cross-fleet message feed)
   limit: number | undefined; // comms-log message cap (-n / --limit)
   check: boolean; // exit nonzero on fleet trouble (scriptable health probe)
+  noActivity: boolean; // skip the real-time tool/activity reads (cheaper one-shot)
   help: boolean;
 };
 
@@ -42,6 +43,7 @@ status flags:
   --log [-n N]        append the cross-fleet comms-log (recent message tail)
   --check             exit ${CHECK_TROUBLE_CODE} on fleet trouble (live deadlock /
                       orphaned wait / work stranded on a dead owner); else 0
+  --no-activity       skip the real-time tool sub-state reads (cheaper)
   --color | --no-color
   --all               include agents from every project, not just this one
   --width N           override output width
@@ -63,6 +65,7 @@ export function parseStatusArgs(argv: string[]): StatusArgs {
     log: false,
     limit: undefined,
     check: false,
+    noActivity: false,
     help: false,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -74,6 +77,9 @@ export function parseStatusArgs(argv: string[]): StatusArgs {
         break;
       case "--check":
         a.check = true;
+        break;
+      case "--no-activity":
+        a.noActivity = true;
         break;
       case "--json":
         a.json = true;
@@ -129,7 +135,11 @@ export function runStatus(
     out(USAGE);
     return 0;
   }
-  const snap = buildSnapshot({ allProjects: a.all, projectRoot: a.project });
+  const snap = buildSnapshot({
+    allProjects: a.all,
+    projectRoot: a.project,
+    readActivity: !a.noActivity, // real-time tool sub-state badges (on by default)
+  });
   const limit = a.limit && Number.isFinite(a.limit) && a.limit > 0 ? a.limit : DEFAULT_LOG_LIMIT;
   // --check: a HARD fleet problem (live deadlock / orphaned wait / dead-owner
   // stranded work) makes the one-shot a scriptable health probe. Soft signals

@@ -17,7 +17,8 @@ import { dirname, join } from "node:path";
 import { buildSnapshot, type FleetAgent, type FleetSnapshot } from "./snapshot.js";
 import { attentionLine, commsBodyLines, computeAgentLabels, renderSnapshot } from "./render.js";
 import { buildCommsLog, type CommsMessage } from "./comms.js";
-import { clipToWidth } from "./format.js";
+import { agentKey, type AgentActivity } from "./activity.js";
+import { clipToWidth, scrubBufferText } from "./format.js";
 import { jumpToAgent } from "./jump.js";
 import { NUDGE_TEXT, sendOperatorMessage } from "./operator.js";
 import { formatAttachmentNote, stageAttachment, type StagedAttachment } from "./attachments.js";
@@ -41,35 +42,6 @@ const DEBOUNCE_MS = 200;
 const SLOW_TICK_MS = 1500;
 const MAX_WAIT_ROWS = 8;
 const LOG_FETCH = 200; // comms messages pulled for the log view (windowed to fit)
-
-function agentKey(a: FleetAgent): string {
-  return a.session_id ?? `pid:${a.server_pid}`;
-}
-
-// Strip terminal-dangerous chars from any text admitted into the compose buffer. The
-// buffer is rendered RAW and sent VERBATIM to the peer, so it is the one place a
-// pasted/⌃X-restored hostile filename (ANSI/C0/C1/bidi/zero-width) could corrupt the
-// operator's terminal OR reach a peer's context (compile-sim F2/F3). Every input path
-// (typed key, paste, attachment-undo) funnels through here. Newlines survive only
-// when keepNewline (a multi-line paste or an explicit newline key).
-function scrubBufferText(s: string, keepNewline: boolean): string {
-  let out = "";
-  for (const ch of s) {
-    if (keepNewline && ch === "\n") {
-      out += ch;
-      continue;
-    }
-    const c = ch.codePointAt(0) ?? 0;
-    if (c < 0x20 || c === 0x7f || (c >= 0x80 && c <= 0x9f)) continue; // C0 / DEL / C1
-    if (c >= 0x200b && c <= 0x200f) continue; // zero-width + bidi marks
-    if (c === 0x2028 || c === 0x2029) continue; // line / paragraph separators
-    if (c >= 0x202a && c <= 0x202e) continue; // bidi embeddings / overrides
-    if (c >= 0x2066 && c <= 0x2069) continue; // bidi isolates
-    if (c === 0xfeff) continue; // BOM / zero-width no-break space
-    out += ch;
-  }
-  return out;
-}
 
 function clientFlag(argv: string[]): string | undefined {
   for (let i = 0; i < argv.length; i++) {
@@ -114,6 +86,10 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     let snapshot: FleetSnapshot = buildSnapshot({ ...opts.buildOpts });
     let selectedKey: string | null =
       snapshot.agents.length > 0 ? agentKey(snapshot.agents[0]) : null;
+    // Last-known tool sub-state per agent. The slow tick (readActivity) refreshes it
+    // for the whole fleet; the cheap 200ms fast ticks (readActivity off) reuse it so
+    // the badge stays steady instead of flickering off on an unrelated mailbox event.
+    let activityCache = new Map<string, AgentActivity | null>();
     let status = "";
     let statusUntil = 0;
     let debounceTimer: NodeJS.Timeout | null = null;
@@ -361,7 +337,18 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     }
 
     function refresh(full: boolean): void {
-      snapshot = buildSnapshot({ ...opts.buildOpts, checkProcSig: full });
+      // readActivity rides the same `full` flag as checkProcSig: ON for the slow
+      // tick / forced refresh, OFF for the 200ms fast fs-debounce. On a full build
+      // we refresh the activity cache from the fresh reads; on a fast build we
+      // overlay the cache so badges persist (and don't flicker) between slow ticks.
+      snapshot = buildSnapshot({ ...opts.buildOpts, checkProcSig: full, readActivity: full });
+      if (full) {
+        activityCache = new Map(snapshot.agents.map((a) => [agentKey(a), a.activity]));
+      } else {
+        for (const a of snapshot.agents) {
+          if (a.activity == null) a.activity = activityCache.get(agentKey(a)) ?? null;
+        }
+      }
       reconcileSelection();
       paint();
     }

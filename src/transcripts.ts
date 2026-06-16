@@ -177,14 +177,66 @@ function splitBufferByNewline(buf: Buffer): Buffer[] {
   return out;
 }
 
-// Reverse-tail reader: walk the file backward in chunks, decoding only complete
-// lines, until we've collected `limit` messages or reached the start of file.
-// `parseLine` is the same per-line→message logic the full-scan path uses, so the
-// returned messages are byte-identical to a full scan; only the SCAN STRATEGY
-// differs. UTF-8 safety: incomplete leftmost lines are carried as raw BYTES and
-// only decoded once a newline to their left completes them (or BOF is reached),
-// so a multi-byte char split across a chunk boundary is always reassembled
-// before decoding.
+// Generic reverse-tail LINE scanner: walk a file backward in chunks, decode only
+// COMPLETE lines, and feed each to `onLine` NEWEST-FIRST until `onLine` returns
+// "stop" or the start of file is reached. The single source of truth for reverse-
+// tail byte reading — readTailScan rides it, and so does oxpit's activity tool-tail
+// scan, so there is exactly ONE reverse byte reader (no reimplemented parsing).
+// UTF-8 safety: an incomplete leftmost line is carried as raw BYTES and only
+// decoded once a newline to its left completes it (or BOF is reached), so a multi-
+// byte char split across a chunk boundary is always reassembled before decoding.
+// Returns reachedBOF — true iff the scan consumed the whole file without `onLine`
+// ever signalling stop (the caller's "did I see everything?" exactness signal).
+export function scanTailLines(
+  path: string,
+  onLine: (line: string) => "stop" | "continue",
+  opts: { chunkSize?: number } = {},
+): { reachedBOF: boolean } {
+  const chunkSize = Math.max(
+    MIN_CHUNK_SIZE,
+    Math.floor(finiteOr(opts.chunkSize, DEFAULT_CHUNK_SIZE)),
+  );
+  let stopped = false;
+  const fd = openSync(path, "r");
+  try {
+    let pos = fstatSync(fd).size;
+    let leftover = Buffer.alloc(0); // bytes of the not-yet-complete leftmost line
+    while (pos > 0 && !stopped) {
+      const readSize = Math.min(chunkSize, pos);
+      pos -= readSize;
+      const chunk = Buffer.allocUnsafe(readSize);
+      readSync(fd, chunk, 0, readSize, pos);
+      const buf = Buffer.concat([chunk, leftover]);
+      const segments = splitBufferByNewline(buf);
+      // segments[0] is the new leftmost partial (extends further left, unless we
+      // reach BOF next); copy it so we don't retain the whole `buf`.
+      leftover = Buffer.from(segments[0]);
+      // segments[1..] are complete lines; process right→left so newest first.
+      for (let i = segments.length - 1; i >= 1; i--) {
+        const line = segments[i].toString("utf8");
+        if (!line) continue;
+        if (onLine(line) === "stop") {
+          stopped = true;
+          break;
+        }
+      }
+    }
+    // Consumed the whole file without ever stopping → the final leftover is the
+    // file's first line; process it so a full scan accounts for every line.
+    if (!stopped && pos === 0) {
+      const line = leftover.toString("utf8");
+      if (line && onLine(line) === "stop") stopped = true;
+    }
+    return { reachedBOF: pos === 0 && !stopped };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+// Reverse-tail reader: collect up to `limit` parsed messages from the END of the
+// file. `parseLine` is the same per-line→message logic the full-scan path uses, so
+// the returned messages are byte-identical to a full scan; only the SCAN STRATEGY
+// differs. Rides scanTailLines for the byte-level reverse walk.
 function readTailScan(
   path: string,
   parseLine: (line: string) => TranscriptMessage | null,
@@ -209,46 +261,21 @@ function readTailScan(
   // out mid-chunk having skipped older messages. The total is exact only when we
   // never capped — i.e. we accounted for every message in the file.
   let hitLimit = false;
-  const fd = openSync(path, "r");
-  try {
-    let pos = fstatSync(fd).size;
-    let leftover = Buffer.alloc(0); // bytes of the not-yet-complete leftmost line
-    while (pos > 0 && !hitLimit) {
-      const readSize = Math.min(chunkSize, pos);
-      pos -= readSize;
-      const chunk = Buffer.allocUnsafe(readSize);
-      readSync(fd, chunk, 0, readSize, pos);
-      const buf = Buffer.concat([chunk, leftover]);
-      const segments = splitBufferByNewline(buf);
-      // segments[0] is the new leftmost partial (extends further left, unless we
-      // reach BOF next); copy it so we don't retain the whole `buf`.
-      leftover = Buffer.from(segments[0]);
-      // segments[1..] are complete lines; process right→left so newest first.
-      for (let i = segments.length - 1; i >= 1; i--) {
-        const line = segments[i].toString("utf8");
-        if (!line) continue;
-        const m = parseLine(line);
-        if (m) {
-          newestFirst.push(m);
-          if (newestFirst.length >= limit) {
-            hitLimit = true;
-            break;
-          }
+  scanTailLines(
+    path,
+    (line) => {
+      const m = parseLine(line);
+      if (m) {
+        newestFirst.push(m);
+        if (newestFirst.length >= limit) {
+          hitLimit = true;
+          return "stop";
         }
       }
-    }
-    // Consumed the whole file without ever capping → the final leftover is the
-    // file's first line; process it so the count is complete and exact.
-    if (!hitLimit && pos === 0) {
-      const line = leftover.toString("utf8");
-      if (line) {
-        const m = parseLine(line);
-        if (m) newestFirst.push(m);
-      }
-    }
-  } finally {
-    closeSync(fd);
-  }
+      return "continue";
+    },
+    { chunkSize },
+  );
 
   const exact = !hitLimit; // every message accounted for iff we never capped
   const chronological = newestFirst.slice().reverse();

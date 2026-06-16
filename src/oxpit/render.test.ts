@@ -28,6 +28,8 @@ function agent(partial: Partial<FleetAgent>): FleetAgent {
     purpose_age_s: null,
     purpose_stale: false,
     possibly_stalled: false,
+    transcript_path: null,
+    activity: null,
     unread: 0,
     unread_confidence: "high",
     open_work: 0,
@@ -461,4 +463,37 @@ test("render: color codes only when enabled", () => {
   const colored = renderSnapshot(snap([agent({ liveness: "active" })]), { color: true });
   assert.ok(!plain.includes("\x1b["), "plain output has no ANSI codes");
   assert.ok(colored.includes("\x1b["), "colored output has ANSI codes");
+});
+
+// ── live tool-activity badge ────────────────────────────────────────────────────
+test("activity badge: running tool renders glyph+label+ellipsis", () => {
+  const out = renderSnapshot(
+    snap([agent({ activity: { tool: "bash", tool_raw: "Bash", tool_running: true } })]),
+    { color: false, width: 120 },
+  );
+  assert.ok(out.includes("⚙bash…"), `expected running bash badge, got:\n${out}`);
+});
+
+test("activity badge: completed tool drops the ellipsis", () => {
+  const out = renderSnapshot(
+    snap([agent({ activity: { tool: "oxtail", tool_raw: "mcp__oxtail__ask_peer", tool_running: false } })]),
+    { color: false, width: 120 },
+  );
+  assert.ok(out.includes("↔oxtail"), `expected oxtail badge, got:\n${out}`);
+  assert.ok(!out.includes("↔oxtail…"), "completed tool must not show the running ellipsis");
+});
+
+test("activity badge: unknown tool family shows shortened raw name", () => {
+  const out = renderSnapshot(
+    snap([agent({ activity: { tool: "tool", tool_raw: "mcp__foo__do_thing", tool_running: true } })]),
+    { color: false, width: 120 },
+  );
+  assert.ok(out.includes("•thing…"), `expected shortened unknown-tool badge, got:\n${out}`);
+});
+
+test("activity badge: absent when no activity", () => {
+  const out = renderSnapshot(snap([agent({ activity: null })]), { color: false, width: 120 });
+  for (const g of ["⚙", "↔", "✎", "▤", "⌕", "↗", "⎇", "☰"]) {
+    assert.ok(!out.includes(g), `unexpected tool glyph ${g} with no activity`);
+  }
 });
