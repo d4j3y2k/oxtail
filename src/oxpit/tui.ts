@@ -172,7 +172,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "                attach: drag a file then ⌃A · ⌃V pastes a clipboard image (copy then ⌃V)",
         "  l             toggle the comms-log bottom panel (fleet stays visible above)",
         "  w             open the selected agent's full thread in the panel (per-agent)",
-        "                in the panel: ↑↓ walk agents · PgUp/PgDn/Space scroll · w full · f filter · ⏎ jump",
+        "                in the panel: ↑↓ walk agents · ⇧↑↓ scroll (or PgUp/PgDn) · w full · f filter · ⏎ jump",
         "  r             force refresh    ?  toggle help    q / Ctrl-C  quit",
         "",
         d("  🟢 active   🟡 idle   ⚫ dead (exited / pid-reused)"),
@@ -330,7 +330,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       const d = (s: string) => dim(s, opts.color);
       const sep = d("─".repeat(Math.max(4, width)));
       const footerKeys = d(
-        `  ↑↓ move · PgUp/PgDn scroll · w ${logFull ? "snippet" : "full"} · f filter${logFilterSelf ? "*" : ""} · ⏎ jump · l global · Esc close`,
+        `  ↑↓ move · ⇧↑↓ scroll · w ${logFull ? "snippet" : "full"} · f filter${logFilterSelf ? "*" : ""} · ⏎ jump · l global · Esc close`,
       );
       const { bySession } = computeAgentLabels(snapshot.agents);
       let comms: CommsMessage[] = buildCommsLog(snapshot.agents, { limit: LOG_FETCH });
@@ -836,9 +836,12 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (s === "r") return refresh(true);
       if (mode === "log") {
         if (s === "\x1b") return closeLog(); // Esc → close the panel (lone ESC, not an arrow)
-        // ↑↓ MOVE the fleet selection (panel follows it when filtered, item 4); history
-        // scrolls with PgUp/PgDn (the expected content-scroll keys), Space/b page, and
-        // [ / ] line-scroll — so reaching for ↑ to read up can't silently swap threads.
+        // ↑↓ MOVE the fleet selection (panel follows it when filtered, item 4). History
+        // scrolls with ⇧↑/⇧↓ — the primary, laptop-friendly scroll (Mac has no real
+        // PgUp/PgDn) — plus PgUp/PgDn, Space/b (page), and [ / ] (line). So reaching
+        // for plain ↑ to read up can't silently swap threads.
+        if (s === "\x1b[1;2A") return logScroll(logPageSize()); // Shift+Up — older
+        if (s === "\x1b[1;2B") return logScroll(-logPageSize()); // Shift+Down — newer
         if (s === "\x1b[A" || s === "k") return move(-1);
         if (s === "\x1b[B" || s === "j") return move(1);
         if (s === "\x1b[5~" || s === "b") return logScroll(logPageSize()); // PgUp — older

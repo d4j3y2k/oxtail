@@ -67,15 +67,18 @@ const SELECT_BG = "\x1b[48;5;238m";
 // mis-measure; TUNE the glyphs/cadence to taste. Active = an energetic pulse
 // (alternating heavy/light angle brackets); idle = a gentle twinkle (brackets fade
 // to spaces and back). Each entry is [left, right]; phase = animFrame % length.
+// ACTIVE = a lively, out-of-phase star shimmer (the two sides twinkle slightly out
+// of sync so it reads as alive). IDLE = a soft sparkle that blinks and then rests.
+// All EAW-Neutral dingbats (1-col). Tune freely — this is the cute knob.
 const FRAME_ACTIVE: [string, string][] = [
-  ["❰", "❱"],
-  ["❮", "❯"],
-  ["❰", "❱"],
-  ["❮", "❯"],
+  ["✶", "✸"],
+  ["✷", "✹"],
+  ["✸", "✺"],
+  ["✹", "✶"],
 ];
 const FRAME_IDLE: [string, string][] = [
-  ["❮", "❯"],
-  ["❮", "❯"],
+  ["✦", "✦"],
+  ["✧", "✧"],
   [" ", " "],
   [" ", " "],
 ];
