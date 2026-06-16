@@ -22,6 +22,18 @@ export const OPERATOR_SOURCE = "oxpit";
 export const NUDGE_TEXT =
   "Operator nudge from oxpit — check your mailbox (read_my_messages) and your current state/work.";
 
+// The wake line typed into the target's pane for an operator message. Unlike a peer
+// wake (the generic "read_my_messages" nudge), this shows the operator's CONTENT so
+// it reads like a direct message in the agent's session. Single-line (newlines
+// would submit early in the agent's prompt) + truncated; the FULL body is delivered
+// to the mailbox and remains in the comms-log.
+const WAKE_PREVIEW_MAX = 240;
+export function operatorWakeText(body: string): string {
+  const oneLine = body.replace(/\s+/g, " ").trim();
+  const preview = oneLine.length > WAKE_PREVIEW_MAX ? oneLine.slice(0, WAKE_PREVIEW_MAX) + "…" : oneLine;
+  return `oxpit msg: ${preview}`;
+}
+
 // Persistent per-target operator-wake throttle. oxpit may be a short-lived CLI, so
 // the in-memory wakePeer debounce doesn't survive across invocations; this guards
 // against accidental/scripted wake storms to one target. mtime is the source of
@@ -103,7 +115,7 @@ export type SendDeps = {
   // injectable for tests
   resolveEntry?: (t: OperatorTarget) => RegistryEntry | null;
   deliver?: typeof deliverToPeer;
-  wake?: (peer: RegistryEntry) => Promise<WakeStatus>;
+  wake?: (peer: RegistryEntry, wakeText?: string) => Promise<WakeStatus>;
 };
 
 // Send one human-authorized operator message to a target agent. wake defaults on
@@ -154,7 +166,9 @@ export async function sendOperatorMessage(
   } else if (recentlyWoken(entry.client.session_id, nowMs)) {
     wake_status = "skipped_throttled";
   } else {
-    wake_status = await wake(entry);
+    // Wake carries the message content ("oxpit msg: …") so it shows in the target's
+    // pane, unlike the generic peer read_my_messages nudge.
+    wake_status = await wake(entry, operatorWakeText(body));
     // Stamp the throttle ONLY when the wake actually fired, so a failed/no-target
     // wake leaves the door open for a retry.
     if (wake_status === "fired") stampWake(entry.client.session_id, nowMs);

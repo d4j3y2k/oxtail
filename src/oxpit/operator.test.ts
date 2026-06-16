@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import type { Mailbox } from "../mailbox.js";
 import type { RegistryEntry } from "../registry.js";
-import { sendOperatorMessage, type OperatorTarget } from "./operator.js";
+import { operatorWakeText, sendOperatorMessage, type OperatorTarget } from "./operator.js";
 
 // Async-aware HOME isolation (the wake-throttle writes under ~/.oxtail).
 async function withHome<T>(fn: (home: string) => Promise<T> | T): Promise<T> {
@@ -81,6 +81,32 @@ test("sendOperatorMessage: delivers as origin=operator with NO from_session_id",
     assert.equal(calls[0].options.operator_source, "oxpit");
     assert.equal(calls[0].route.session_id, "s1");
     assert.equal(calls[0].route.session_keyed, true);
+  });
+});
+
+test("operatorWakeText: single-line 'oxpit msg:' preview, newlines flattened, truncated", () => {
+  assert.equal(operatorWakeText("hello world"), "oxpit msg: hello world");
+  assert.equal(operatorWakeText("multi\nline\nmsg"), "oxpit msg: multi line msg");
+  const t = operatorWakeText("x".repeat(300));
+  assert.ok(t.startsWith("oxpit msg: "));
+  assert.ok(t.endsWith("…"));
+  assert.ok(t.length < 300, "truncated");
+});
+
+test("sendOperatorMessage: wake receives the oxpit-msg content line", async () => {
+  await withHome(async () => {
+    let wakeText: string | undefined;
+    const r = await sendOperatorMessage(TARGET, "ping the team", {}, {
+      resolveEntry: () => entry(),
+      deliver: captureDeliver().deliver,
+      wake: async (_p, t) => {
+        wakeText = t;
+        return "fired";
+      },
+      nowMs: 1000,
+    });
+    assert.equal(r.ok, true);
+    assert.equal(wakeText, "oxpit msg: ping the team");
   });
 });
 
