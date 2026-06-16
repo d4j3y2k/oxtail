@@ -138,15 +138,9 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       }
     }
 
+    // Fleet-mode footer keys (log mode carries its own footer inside the panel).
     function footer(): string {
-      let keys: string;
-      if (mode === "log") {
-        const pos = logOffset === 0 ? "live" : `↑${logOffset}`;
-        const filt = logFilterSelf ? " (on)" : "";
-        keys = `↑↓ scroll  w ${logFull ? "snippet" : "full"}  f filter${filt}  l/Esc fleet  q quit  [${pos}]`;
-      } else {
-        keys = "↑↓ move  ⏎ jump  n nudge  m message  l log  r refresh  ? help  q quit";
-      }
+      const keys = "↑↓ move  ⏎ jump  n nudge  m msg  l log  w thread  r refresh  ? help  q quit";
       const now = Date.now();
       const msg = now < statusUntil && status ? "  " + status : "";
       return "\n" + dim("  " + keys, opts.color) + msg;
@@ -163,7 +157,9 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "  n             nudge the selected agent (canned operator message; y to confirm)",
         "  m             compose a message (Enter send · ⌥⏎/⌃J newline · ⌃X unattach · Esc cancel)",
         "                attach: drag a file then ⌃A · ⌃V pastes a clipboard image (copy then ⌃V)",
-        "  l             comms-log (fleet ⇄ log); in log: w full-text · f filter · ↑↓ scroll",
+        "  l             toggle the comms-log bottom panel (fleet stays visible above)",
+        "  w             open the selected agent's full thread in the panel (per-agent)",
+        "                in the panel: ↑↓ walk agents · [ ] scroll · w full · f filter · ⏎ jump",
         "  r             force refresh    ?  toggle help    q / Ctrl-C  quit",
         "",
         d("  🟢 active   🟡 idle   ⚫ dead (exited / pid-reused)"),
@@ -285,6 +281,55 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       return out.join("\n");
     }
 
+    // Comms panel rendered as the BOTTOM region (item 3): a separator, the comms
+    // header, the windowed body (scroll-positioned by logOffset), and a footer of
+    // panel keys — EXACTLY `rows` lines so the caller can pin it to the foot with the
+    // fleet table above. `w`/`f` toggle full-text / selected-agent filter; when
+    // filtered it follows the live fleet selection (the per-agent thread, item 4).
+    function logPanelLines(width: number, rows: number): string[] {
+      const d = (s: string) => dim(s, opts.color);
+      const sep = d("─".repeat(Math.max(4, width)));
+      const footerKeys = d(
+        `  ↑↓ move · [ ] scroll · w ${logFull ? "snippet" : "full"} · f filter${logFilterSelf ? "*" : ""} · ⏎ jump · l/Esc close`,
+      );
+      const { bySession } = computeAgentLabels(snapshot.agents);
+      let comms: CommsMessage[] = buildCommsLog(snapshot.agents, { limit: LOG_FETCH });
+      let filterNote = "";
+      if (logFilterSelf) {
+        const sel = snapshot.agents[selectedIndex()];
+        const sid = sel?.session_id;
+        if (sid) {
+          comms = comms.filter((m) => m.from_session_id === sid || m.to_session_id === sid);
+          filterNote = `  [${sel.window_name ?? sel.short_id}]`;
+        } else {
+          filterNote = "  [no agent selected]";
+        }
+      }
+      const bodyLines = commsBodyLines(comms, bySession, { color: opts.color, width, full: logFull });
+      logTotalLines = bodyLines.length;
+      // Fixed line budget: sep(1) + header(1) + up-marker(1) + body(avail) +
+      // down-marker(1) + footer(1) = avail + 5. Markers are always emitted (blank
+      // when nothing's hidden) so the panel is a constant `rows` lines — no desync.
+      const avail = Math.max(1, rows - 5);
+      logAvail = avail;
+      const maxOffset = Math.max(0, bodyLines.length - avail);
+      if (logOffset > maxOffset) logOffset = maxOffset;
+      const end = bodyLines.length - logOffset;
+      const start = Math.max(0, end - avail);
+      const header =
+        (opts.color ? "\x1b[1m\x1b[36mcomms\x1b[0m" : "comms") +
+        d(`  recent tail${logFull ? " · full" : ""}${filterNote}`);
+      const out: string[] = [sep, header];
+      out.push(start > 0 ? d(`  ↑ ${start} more`) : "");
+      const window = bodyLines.slice(start, end);
+      out.push(...window);
+      // pad the body region to `avail` so the footer pins to the bottom
+      for (let i = window.length; i < avail; i++) out.push("");
+      out.push(end < bodyLines.length ? d(`  ↓ ${bodyLines.length - end} more`) : "");
+      out.push(footerKeys);
+      return out;
+    }
+
     // Hard char-wrap a single logical line to `w` columns.
     function wrapText(s: string, w: number): string[] {
       if (w <= 0 || s.length <= w) return [s];
@@ -355,14 +400,26 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         stdout.write(HOME + [...top, ...bar].join("\n") + CLEAR_BELOW);
         return;
       }
-      const frame = (mode === "log" ? logFrame(width, rows) : fleetFrame(width, rows)) + footer();
+      const clipEOL = (l: string) => clipToWidth(l, width) + CLEAR_EOL;
+      if (mode === "log") {
+        // item 3: comms as a BOTTOM PANEL with the fleet table still visible above
+        // (the selection up top is the agent the per-agent thread follows). The panel
+        // is a constant height; the fleet gets the rest. Whole frame clamped to `rows`.
+        const panelRows = Math.max(7, Math.min(Math.floor(rows * 0.55), rows - 6));
+        const topAvail = Math.max(3, rows - panelRows);
+        const top = fleetFrame(width, topAvail).split("\n").slice(0, topAvail).map(clipEOL);
+        while (top.length < topAvail) top.push(CLEAR_EOL);
+        const panel = logPanelLines(width, rows - topAvail).map(clipEOL);
+        stdout.write(HOME + [...top, ...panel].slice(0, rows).join("\n") + CLEAR_BELOW);
+        return;
+      }
       // Clip every physical line to the terminal width (ANSI-aware) so none wraps —
       // a wrapped line would push the cursor-home repaint out of sync and corrupt
       // the screen. The renderers already clip their lines; this covers the footer
       // and is idempotent.
-      const body = frame
+      const body = (fleetFrame(width, rows) + footer())
         .split("\n")
-        .map((l) => clipToWidth(l, width) + CLEAR_EOL)
+        .map(clipEOL)
         .join("\n");
       stdout.write(HOME + body + CLEAR_BELOW);
     }
@@ -416,6 +473,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (idx < 0) idx = 0;
       idx = (idx + delta + snapshot.agents.length) % snapshot.agents.length;
       selectedKey = agentKey(snapshot.agents[idx]);
+      logOffset = 0; // tail the newly-selected agent's thread (item 4 follow-selection)
       paint();
       maybeCaptureSelected(true); // capture the newly-selected pane immediately
     }
@@ -705,9 +763,14 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (s === "l") return toggleLog();
       if (s === "r") return refresh(true);
       if (mode === "log") {
-        if (s === "\x1b") return toggleLog(); // Esc → back to fleet (lone ESC, not an arrow)
-        if (s === "\x1b[A" || s === "k") return logScroll(1); // older
-        if (s === "\x1b[B" || s === "j") return logScroll(-1); // newer
+        if (s === "\x1b") return toggleLog(); // Esc → close the panel (lone ESC, not an arrow)
+        // ↑↓ still MOVE the fleet selection (panel follows it when filtered, item 4);
+        // history scrolls with [ / ] so navigation and scrolling don't fight.
+        if (s === "\x1b[A" || s === "k") return move(-1);
+        if (s === "\x1b[B" || s === "j") return move(1);
+        if (s === "[") return logScroll(1); // older
+        if (s === "]") return logScroll(-1); // newer
+        if (s === "\r" || s === "\n") return doJump(); // jump to the selected agent
         if (s === "w") {
           logFull = !logFull; // toggle full word-wrap vs snippet
           logOffset = 0;
@@ -718,7 +781,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
           logOffset = 0;
           return paint();
         }
-        if (s === "m") return startCompose(); // compose to the filtered/selected agent
+        if (s === "m") return startCompose(); // compose to the selected agent
         return; // ignore other keys in log mode
       }
       // fleet mode
@@ -736,6 +799,16 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         );
       }
       if (s === "m") return startCompose();
+      if (s === "w") {
+        // item 4: open the selected row's full per-agent thread (filtered + full
+        // bodies) in the bottom log panel. ↑↓ then walks agents, the panel follows.
+        if (selectedIndex() < 0) return;
+        logFilterSelf = true;
+        logFull = true;
+        logOffset = 0;
+        mode = "log";
+        return paint();
+      }
       // ignore everything else
     }
 
