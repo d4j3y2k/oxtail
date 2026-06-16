@@ -392,6 +392,25 @@ test("fleetTrouble: counts deadlocks/orphaned/stranded, ignores live open_work",
   assert.equal(t.stalled, 1);
 });
 
+test("render: selected row gets a reverse-video highlight bar + ❯ (color on)", () => {
+  const out = renderSnapshot(
+    snap([agent({ short_id: "aaaa", session_id: "a" }), agent({ short_id: "bbbb", session_id: "b" })]),
+    { color: true, selected: 1, width: 100 },
+  );
+  const rows = out.split("\n").filter((l) => l.includes("\x1b[7m"));
+  assert.equal(rows.length, 1, "exactly one row is reverse-highlighted");
+  assert.match(rows[0], /❯/, "selected row carries the ❯ marker");
+});
+
+test("render: no-color selection uses the ❯ marker only (no reverse codes)", () => {
+  const out = renderSnapshot(snap([agent({ short_id: "aaaa", session_id: "a" })]), {
+    color: false,
+    selected: 0,
+  });
+  assert.match(out, /❯/);
+  assert.ok(!out.includes("\x1b[7m"), "no reverse-video escapes in no-color mode");
+});
+
 function manyAgents(n: number, over: (i: number) => Partial<FleetAgent> = () => ({})): FleetAgent[] {
   return Array.from({ length: n }, (_, i) =>
     agent({ short_id: `a${i}`, session_id: `s${i}`, ...over(i) }),

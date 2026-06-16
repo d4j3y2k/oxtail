@@ -42,6 +42,18 @@ function makePaint(color: boolean): Paint {
   return (s, ...codes) => `${codes.join("")}${s}${C.reset}`;
 }
 
+// Full-width reverse-video "cursor line" for the selected agent row. Reverse (not a
+// fixed bg color) is theme-agnostic — it inverts whatever the pane's colors are, so
+// it stays visible on any tinted terminal. The row's segments each end in a reset
+// (\x1b[0m) which would also clear reverse, so we re-enter reverse after every reset;
+// and pad to the full width so the bar fills the line. Caller applies this only when
+// color is on (no-color mode relies on the ❯ marker for the selection cue).
+function highlightRow(row: string, width: number): string {
+  const REV = "\x1b[7m";
+  const pad = " ".repeat(Math.max(0, width - displayWidth(row)));
+  return REV + (row + pad).replace(/\x1b\[0m/g, C.reset + REV) + C.reset;
+}
+
 const GLYPH: Record<Liveness, string> = {
   active: "🟢",
   idle: "🟡",
@@ -190,7 +202,7 @@ function renderAgentRow(
   label: string,
   labels: Map<string, string>,
 ): string {
-  const marker = i === selected ? paint("›", C.cyan, C.bold) : " ";
+  const marker = i === selected ? paint("❯", C.cyan, C.bold) : " ";
   const glyph = GLYPH[a.liveness];
   const idText = label + (a.is_self ? "*" : "");
   const id = paint(cell(idText, ID_W), a.is_self ? C.bold : C.reset);
@@ -426,9 +438,13 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
     );
     const total = s.agents.length;
     const cap = opts.maxAgentRows && opts.maxAgentRows > 0 ? opts.maxAgentRows : total;
+    const row = (i: number): string => {
+      const r = renderAgentRow(s.agents[i], i, paint, width, selected, rowLabel(s.agents[i]), labels);
+      return i === selected && color ? highlightRow(r, width) : r;
+    };
     if (total <= cap) {
       for (let i = 0; i < total; i++) {
-        lines.push(renderAgentRow(s.agents[i], i, paint, width, selected, rowLabel(s.agents[i]), labels));
+        lines.push(row(i));
       }
     } else {
       // Window that always keeps the selected row visible (centered when possible).
@@ -437,7 +453,7 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
       const end = start + cap;
       if (start > 0) lines.push(paint(`  ⋯ ${start} more above`, C.dim));
       for (let i = start; i < end; i++) {
-        lines.push(renderAgentRow(s.agents[i], i, paint, width, selected, rowLabel(s.agents[i]), labels));
+        lines.push(row(i));
       }
       if (end < total) lines.push(paint(`  ⋯ ${total - end} more below`, C.dim));
     }
