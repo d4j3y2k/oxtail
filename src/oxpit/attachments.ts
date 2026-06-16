@@ -96,7 +96,21 @@ export function stageAttachment(
   try {
     real = realpathSync(raw); // dereferences symlinks to a concrete target
   } catch {
-    return { ok: false, reason: `not found: ${disp}` };
+    // Terminal drag-and-drop backslash-escapes spaces / shell-special chars (macOS
+    // Terminal & iTerm hand you "/a/Screenshot\ 2026.png"). realpath on the literal
+    // escaped string fails — retry with one layer of backslash escapes removed. The
+    // raw form is tried FIRST so a filename containing a genuine backslash still
+    // resolves; the unescaped retry only runs when the raw path didn't exist. This
+    // matters doubly for a macOS screenshot-thumbnail drag: its source lives in an
+    // ephemeral TemporaryItems dir, so staging must succeed on the first try to copy
+    // the bytes before the temp file is reaped.
+    const unescaped = raw.replace(/\\(.)/g, "$1");
+    try {
+      if (unescaped === raw) throw new Error("no escapes to strip");
+      real = realpathSync(unescaped);
+    } catch {
+      return { ok: false, reason: `not found: ${disp}` };
+    }
   }
   let st;
   try {

@@ -115,6 +115,21 @@ test("stageAttachment: strips surrounding quotes (drag paste)", () => {
   });
 });
 
+test("stageAttachment: resolves a backslash-escaped drag path (macOS Terminal/iTerm)", () => {
+  withHome((home) => {
+    const src = join(home, "Screenshot 2026 at 10.55 PM.png"); // real spaces in the name
+    writeFileSync(src, "img-bytes");
+    // A terminal drag escapes the spaces with backslashes; realpath on the literal
+    // escaped form fails, so staging must retry unescaped.
+    const escaped = src.replace(/ /g, "\\ ");
+    assert.notEqual(escaped, src);
+    const r = stageAttachment(escaped);
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    assert.equal(readFileSync(r.attachment.stagedPath, "utf8"), "img-bytes");
+  });
+});
+
 test("gcAttachments: removes only old staged files", () => {
   withHome(() => {
     const now = 1_000_000_000_000;
