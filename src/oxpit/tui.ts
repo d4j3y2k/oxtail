@@ -152,14 +152,14 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       const L = [
         b("oxpit — help"),
         "",
-        "  ↑/k  ↓/j      move selection (fleet) / scroll (log)",
+        "  ↑/k  ↓/j      move selection (fleet & log panel)",
         "  ⏎             jump to the selected agent's tmux pane",
         "  n             nudge the selected agent (canned operator message; y to confirm)",
         "  m             compose a message (Enter send · ⌥⏎/⌃J newline · ⌃X unattach · Esc cancel)",
         "                attach: drag a file then ⌃A · ⌃V pastes a clipboard image (copy then ⌃V)",
         "  l             toggle the comms-log bottom panel (fleet stays visible above)",
         "  w             open the selected agent's full thread in the panel (per-agent)",
-        "                in the panel: ↑↓ walk agents · [ ] scroll · w full · f filter · ⏎ jump",
+        "                in the panel: ↑↓ walk agents · PgUp/PgDn/Space scroll · w full · f filter · ⏎ jump",
         "  r             force refresh    ?  toggle help    q / Ctrl-C  quit",
         "",
         d("  🟢 active   🟡 idle   ⚫ dead (exited / pid-reused)"),
@@ -290,7 +290,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       const d = (s: string) => dim(s, opts.color);
       const sep = d("─".repeat(Math.max(4, width)));
       const footerKeys = d(
-        `  ↑↓ move · [ ] scroll · w ${logFull ? "snippet" : "full"} · f filter${logFilterSelf ? "*" : ""} · ⏎ jump · l/Esc close`,
+        `  ↑↓ move · PgUp/PgDn scroll · w ${logFull ? "snippet" : "full"} · f filter${logFilterSelf ? "*" : ""} · ⏎ jump · l global · Esc close`,
       );
       const { bySession } = computeAgentLabels(snapshot.agents);
       let comms: CommsMessage[] = buildCommsLog(snapshot.agents, { limit: LOG_FETCH });
@@ -327,6 +327,13 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       for (let i = window.length; i < avail; i++) out.push("");
       out.push(end < bodyLines.length ? d(`  ↓ ${bodyLines.length - end} more`) : "");
       out.push(footerKeys);
+      // Normalize to EXACTLY `rows` lines for ANY height (codex MEDIUM): on a tiny
+      // terminal the fixed 5-line chrome can't all fit, so trim from the TOP while
+      // always preserving the footer (last line) — never returns ≠ rows, so the
+      // caller never has to .slice() and the panel can't desync the repaint.
+      if (rows <= 0) return [];
+      if (out.length > rows) return [...out.slice(0, rows - 1), out[out.length - 1]];
+      while (out.length < rows) out.push("");
       return out;
     }
 
@@ -403,13 +410,17 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       const clipEOL = (l: string) => clipToWidth(l, width) + CLEAR_EOL;
       if (mode === "log") {
         // item 3: comms as a BOTTOM PANEL with the fleet table still visible above
-        // (the selection up top is the agent the per-agent thread follows). The panel
-        // is a constant height; the fleet gets the rest. Whole frame clamped to `rows`.
-        const panelRows = Math.max(7, Math.min(Math.floor(rows * 0.55), rows - 6));
-        const topAvail = Math.max(3, rows - panelRows);
+        // (the selection up top is the agent the per-agent thread follows). Panel ~half
+        // the height (the fleet is the anchor), fleet keeps ≥3 rows. topAvail+panelRows
+        // == rows exactly (logPanelLines returns EXACTLY its requested rows), so the
+        // frame is exactly `rows` lines; the final slice only guards a degenerate tiny
+        // terminal (rows < the fleet minimum).
+        const desiredPanel = Math.max(7, Math.floor(rows * 0.5));
+        const topAvail = Math.max(3, rows - desiredPanel);
+        const panelRows = Math.max(0, rows - topAvail);
         const top = fleetFrame(width, topAvail).split("\n").slice(0, topAvail).map(clipEOL);
         while (top.length < topAvail) top.push(CLEAR_EOL);
-        const panel = logPanelLines(width, rows - topAvail).map(clipEOL);
+        const panel = logPanelLines(width, panelRows).map(clipEOL);
         stdout.write(HOME + [...top, ...panel].slice(0, rows).join("\n") + CLEAR_BELOW);
         return;
       }
@@ -432,10 +443,15 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       paint();
     }
 
-    function toggleLog(): void {
-      mode = mode === "log" ? "fleet" : "log";
-      logOffset = 0;
+    function closeLog(): void {
+      mode = "fleet";
       paint();
+    }
+
+    // A "page" for PgUp/PgDn/Space/b — nearly a full panel of body lines (logAvail is
+    // set by the last logPanelLines render). Minus one for visual overlap.
+    function logPageSize(): number {
+      return Math.max(1, logAvail - 1);
     }
 
     function refresh(full: boolean): void {
@@ -760,16 +776,30 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         }
         return paint(); // any other key cancels the pending nudge
       }
-      if (s === "l") return toggleLog();
+      // `l` = the GLOBAL feed (max review): always predictable — opens/switches to
+      // the unfiltered panel, and closes only when already showing global. `w`
+      // (below) is the per-agent counterpart. So l/w read as "everything vs this one".
+      if (s === "l") {
+        if (mode === "log" && !logFilterSelf) mode = "fleet"; // already global → close
+        else {
+          mode = "log";
+          logFilterSelf = false;
+          logOffset = 0;
+        }
+        return paint();
+      }
       if (s === "r") return refresh(true);
       if (mode === "log") {
-        if (s === "\x1b") return toggleLog(); // Esc → close the panel (lone ESC, not an arrow)
-        // ↑↓ still MOVE the fleet selection (panel follows it when filtered, item 4);
-        // history scrolls with [ / ] so navigation and scrolling don't fight.
+        if (s === "\x1b") return closeLog(); // Esc → close the panel (lone ESC, not an arrow)
+        // ↑↓ MOVE the fleet selection (panel follows it when filtered, item 4); history
+        // scrolls with PgUp/PgDn (the expected content-scroll keys), Space/b page, and
+        // [ / ] line-scroll — so reaching for ↑ to read up can't silently swap threads.
         if (s === "\x1b[A" || s === "k") return move(-1);
         if (s === "\x1b[B" || s === "j") return move(1);
-        if (s === "[") return logScroll(1); // older
-        if (s === "]") return logScroll(-1); // newer
+        if (s === "\x1b[5~" || s === "b") return logScroll(logPageSize()); // PgUp — older
+        if (s === "\x1b[6~" || s === " ") return logScroll(-logPageSize()); // PgDn/Space — newer
+        if (s === "[") return logScroll(1); // older (line)
+        if (s === "]") return logScroll(-1); // newer (line)
         if (s === "\r" || s === "\n") return doJump(); // jump to the selected agent
         if (s === "w") {
           logFull = !logFull; // toggle full word-wrap vs snippet
