@@ -392,23 +392,25 @@ test("fleetTrouble: counts deadlocks/orphaned/stranded, ignores live open_work",
   assert.equal(t.stalled, 1);
 });
 
-test("render: selected row gets a reverse-video highlight bar + ❯ (color on)", () => {
+test("render: selection highlights only the agent column (soft bg), color on", () => {
   const out = renderSnapshot(
     snap([agent({ short_id: "aaaa", session_id: "a" }), agent({ short_id: "bbbb", session_id: "b" })]),
     { color: true, selected: 1, width: 100 },
   );
-  const rows = out.split("\n").filter((l) => l.includes("\x1b[7m"));
-  assert.equal(rows.length, 1, "exactly one row is reverse-highlighted");
-  assert.match(rows[0], /❯/, "selected row carries the ❯ marker");
+  const rows = out.split("\n").filter((l) => l.includes("\x1b[48;5;238m"));
+  assert.equal(rows.length, 1, "exactly one row carries the agent-column bg chip");
+  assert.match(rows[0], /›/, "selected row carries the › marker");
+  // it must NOT be a full-row reverse bar — the harsh look we backed out of
+  assert.ok(!out.includes("\x1b[7m"), "no full-row reverse-video");
 });
 
-test("render: no-color selection uses the ❯ marker only (no reverse codes)", () => {
+test("render: no-color selection uses the › marker only (no bg escapes)", () => {
   const out = renderSnapshot(snap([agent({ short_id: "aaaa", session_id: "a" })]), {
     color: false,
     selected: 0,
   });
-  assert.match(out, /❯/);
-  assert.ok(!out.includes("\x1b[7m"), "no reverse-video escapes in no-color mode");
+  assert.match(out, /›/);
+  assert.ok(!out.includes("\x1b[48;5;238m"), "no bg escapes in no-color mode");
 });
 
 function manyAgents(n: number, over: (i: number) => Partial<FleetAgent> = () => ({})): FleetAgent[] {
