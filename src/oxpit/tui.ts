@@ -272,47 +272,44 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       return out;
     }
 
-    // Full-screen compose modal: target + multi-line wrapped buffer + cursor + hint.
-    // Full-screen (not overlaid on the fleet) so a long multi-line message has room
-    // and can't overflow/desync the fleet repaint.
-    function composeFrame(width: number, rows: number): string {
+    // Compose FIELD — a compact input pinned to the bottom of the screen, with the
+    // fleet/log still visible above it (paint() sizes the top region and pads so this
+    // bar sits at the foot). Replaces the old full-screen modal: messaging from the
+    // cockpit should feel like a chat field, not a whole-screen context switch. The
+    // buffer is tail-windowed so a long multi-line message can't grow the bar without
+    // bound (which would desync the cursor-home repaint).
+    const MAX_FIELD_LINES = 6;
+    function composerBar(width: number): string[] {
       const a = composeTargetKey
         ? snapshot.agents.find((ag) => agentKey(ag) === composeTargetKey)
         : undefined;
       const to = a ? a.window_name ?? a.short_id : "?";
       const b = (s: string) => (opts.color ? `\x1b[1m\x1b[36m${s}\x1b[0m` : s);
       const d = (s: string) => dim(s, opts.color);
-      const mark = a?.is_self ? d("  → your primary session") : "";
-      const lines: string[] = [b(`✉ message to ${to}`) + mark, ""];
-      // Render the buffer: each logical line (\n-split) wrapped; cursor on the last.
-      const body: string[] = [];
+      const mark = a?.is_self ? " → your primary session" : "";
+      const lines: string[] = [d("─".repeat(Math.max(4, width))), b(`✉ ${to}`) + d(mark)];
+      // Buffer: each logical line wrapped, a "> " prompt on the first, cursor on the
+      // last, tail-windowed to MAX_FIELD_LINES.
+      const wrapped: string[] = [];
       for (const logical of composeBuf.split("\n")) {
-        for (const seg of wrapText(logical, width - 2)) body.push("  " + seg);
+        for (const seg of wrapText(logical, width - 2)) wrapped.push(seg);
       }
-      if (body.length === 0) body.push("  ");
-      body[body.length - 1] += "█";
-      // Footer chrome (attachments list + note + blank + hint) is rendered below the
-      // buffer; reserve its rows so the buffer tail stays visible on a tall message.
-      const foot: string[] = [];
-      // Cap the listed attachments so a big attach set can't grow `foot` past the
-      // body budget and desync the cursor-home repaint on a short terminal.
-      const ATT_SHOW = 4;
-      for (const att of composeAttachments.slice(0, ATT_SHOW)) {
-        foot.push(d(`  📎 ${att.name} (${att.bytes}B)`));
+      if (wrapped.length === 0) wrapped.push("");
+      wrapped[wrapped.length - 1] += "█";
+      const shown =
+        wrapped.length > MAX_FIELD_LINES ? wrapped.slice(wrapped.length - MAX_FIELD_LINES) : wrapped;
+      shown.forEach((seg, i) => lines.push((i === 0 ? d("> ") : "  ") + seg));
+      // Attachments (capped) + transient note.
+      for (const att of composeAttachments.slice(0, 3)) {
+        lines.push(d(`📎 ${att.name} (${att.bytes}B)`));
       }
-      if (composeAttachments.length > ATT_SHOW) {
-        foot.push(d(`  📎 …+${composeAttachments.length - ATT_SHOW} more`));
+      if (composeAttachments.length > 3) {
+        lines.push(d(`📎 …+${composeAttachments.length - 3} more`));
       }
-      if (composeNote) foot.push(d("  " + composeNote));
-      foot.push("");
+      if (composeNote) lines.push(d(composeNote));
       const undo = composeAttachments.length ? " · ⌃X unattach" : "";
-      foot.push(
-        d(`  Enter send · ⌥⏎/⌃J newline · drag+⌃A attach · ⌃V paste image${undo} · Esc cancel`),
-      );
-      const avail = Math.max(3, rows - 2 - foot.length); // header(2) + footer chrome
-      lines.push(...(body.length > avail ? body.slice(body.length - avail) : body));
-      lines.push(...foot);
-      return lines.map((l) => clipToWidth(l, width) + CLEAR_EOL).join("\n");
+      lines.push(d(`Enter send · ⌥⏎/⌃J newline · drag+⌃A attach · ⌃V image${undo} · Esc cancel`));
+      return lines;
     }
 
     function paint(): void {
@@ -324,7 +321,17 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       }
       const rows = stdout.rows || 24;
       if (composing) {
-        stdout.write(HOME + composeFrame(width, rows) + CLEAR_BELOW);
+        // Compose field at the BOTTOM; fleet/log stays visible above. Size the top
+        // region to the remaining rows and pad so the field is pinned to the foot.
+        const bar = composerBar(width).map((l) => clipToWidth(l, width) + CLEAR_EOL);
+        const avail = Math.max(1, rows - bar.length);
+        const topStr = mode === "log" ? logFrame(width, avail) : fleetFrame(width, avail);
+        const top = topStr
+          .split("\n")
+          .slice(0, avail)
+          .map((l) => clipToWidth(l, width) + CLEAR_EOL);
+        while (top.length < avail) top.push(CLEAR_EOL); // pad so the bar sits at the bottom
+        stdout.write(HOME + [...top, ...bar].join("\n") + CLEAR_BELOW);
         return;
       }
       const frame = (mode === "log" ? logFrame(width, rows) : fleetFrame(width, rows)) + footer();
