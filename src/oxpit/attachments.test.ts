@@ -16,6 +16,7 @@ import {
   attachmentsDir,
   formatAttachmentNote,
   gcAttachments,
+  safeDisplay,
   stageAttachment,
 } from "./attachments.js";
 
@@ -136,6 +137,63 @@ function writeTmp(content: string): string {
   writeFileSync(p, content);
   return p;
 }
+
+test("stageAttachment: staged filename embeds the FULL sha256 (no prefix aliasing)", () => {
+  withHome((home) => {
+    const src = join(home, "doc.txt");
+    writeFileSync(src, "some content");
+    const r = stageAttachment(src);
+    assert.ok(r.ok);
+    if (!r.ok) return;
+    // The whole 64-hex digest is in the path — distinct content can never collide
+    // on the same staged name (codex review #4).
+    assert.ok(r.attachment.stagedPath.includes(r.attachment.sha256));
+    assert.equal(r.attachment.sha256.length, 64);
+  });
+});
+
+test("stageAttachment: same basename, different content ⇒ distinct staged paths", () => {
+  withHome((home) => {
+    const a = join(home, "a", "report.txt");
+    const b = join(home, "b", "report.txt");
+    mkdirSync(join(home, "a"));
+    mkdirSync(join(home, "b"));
+    writeFileSync(a, "alpha");
+    writeFileSync(b, "bravo");
+    const ra = stageAttachment(a);
+    const rb = stageAttachment(b);
+    assert.ok(ra.ok && rb.ok);
+    if (!ra.ok || !rb.ok) return;
+    assert.notEqual(ra.attachment.stagedPath, rb.attachment.stagedPath, "no aliasing");
+    assert.equal(readFileSync(ra.attachment.stagedPath, "utf8"), "alpha");
+    assert.equal(readFileSync(rb.attachment.stagedPath, "utf8"), "bravo");
+  });
+});
+
+test("stageAttachment: bytes reflects the COPIED buffer length", () => {
+  withHome((home) => {
+    const src = join(home, "sz.bin");
+    writeFileSync(src, "1234567");
+    const r = stageAttachment(src);
+    assert.ok(r.ok);
+    if (!r.ok) return;
+    assert.equal(r.attachment.bytes, 7);
+  });
+});
+
+test("safeDisplay: scrubs control chars and bounds length", () => {
+  assert.equal(safeDisplay("ok-path.txt"), "ok-path.txt");
+  assert.equal(safeDisplay("ev\x1b[2Jil\nname"), "ev?[2Jil?name"); // ESC + newline neutralized
+  assert.ok(!safeDisplay("\x07\x00\x7f").includes("\x00"));
+  const long = "x".repeat(500);
+  assert.ok(safeDisplay(long).length <= 120);
+});
+
+test("safeDisplay: scrubs C1, bidi overrides, and zero-width spoofers (compile-sim F3)", () => {
+  // RLO (U+202E) reverses display ("gpj.elif" → "file.jpg"); zero-width + BOM hide.
+  assert.equal(safeDisplay("a\u202eb"), "a?b");
+  assert.ok(!/[\u0080-\u009f\u200b-\u200f\u2066-\u2069\u202a-\u202e\ufeff]/.test(safeDisplay("x\u202ey\u200bz\ufeff\u009bq")));
+});
 
 test("formatAttachmentNote: lists staged paths, empty when none", () => {
   assert.equal(formatAttachmentNote([]), "");

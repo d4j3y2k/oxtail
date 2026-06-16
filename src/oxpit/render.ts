@@ -112,6 +112,64 @@ function badges(
   return { text: parts.join(" "), len: len > 0 ? len - 1 : 0 };
 }
 
+// The trouble conditions the attention line / `--check` probe key on. Computed once
+// from the snapshot (pure VIEW — every field already exists) so the render line and
+// the exit-code probe can never disagree about what "trouble" means.
+export type FleetTrouble = {
+  deadlocks: number; // live wait cycles (every member alive) — credible deadlock
+  staleCycles: number; // wait cycles with a dead/aged-out member — "possible"
+  orphaned: number; // agents awaiting a reply from a target that is itself dead
+  stranded: number; // open obligations whose OWNER is dead — will never be done
+  strandedOwners: number; // how many dead agents hold that stranded work
+  stalled: number; // possibly-stalled agents (soft hint, never an alarm)
+  active: number;
+};
+
+export function fleetTrouble(s: FleetSnapshot): FleetTrouble {
+  const strandedAgents = s.agents.filter((a) => a.liveness === "dead" && a.open_work > 0);
+  return {
+    deadlocks: s.cycles.filter((c) => c.all_live).length,
+    staleCycles: s.cycles.filter((c) => !c.all_live).length,
+    orphaned: s.agents.filter((a) => a.waiting?.orphaned).length,
+    stranded: strandedAgents.reduce((n, a) => n + a.open_work, 0),
+    strandedOwners: strandedAgents.length,
+    stalled: s.agents.filter((a) => a.possibly_stalled).length,
+    active: s.agents.filter((a) => a.liveness === "active").length,
+  };
+}
+
+// Fleet-level attention summary — the "do I even need to look?" line. Aggregates
+// the trouble signals oxpit ALREADY computes into one severity-ordered line at the
+// very top, so the operator catches fleet trouble without scanning every row or the
+// wait-graph. Pure VIEW; forks no truth. Returns null only for an empty fleet (the
+// "no agents" line covers that); a healthy fleet still renders a dim "✓ nominal" so
+// the absence of alarms reads as "checked & fine", not "feature didn't render"
+// (max review). RED is reserved for the ⛔ classes; possibly-stalled stays a DIM
+// soft hint (never a red fleet alarm — the M1 posture). Crucially it does NOT flag
+// raw open_work: an open obligation on a LIVE agent is the NORMAL state of a working
+// fleet — only work STRANDED on a dead owner is the high-signal "will never finish".
+export function attentionLine(s: FleetSnapshot, paint: Paint): string | null {
+  if (s.agents.length === 0) return null;
+  const plural = (n: number, one: string, many = one + "s") => (n === 1 ? one : many);
+  const t = fleetTrouble(s);
+  const segs: string[] = [];
+  if (t.deadlocks)
+    segs.push(paint(`⛔ ${t.deadlocks} live ${plural(t.deadlocks, "deadlock")}`, C.red, C.bold));
+  if (t.orphaned)
+    segs.push(paint(`⛔ ${t.orphaned} orphaned ${plural(t.orphaned, "wait")}`, C.red, C.bold));
+  if (t.stranded)
+    segs.push(
+      paint(`⚑ ${t.stranded} stranded (dead ${plural(t.strandedOwners, "owner")})`, C.red),
+    );
+  if (t.staleCycles)
+    segs.push(paint(`⚠ ${t.staleCycles} possible ${plural(t.staleCycles, "cycle")}`, C.yellow));
+  if (t.stalled) segs.push(paint(`⚠ ${t.stalled} possibly stalled`, C.dim));
+  if (segs.length === 0) {
+    return paint(`  ✓ fleet nominal · ${t.active} active`, C.dim);
+  }
+  return paint("  attention:", C.bold) + " " + segs.join(paint(" · ", C.dim));
+}
+
 const ID_W = 14;
 const TYPE_W = 7;
 const STATUS_W = 13;
@@ -339,12 +397,19 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
   // Header.
   const projName = s.project_root.split("/").filter(Boolean).pop() ?? s.project_root;
   const active = s.agents.filter((a) => a.liveness === "active").length;
+  // A live ⛔ condition (deadlock or orphaned wait) tints the title red — a
+  // peripheral cue that registers before the operator reads the attention line.
+  const alarm = s.cycles.some((c) => c.all_live) || s.agents.some((a) => a.waiting?.orphaned);
   const head =
-    paint("oxpit", C.bold, C.cyan) +
+    paint("oxpit", C.bold, alarm ? C.red : C.cyan) +
     paint(`  ${projName}`, C.dim) +
     `  ${s.agents.length} agent${s.agents.length === 1 ? "" : "s"}` +
     paint(` (${active} active)`, C.green);
   lines.push(head);
+
+  // Top attention line — only present when the fleet has trouble worth a glance.
+  const attn = attentionLine(s, paint);
+  if (attn) lines.push(attn);
 
   const { byShortId: labels } = computeAgentLabels(s.agents);
   const rowLabel = (a: FleetAgent): string => labels.get(a.short_id) ?? a.short_id;

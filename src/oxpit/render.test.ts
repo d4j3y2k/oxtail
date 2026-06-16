@@ -1,6 +1,13 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { commsBodyLines, computeAgentLabels, renderCommsLog, renderSnapshot } from "./render.js";
+import {
+  attentionLine,
+  commsBodyLines,
+  computeAgentLabels,
+  fleetTrouble,
+  renderCommsLog,
+  renderSnapshot,
+} from "./render.js";
 import type { FleetAgent, FleetSnapshot } from "./snapshot.js";
 import type { CommsMessage } from "./comms.js";
 
@@ -317,6 +324,72 @@ test("render: orphaned wait (target dead)", () => {
 test("render: empty fleet", () => {
   const out = renderSnapshot(snap([]), { color: false });
   assert.match(out, /no agents registered/);
+});
+
+// ── attention line / fleetTrouble ───────────────────────────────────────────────
+
+const ID = (s: string) => s; // identity paint for plain-text assertions
+
+test("attentionLine: healthy fleet renders a dim '✓ nominal' (not null/absent)", () => {
+  const out = attentionLine(snap([agent({ liveness: "active" }), agent({ liveness: "idle" })]), ID);
+  assert.ok(out && /✓ fleet nominal · 1 active/.test(out), "absence of alarms reads as 'checked & fine'");
+});
+
+test("attentionLine: empty fleet returns null (the 'no agents' line covers it)", () => {
+  assert.equal(attentionLine(snap([]), ID), null);
+});
+
+test("attentionLine: live deadlock and orphaned wait are RED ⛔ classes", () => {
+  const s = snap(
+    [
+      agent({
+        short_id: "main",
+        session_id: "m",
+        waiting: { target_session_id: "c", target_short_id: "codex", age_s: 9, orphaned: false, in_cycle: true, cycle_all_live: true },
+      }),
+      agent({
+        short_id: "lone",
+        session_id: "l",
+        waiting: { target_session_id: "d", target_short_id: "ghost", age_s: 9, orphaned: true, in_cycle: false, cycle_all_live: false },
+      }),
+    ],
+    { cycles: [{ members: ["main", "codex"], all_live: true }] },
+  );
+  const out = attentionLine(s, ID)!;
+  assert.match(out, /attention:/);
+  assert.match(out, /1 live deadlock/);
+  assert.match(out, /1 orphaned wait/);
+});
+
+test("attentionLine: open work on a DEAD owner is flagged as stranded", () => {
+  const out = attentionLine(snap([agent({ liveness: "dead", open_work: 3 })]), ID)!;
+  assert.match(out, /3 stranded \(dead owner\)/);
+});
+
+test("attentionLine: open work on a LIVE agent does NOT cry wolf (key refinement)", () => {
+  // A working fleet always has open obligations on live agents — that is normal,
+  // never an alert. Only dead-owner work is stranded.
+  const out = attentionLine(snap([agent({ liveness: "active", open_work: 5 })]), ID)!;
+  assert.match(out, /✓ fleet nominal/);
+  assert.ok(!/stranded/.test(out) && !/attention/.test(out));
+});
+
+test("fleetTrouble: counts deadlocks/orphaned/stranded, ignores live open_work", () => {
+  const t = fleetTrouble(
+    snap(
+      [
+        agent({ short_id: "a", session_id: "a", liveness: "active", open_work: 4 }),
+        agent({ short_id: "d", session_id: "d", liveness: "dead", open_work: 2 }),
+        agent({ short_id: "s", session_id: "s", possibly_stalled: true }),
+      ],
+      { cycles: [{ members: ["a", "d"], all_live: false }] },
+    ),
+  );
+  assert.equal(t.stranded, 2);
+  assert.equal(t.strandedOwners, 1);
+  assert.equal(t.staleCycles, 1);
+  assert.equal(t.deadlocks, 0);
+  assert.equal(t.stalled, 1);
 });
 
 function manyAgents(n: number, over: (i: number) => Partial<FleetAgent> = () => ({})): FleetAgent[] {

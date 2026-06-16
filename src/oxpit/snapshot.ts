@@ -489,12 +489,30 @@ function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
 
 const LIVENESS_ORDER: Record<Liveness, number> = { active: 0, idle: 1, dead: 2 };
 
-// Sort: liveness (active first), then more outstanding work first (open+unread),
-// then waiting first, then short_id for stability. Self is NOT special-cased in
-// ordering — the renderer marks it.
+// Trouble weight so the operator's eye lands on agents that need attention (max's
+// pin-troubled-to-top). Floats trouble to the TOP OF ITS LIVENESS BAND — liveness
+// stays primary (active before idle before dead), so this never hoists a dead row
+// above the living; it just orders within a band. Mirrors the attention-line
+// severity: live deadlock / orphaned wait highest, then dead-owner stranded work,
+// then a plain wait, then a soft stall hint.
+function troubleScore(a: FleetAgent): number {
+  let s = 0;
+  if (a.waiting?.in_cycle && a.waiting.cycle_all_live) s += 4; // live deadlock
+  if (a.waiting?.orphaned) s += 4; // wait on a dead target
+  if (a.liveness === "dead" && a.open_work > 0) s += 3; // stranded obligations
+  else if (a.waiting) s += 1; // plain awaiting-reply
+  if (a.possibly_stalled) s += 1; // soft hint
+  return s;
+}
+
+// Sort: liveness (active first), then trouble (so attention-needing agents top their
+// band), then more outstanding work first (open+unread+waiting), then short_id for
+// stability. Self is NOT special-cased in ordering — the renderer marks it.
 function compareAgents(a: FleetAgent, b: FleetAgent): number {
   const lv = LIVENESS_ORDER[a.liveness] - LIVENESS_ORDER[b.liveness];
   if (lv !== 0) return lv;
+  const tr = troubleScore(b) - troubleScore(a);
+  if (tr !== 0) return tr;
   const workA = a.open_work + a.unread + (a.waiting ? 1 : 0);
   const workB = b.open_work + b.unread + (b.waiting ? 1 : 0);
   if (workA !== workB) return workB - workA;

@@ -2,7 +2,7 @@
 // (interactive TUI). Both are thin wrappers over the pure snapshot/render layer.
 
 import { buildSnapshot } from "./snapshot.js";
-import { computeAgentLabels, renderCommsLog, renderSnapshot } from "./render.js";
+import { computeAgentLabels, fleetTrouble, renderCommsLog, renderSnapshot } from "./render.js";
 import { buildCommsLog } from "./comms.js";
 import {
   NUDGE_TEXT,
@@ -10,7 +10,7 @@ import {
   type OperatorSendResult,
   type OperatorTarget,
 } from "./operator.js";
-import { formatAttachmentNote, stageAttachment } from "./attachments.js";
+import { formatAttachmentNote, safeDisplay, stageAttachment } from "./attachments.js";
 import type { FleetAgent } from "./snapshot.js";
 
 export type StatusArgs = {
@@ -22,10 +22,17 @@ export type StatusArgs = {
   project: string | undefined;
   log: boolean; // append the comms-log (cross-fleet message feed)
   limit: number | undefined; // comms-log message cap (-n / --limit)
+  check: boolean; // exit nonzero on fleet trouble (scriptable health probe)
   help: boolean;
 };
 
 const DEFAULT_LOG_LIMIT = 20;
+
+// `status --check` exit code when a hard fleet problem (live deadlock / orphaned
+// wait / work stranded on a dead owner) is present. status exits 0 when healthy and
+// 2 on trouble (it has no usage-error path — unknown flags are ignored); 2 is
+// distinct from a generic 1 so `watch`/CI can branch specifically on fleet trouble.
+export const CHECK_TROUBLE_CODE = 2;
 
 export const USAGE = `oxtail status — print the agent fleet once and exit
 oxtail oxpit  — live interactive fleet cockpit (separate terminal)
@@ -33,13 +40,15 @@ oxtail oxpit  — live interactive fleet cockpit (separate terminal)
 status flags:
   --json [--pretty]   machine-readable snapshot (CI / scripting)
   --log [-n N]        append the cross-fleet comms-log (recent message tail)
+  --check             exit ${CHECK_TROUBLE_CODE} on fleet trouble (live deadlock /
+                      orphaned wait / work stranded on a dead owner); else 0
   --color | --no-color
   --all               include agents from every project, not just this one
   --width N           override output width
   --project PATH      scope to a specific project root
   -h, --help          this help
 
-oxpit keys:  ↑/k ↓/j move · ⏎ jump to pane · l comms-log · r refresh · ? help · q quit
+oxpit keys:  ↑/k ↓/j move · ⏎ jump · n nudge · m message · l comms-log · r refresh · ? help · q quit
 oxpit flags: --no-color, --all, --project PATH, --client NAME (which tmux
              client the jump drives when several are attached)`;
 
@@ -53,6 +62,7 @@ export function parseStatusArgs(argv: string[]): StatusArgs {
     project: undefined,
     log: false,
     limit: undefined,
+    check: false,
     help: false,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -61,6 +71,9 @@ export function parseStatusArgs(argv: string[]): StatusArgs {
       case "-h":
       case "--help":
         a.help = true;
+        break;
+      case "--check":
+        a.check = true;
         break;
       case "--json":
         a.json = true;
@@ -118,12 +131,19 @@ export function runStatus(
   }
   const snap = buildSnapshot({ allProjects: a.all, projectRoot: a.project });
   const limit = a.limit && Number.isFinite(a.limit) && a.limit > 0 ? a.limit : DEFAULT_LOG_LIMIT;
+  // --check: a HARD fleet problem (live deadlock / orphaned wait / dead-owner
+  // stranded work) makes the one-shot a scriptable health probe. Soft signals
+  // (possibly-stalled, stale cycles) deliberately do NOT trip it (no false alarms).
+  const checkCode = (): number => {
+    const t = fleetTrouble(snap);
+    return t.deadlocks + t.orphaned + t.stranded > 0 ? CHECK_TROUBLE_CODE : 0;
+  };
   if (a.json) {
     // --log adds a `comms` array (full bodies) alongside the snapshot, so the
     // machine-readable form is a superset, not a separate shape.
     const payload = a.log ? { ...snap, comms: buildCommsLog(snap.agents, { limit }) } : snap;
     out(JSON.stringify(payload, null, a.pretty ? 2 : 0));
-    return 0;
+    return a.check ? checkCode() : 0;
   }
   const color = a.color ?? autoColor();
   const width = a.width && Number.isFinite(a.width) ? a.width : process.stdout.columns || 100;
@@ -133,7 +153,7 @@ export function runStatus(
     out("");
     out(renderCommsLog(buildCommsLog(snap.agents, { limit }), bySession, { color, width }));
   }
-  return 0;
+  return a.check ? checkCode() : 0;
 }
 
 // ── oxtail message — operator send (act-from-cockpit, one-shot) ────────────────
@@ -245,7 +265,7 @@ function stageAll(paths: string[]): { ok: true; note: string } | { ok: false; re
   for (const p of paths) {
     if (!p.trim()) continue;
     const r = stageAttachment(p);
-    if (!r.ok) return { ok: false, reason: `attach '${p}': ${r.reason}` };
+    if (!r.ok) return { ok: false, reason: `attach '${safeDisplay(p)}': ${r.reason}` };
     staged.push(r.attachment);
   }
   return { ok: true, note: formatAttachmentNote(staged) };
@@ -311,21 +331,25 @@ export async function runMessage(
     out(MESSAGE_USAGE);
     return 1;
   }
-  const staged = stageAll(a.attach);
-  if (!staged.ok) {
-    out("error: " + staged.reason);
-    return 1;
-  }
-  const body = (a.nudge ? NUDGE_TEXT : a.positionals.slice(1).join(" ")) + staged.note;
-  if (!body.trim()) {
+  const baseBody = a.nudge ? NUDGE_TEXT : a.positionals.slice(1).join(" ");
+  if (!baseBody.trim() && a.attach.length === 0) {
     out("error: empty message (give text, --nudge, or --attach)");
     return 1;
   }
+  // Resolve/refuse the target BEFORE staging (codex review #3): a typo or ambiguous
+  // target must not copy a file into ~/.oxtail/attachments + run GC for a send that
+  // never happens. Stage only on the actual send, matching the broadcast path.
   const res = resolveAgent(snap.agents, target);
   if (!res.agent) {
     out("error: " + res.error);
     return 1;
   }
+  const staged = stageAll(a.attach);
+  if (!staged.ok) {
+    out("error: " + staged.reason);
+    return 1;
+  }
+  const body = baseBody + staged.note;
   const r = await sendOperatorMessage(targetOf(res.agent), body, { wake: !a.noWake });
   out(formatResult(r));
   return r.ok ? 0 : 1;

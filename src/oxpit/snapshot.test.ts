@@ -373,6 +373,34 @@ test("wait-graph: an ask with no observed reply still shows as waiting", () => {
   });
 });
 
+test("sort: a troubled (waiting) agent floats above a higher-work healthy one in-band", () => {
+  withHome(() => {
+    const A = "aaaaaaaa-0000-0000-0000-000000000001"; // healthy, MORE raw work
+    const B = "bbbbbbbb-0000-0000-0000-000000000002"; // waiting (trouble), LESS work
+    recordReceived(A, mailbox.buildMessage("do1", "boss", { action_required: true }));
+    recordReceived(A, mailbox.buildMessage("do2", "boss", { action_required: true }));
+    recordPendingAsk(defaultPendingAskDir(), B, "req-sort", NOW_MS);
+    const snap = buildSnapshot({
+      readEntries: () => [
+        makeEntry({ client: { session_id: A, transcript_path: null } as never }),
+        makeEntry({ client: { session_id: B, transcript_path: null } as never }),
+      ],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      resolveWindowNames: () => new Map(),
+    });
+    assert.equal(snap.agents.length, 2);
+    // Both idle. A has 2 open obligations (more raw work); B is merely waiting. The
+    // trouble weight must still float B to the top of the band — trouble outranks
+    // raw work-count (max's pin-troubled-to-top).
+    assert.equal(snap.agents[0].session_id, B, "troubled agent pinned to top of its band");
+    assert.ok(snap.agents[0].waiting);
+    assert.equal(snap.agents[1].open_work, 2);
+  });
+});
+
 test("buildSnapshot: empty registry ⇒ no agents, no throw", () => {
   withHome(() => {
     const snap = buildSnapshot({ readEntries: () => [], allProjects: true, nowMs: NOW_MS });

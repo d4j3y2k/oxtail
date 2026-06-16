@@ -15,7 +15,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { buildSnapshot, type FleetAgent, type FleetSnapshot } from "./snapshot.js";
-import { commsBodyLines, computeAgentLabels, renderSnapshot } from "./render.js";
+import { attentionLine, commsBodyLines, computeAgentLabels, renderSnapshot } from "./render.js";
 import { buildCommsLog, type CommsMessage } from "./comms.js";
 import { clipToWidth } from "./format.js";
 import { jumpToAgent } from "./jump.js";
@@ -43,6 +43,31 @@ const LOG_FETCH = 200; // comms messages pulled for the log view (windowed to fi
 
 function agentKey(a: FleetAgent): string {
   return a.session_id ?? `pid:${a.server_pid}`;
+}
+
+// Strip terminal-dangerous chars from any text admitted into the compose buffer. The
+// buffer is rendered RAW and sent VERBATIM to the peer, so it is the one place a
+// pasted/⌃X-restored hostile filename (ANSI/C0/C1/bidi/zero-width) could corrupt the
+// operator's terminal OR reach a peer's context (compile-sim F2/F3). Every input path
+// (typed key, paste, attachment-undo) funnels through here. Newlines survive only
+// when keepNewline (a multi-line paste or an explicit newline key).
+function scrubBufferText(s: string, keepNewline: boolean): string {
+  let out = "";
+  for (const ch of s) {
+    if (keepNewline && ch === "\n") {
+      out += ch;
+      continue;
+    }
+    const c = ch.codePointAt(0) ?? 0;
+    if (c < 0x20 || c === 0x7f || (c >= 0x80 && c <= 0x9f)) continue; // C0 / DEL / C1
+    if (c >= 0x200b && c <= 0x200f) continue; // zero-width + bidi marks
+    if (c === 0x2028 || c === 0x2029) continue; // line / paragraph separators
+    if (c >= 0x202a && c <= 0x202e) continue; // bidi embeddings / overrides
+    if (c >= 0x2066 && c <= 0x2069) continue; // bidi isolates
+    if (c === 0xfeff) continue; // BOM / zero-width no-break space
+    out += ch;
+  }
+  return out;
 }
 
 function clientFlag(argv: string[]): string | undefined {
@@ -107,6 +132,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     let composeTargetKey: string | null = null; // agentKey the message is bound to
     const COMPOSE_MAX = 7000; // generous cap; mailbox bodies are ≤8KB
     let composeAttachments: StagedAttachment[] = []; // staged files for the message
+    let composeAttachSources: string[] = []; // source path per attachment (for ⌃X undo)
     let composeNote = ""; // transient composer feedback (attach result)
     let pasting = false; // inside a bracketed-paste sequence
     let pasteBuf = ""; // accumulates paste content across data chunks
@@ -153,7 +179,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "  ↑/k  ↓/j      move selection (fleet) / scroll (log)",
         "  ⏎             jump to the selected agent's tmux pane",
         "  n             nudge the selected agent (canned operator message; y to confirm)",
-        "  m             compose a message (Enter send · ⌥⏎/⌃J newline · ⌃A/drag attach · Esc cancel)",
+        "  m             compose (Enter send · ⌥⏎/⌃J newline · ⌃A/drag attach · ⌃X unattach · Esc cancel)",
         "  l             comms-log (fleet ⇄ log); in log: w full-text · f filter · ↑↓ scroll",
         "  r             force refresh    ?  toggle help    q / Ctrl-C  quit",
         "",
@@ -177,9 +203,10 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         waiters.length || snapshot.cycles.length
           ? 2 + Math.min(wgBody, MAX_WAIT_ROWS) + (wgBody > MAX_WAIT_ROWS ? 1 : 0)
           : 0;
-      // header(1) + column header(1) + footer(2) + wait-graph + warnings + window
-      // markers(2) + margin(1)
-      return 1 + 1 + 2 + wgLines + snapshot.warnings.length + 2 + 1;
+      // header(1) + optional attention line + column header(1) + footer(2) +
+      // wait-graph + warnings + window markers(2) + margin(1)
+      const attn = attentionLine(snapshot, (x) => x) ? 1 : 0;
+      return 1 + attn + 1 + 2 + wgLines + snapshot.warnings.length + 2 + 1;
     }
 
     function fleetFrame(width: number, rows: number): string {
@@ -265,10 +292,19 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       // Footer chrome (attachments list + note + blank + hint) is rendered below the
       // buffer; reserve its rows so the buffer tail stays visible on a tall message.
       const foot: string[] = [];
-      for (const att of composeAttachments) foot.push(d(`  📎 ${att.name} (${att.bytes}B)`));
+      // Cap the listed attachments so a big attach set can't grow `foot` past the
+      // body budget and desync the cursor-home repaint on a short terminal.
+      const ATT_SHOW = 4;
+      for (const att of composeAttachments.slice(0, ATT_SHOW)) {
+        foot.push(d(`  📎 ${att.name} (${att.bytes}B)`));
+      }
+      if (composeAttachments.length > ATT_SHOW) {
+        foot.push(d(`  📎 …+${composeAttachments.length - ATT_SHOW} more`));
+      }
       if (composeNote) foot.push(d("  " + composeNote));
       foot.push("");
-      foot.push(d("  Enter send · ⌥⏎ / ⌃J newline · ⌃A attach (or drag a file) · Esc cancel"));
+      const undo = composeAttachments.length ? " · ⌃X unattach" : "";
+      foot.push(d(`  Enter send · ⌥⏎/⌃J newline · ⌃A/drag attach${undo} · Esc cancel`));
       const avail = Math.max(3, rows - 2 - foot.length); // header(2) + footer chrome
       lines.push(...(body.length > avail ? body.slice(body.length - avail) : body));
       lines.push(...foot);
@@ -393,6 +429,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       composeBuf = "";
       composeTargetKey = null;
       composeAttachments = [];
+      composeAttachSources = [];
       composeNote = "";
       // Attach-only sends are allowed (drag a file, hit Enter) — but a wholly empty
       // composer (no text, no files) is a cancel, not a send.
@@ -430,6 +467,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       composeBuf = "";
       composeTargetKey = null;
       composeAttachments = [];
+      composeAttachSources = [];
       composeNote = "";
       paint();
     }
@@ -438,7 +476,8 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       const r = stageAttachment(p);
       if (r.ok) {
         composeAttachments.push(r.attachment);
-        composeNote = `📎 ${r.attachment.name} (${r.attachment.bytes}B)`;
+        composeAttachSources.push(p); // remember the source so ⌃X can restore it as text
+        composeNote = `📎 ${r.attachment.name} (${r.attachment.bytes}B) — ⌃X to undo`;
       } else {
         composeNote = `✗ ${r.reason}`;
       }
@@ -446,25 +485,46 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       return r.ok;
     }
 
-    // Bracketed-paste content. A single-line paste that resolves to a stageable file
-    // = drag-to-attach; otherwise insert as text (newlines preserved, control
-    // stripped — so a multi-line paste never fires-send or corrupts).
+    // Undo the last attachment and restore its source path into the buffer as text —
+    // the safety net for the paste-auto-attach ambiguity (max review): "I meant that
+    // path as text, not a file."
+    function unattachLast(): void {
+      if (composeAttachments.length === 0) {
+        composeNote = "✗ no attachment to remove";
+        return paint();
+      }
+      composeAttachments.pop();
+      const src = composeAttachSources.pop();
+      if (src) {
+        // Scrub the restored path: this is the ONE buffer-input path that doesn't go
+        // through composeKey/onPaste, so without this a hostile filename's control/
+        // bidi bytes would land in the buffer and reach the peer (compile-sim F2).
+        const restored = scrubBufferText(src, false);
+        const sep = composeBuf && !composeBuf.endsWith(" ") ? " " : "";
+        composeBuf = (composeBuf + sep + restored).slice(0, COMPOSE_MAX);
+        composeNote = "↩ removed attachment — path restored as text";
+      } else {
+        composeNote = "↩ removed attachment";
+      }
+      paint();
+    }
+
+    // Bracketed-paste content. A single-line paste of an ABSOLUTE path that resolves
+    // to a stageable file = drag-to-attach (a Finder/terminal drag is always
+    // absolute). A relative paste ("README.md"), a code snippet, or a URL inserts as
+    // TEXT — so a path-shaped string can't be silently swallowed (max review); use ⌃A
+    // to attach those deliberately. Multi-line pastes are always text (newlines kept,
+    // control stripped, so a paste never fires-send or corrupts the screen).
     function onPaste(content: string): void {
       if (!composing) return; // paste only meaningful in the composer
       const single = content.trim();
       if (single && !single.includes("\n")) {
-        const r = stageAttachment(single);
-        if (r.ok) {
-          composeAttachments.push(r.attachment);
-          composeNote = `📎 ${r.attachment.name} (${r.attachment.bytes}B)`;
-          return paint();
-        }
-        // not a file → fall through and insert as text
+        const unq = single.replace(/^['"]/, "").replace(/['"]$/, "");
+        if (unq.startsWith("/") && attachPath(unq)) return; // absolute + stageable → attach
+        // not absolute, or not a stageable file → fall through and insert as text
       }
       const norm = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-      let clean = "";
-      for (const ch of norm) if (ch === "\n" || (ch >= " " && ch !== "\x7f" && ch !== "\x1b")) clean += ch;
-      composeInsert(clean);
+      composeInsert(scrubBufferText(norm, true));
     }
 
     // Raw-mode line editing for the composer (one keystroke chunk).
@@ -474,6 +534,11 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (s === "\x03") return teardown(0);
       if (s === "\x1b") return cancelCompose(); // lone ESC
       if (s === "\x1b\r" || s === "\x1b\n") return composeInsert("\n"); // Alt+Enter
+      // Any OTHER escape sequence (arrows, Home/End, PgUp/Dn, F-keys) must be
+      // dropped, not typed: without this its CSI tail ("[A","[B"…) leaks into the
+      // buffer as text (max review — verified composer bug).
+      if (s[0] === "\x1b") return;
+      if (s === "\x18") return unattachLast(); // Ctrl-X: undo last attachment
       if (s === "\x01") {
         // Ctrl-A: treat the current line as a file path and attach it (drag-to-attach
         // works too, via onPaste). Clear the buffer only on a successful stage.
@@ -493,9 +558,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       }
       // Printable typed input; strip control + stray escapes (newlines come via the
       // explicit branches above or via onPaste).
-      let printable = "";
-      for (const ch of s) if (ch >= " " && ch !== "\x7f" && ch !== "\x1b") printable += ch;
-      composeInsert(printable);
+      composeInsert(scrubBufferText(s, false));
     }
 
     function teardown(code: number): void {

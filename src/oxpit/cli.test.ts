@@ -70,6 +70,19 @@ test("runStatus --help prints usage and skips the snapshot", () => {
   assert.match(lines[0], /oxpit keys/);
 });
 
+test("parseStatusArgs: --check", () => {
+  assert.equal(parseStatusArgs(["--check"]).check, true);
+  assert.equal(parseStatusArgs([]).check, false);
+});
+
+test("runStatus --check on a healthy/empty fleet exits 0 (probe-friendly default)", async () => {
+  await withHome(async () => {
+    const lines: string[] = [];
+    const code = runStatus(["--check", "--no-color"], (l) => lines.push(l));
+    assert.equal(code, 0, "no trouble ⇒ exit 0 so scripts can branch on it");
+  });
+});
+
 test("parseMessageArgs: positionals + flags", () => {
   const a = parseMessageArgs(["max", "hello", "world", "--no-wake"]);
   assert.deepEqual(a.positionals, ["max", "hello", "world"]);
