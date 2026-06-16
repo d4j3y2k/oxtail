@@ -3,7 +3,7 @@
 // Color is injected (gated on TTY / NO_COLOR by the caller), never auto-detected
 // here, so tests get deterministic plain output.
 
-import { cell, clip, clipToWidth, displayWidth, fmtAge } from "./format.js";
+import { cell, clip, clipToWidth, displayWidth, fmtAge, scrubBufferText } from "./format.js";
 import { ACTIVE_WINDOW_S, type FleetAgent, type FleetSnapshot, type Liveness } from "./snapshot.js";
 import { agentKey, type AgentActivity, type PaneActivity, type ToolKind } from "./activity.js";
 import type { CommsMessage } from "./comms.js";
@@ -268,7 +268,7 @@ function renderAgentRow(
   label: string,
   labels: Map<string, string>,
   paneAct: PaneActivity | undefined,
-  toolAct: AgentActivity | null | undefined,
+  act: AgentActivity | null, // resolved tool sub-state (overlay-aware)
 ): string {
   const marker = i === selected ? paint("›", C.cyan, C.bold) : " ";
   const glyph = GLYPH[a.liveness];
@@ -288,9 +288,7 @@ function renderAgentRow(
   }
   const type = paint(cell(agentLabel(a.client_type), TYPE_W), C.dim);
   const status = paint(cell(statusText(a), STATUS_W), livenessColor(a.liveness));
-  // Resolve the tool sub-state: a TUI overlay (sticky last-known) overrides the
-  // snapshot's own field, without ever mutating the snapshot.
-  const b = badges(a, paint, labels, toolAct ?? a.activity);
+  const b = badges(a, paint, labels, act);
 
   // Fixed prefix visible width: marker(1) sp glyph(2) sp id sp type sp status sp
   const prefixLen = 1 + 1 + 2 + 1 + ID_W + 1 + TYPE_W + 1 + STATUS_W + 1;
@@ -308,7 +306,10 @@ function renderAgentRow(
     detailText = "working…";
     detailColor = C.cyan;
   } else if (a.purpose) {
-    detailText = a.purpose;
+    // purpose is UNTRUSTED peer text (set_my_state, arbitrary ≤200 chars). Scrub the
+    // ESC/C0/C1/bidi injection vector before it reaches the operator's terminal —
+    // the same bar as captured pane text (codex). clip() only collapses whitespace.
+    detailText = scrubBufferText(a.purpose, false);
     detailColor = a.purpose_stale ? C.gray : C.dim;
   }
   if (detailText) {
@@ -431,13 +432,16 @@ export function commsBodyLines(
     else if (m.request_id) mark = "❓";
     const markStr = mark ? ` ${mark}` : "";
     const head = `  ${cell(age, 4)} ${fromLabel(m)} → ${name(m.to_session_id)}${markStr}: `;
+    // Message bodies are UNTRUSTED peer text — scrub the ESC/C0/C1/bidi injection
+    // vector before render (clip/clipToWidth only handle whitespace + width).
+    const safeBody = scrubBufferText(m.body, false);
     if (opts.full || m.message_id === opts.expandedId) {
-      const body = m.body.replace(/\s+/g, " ").trim();
+      const body = safeBody.replace(/\s+/g, " ").trim();
       out.push(clipToWidth(paint(head, C.dim), width));
       for (const seg of wrap(body, width - 4)) out.push(clipToWidth("    " + seg, width));
     } else {
       const remaining = width - head.length - 1;
-      const snippet = remaining >= 8 ? clip(m.body, remaining) : "";
+      const snippet = remaining >= 8 ? clip(safeBody, remaining) : "";
       out.push(clipToWidth(paint(head, C.dim) + snippet, width));
     }
   }
@@ -521,8 +525,17 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
   const { byShortId: labels } = computeAgentLabels(s.agents);
   const rowLabel = (a: FleetAgent): string => labels.get(a.short_id) ?? a.short_id;
   const paneAct = (a: FleetAgent): PaneActivity | undefined => opts.paneActivity?.get(agentKey(a));
-  const toolAct = (a: FleetAgent): AgentActivity | null | undefined =>
-    opts.toolActivity?.get(agentKey(a));
+  // Resolve the tool sub-state: when the overlay HAS the key it wins (an explicit
+  // null = "known to have no tool" genuinely suppresses, matching the contract);
+  // otherwise fall back to the snapshot's own activity.
+  const resolveAct = (a: FleetAgent): AgentActivity | null => {
+    const m = opts.toolActivity;
+    if (m) {
+      const k = agentKey(a);
+      if (m.has(k)) return m.get(k) ?? null;
+    }
+    return a.activity;
+  };
 
   if (s.agents.length === 0) {
     lines.push(paint("  no agents registered in this project scope", C.dim));
@@ -539,7 +552,7 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
     if (total <= cap) {
       for (let i = 0; i < total; i++) {
         const a = s.agents[i];
-        lines.push(renderAgentRow(a, i, paint, width, selected, rowLabel(a), labels, paneAct(a), toolAct(a)));
+        lines.push(renderAgentRow(a, i, paint, width, selected, rowLabel(a), labels, paneAct(a), resolveAct(a)));
       }
     } else {
       // Window that always keeps the selected row visible (centered when possible).
@@ -549,7 +562,7 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
       if (start > 0) lines.push(paint(`  ⋯ ${start} more above`, C.dim));
       for (let i = start; i < end; i++) {
         const a = s.agents[i];
-        lines.push(renderAgentRow(a, i, paint, width, selected, rowLabel(a), labels, paneAct(a), toolAct(a)));
+        lines.push(renderAgentRow(a, i, paint, width, selected, rowLabel(a), labels, paneAct(a), resolveAct(a)));
       }
       if (end < total) lines.push(paint(`  ⋯ ${total - end} more below`, C.dim));
     }

@@ -580,3 +580,21 @@ test("render: overlay null entry on a fast tick (no snapshot activity) → no ba
   );
   assert.ok(!out.includes("⚙bash"), "a null overlay over a null snapshot shows nothing");
 });
+
+test("render: overlay explicit null NOW genuinely suppresses a snapshot badge (contract)", () => {
+  // The resolver is has()-based, so an explicit-null overlay overrides — matching
+  // the RenderOptions comment (codex/max LOW).
+  const overlay = new Map<string, null>([["sess1", null]]);
+  const out = renderSnapshot(
+    snap([agent({ session_id: "sess1", activity: { tool: "bash", tool_raw: "Bash", tool_running: true } })]),
+    { color: false, width: 120, toolActivity: overlay },
+  );
+  assert.ok(!out.includes("⚙bash"), "explicit-null overlay suppresses the snapshot badge");
+});
+
+test("renderCommsLog: scrubs ESC/bidi from an untrusted message body", () => {
+  const hostile = "hi \x1b[31mRED\x1b[0m ‮evil there";
+  const out = renderCommsLog([msg({ body: hostile })], COMMS_LABELS, { color: false, nowSec: 1000 });
+  assert.ok(!out.includes("\x1b[31m"), "raw ESC sequence stripped from body");
+  assert.ok(!out.includes("‮"), "bidi override stripped from body");
+});
