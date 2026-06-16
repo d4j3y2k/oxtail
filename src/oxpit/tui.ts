@@ -97,6 +97,10 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     let logTotalLines = 0; // last-rendered total body lines (for scroll clamping)
     let logAvail = 0; // last-rendered visible body lines
     let pendingNudgeKey: string | null = null; // agentKey awaiting 'y' to confirm a nudge
+    let composing = false; // typing a custom operator message in the TUI
+    let composeBuf = ""; // the message being typed
+    let composeTargetKey: string | null = null; // agentKey the message is bound to
+    const COMPOSE_MAX = 2000; // generous cap; mailbox bodies are ≤8KB anyway
 
     const stdin = process.stdin;
     const stdout = process.stdout;
@@ -118,13 +122,21 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     }
 
     function footer(): string {
+      if (composing) {
+        const a = composeTargetKey
+          ? snapshot.agents.find((ag) => agentKey(ag) === composeTargetKey)
+          : undefined;
+        const to = a ? a.window_name ?? a.short_id : "?";
+        const prompt = opts.color ? `\x1b[1m\x1b[36m  ✉ ${to} ▸ \x1b[0m` : `  ✉ ${to} ▸ `;
+        return "\n" + prompt + composeBuf + "█" + dim("   (Enter send · Esc cancel)", opts.color);
+      }
       let keys: string;
       if (mode === "log") {
         const pos = logOffset === 0 ? "live" : `↑${logOffset}`;
         const filt = logFilterSelf ? " (on)" : "";
         keys = `↑↓ scroll  w ${logFull ? "snippet" : "full"}  f filter${filt}  l/Esc fleet  q quit  [${pos}]`;
       } else {
-        keys = "↑↓ move  ⏎ jump  n nudge  l log  r refresh  ? help  q quit";
+        keys = "↑↓ move  ⏎ jump  n nudge  m message  l log  r refresh  ? help  q quit";
       }
       const now = Date.now();
       const msg = now < statusUntil && status ? "  " + status : "";
@@ -139,7 +151,8 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "",
         "  ↑/k  ↓/j      move selection (fleet) / scroll (log)",
         "  ⏎             jump to the selected agent's tmux pane",
-        "  n             nudge the selected agent (operator message; y to confirm)",
+        "  n             nudge the selected agent (canned operator message; y to confirm)",
+        "  m             compose a custom message to the selected agent (Enter send, Esc cancel)",
         "  l             comms-log (fleet ⇄ log); in log: w full-text · f filter · ↑↓ scroll",
         "  r             force refresh    ?  toggle help    q / Ctrl-C  quit",
         "",
@@ -326,6 +339,61 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         });
     }
 
+    // Send the composed custom message to the bound agent (resolved by session key,
+    // so churn can't re-point it), then leave compose mode.
+    function sendCompose(): void {
+      const body = composeBuf.trim();
+      const key = composeTargetKey;
+      composing = false;
+      composeBuf = "";
+      composeTargetKey = null;
+      if (!body) return setStatus(warn("empty message — cancelled", opts.color));
+      const agent = key ? snapshot.agents.find((a) => agentKey(a) === key) : undefined;
+      if (!agent) return setStatus(warn("agent gone — message cancelled", opts.color));
+      const label = agent.window_name ?? agent.short_id;
+      setStatus(dim(`sending to ${label}…`, opts.color));
+      sendOperatorMessage(
+        { session_id: agent.session_id, server_pid: agent.server_pid, short_id: label },
+        body,
+        {},
+      )
+        .then((r) => {
+          if (torndown) return;
+          if (r.ok) setStatus(ok(`→ sent to ${r.target_short_id} (wake:${r.wake_status})`, opts.color));
+          else setStatus(warn(`send failed: ${r.reason}`, opts.color));
+        })
+        .catch((e) => {
+          if (torndown) return;
+          setStatus(warn(`send error: ${e instanceof Error ? e.message : e}`, opts.color));
+        });
+    }
+
+    // Raw-mode line editing for the composer. Returns having handled the keystroke.
+    function composeKey(s: string): void {
+      if (s === "\x03") return teardown(0); // Ctrl-C still quits
+      if (s === "\x1b") {
+        // lone ESC cancels; an arrow (\x1b[A…) is multi-char and falls through to
+        // the printable filter below, which strips it.
+        composing = false;
+        composeBuf = "";
+        composeTargetKey = null;
+        return paint();
+      }
+      if (s === "\r" || s === "\n") return sendCompose();
+      if (s === "\x7f" || s === "\b") {
+        composeBuf = composeBuf.slice(0, -1);
+        return paint();
+      }
+      // Append printable input (single keypress OR a paste burst), stripping any
+      // control chars (incl. embedded newlines and stray escape sequences).
+      let printable = "";
+      for (const ch of s) if (ch >= " " && ch !== "\x7f" && ch !== "\x1b") printable += ch;
+      if (printable && composeBuf.length < COMPOSE_MAX) {
+        composeBuf = (composeBuf + printable).slice(0, COMPOSE_MAX);
+        paint();
+      }
+    }
+
     function teardown(code: number): void {
       if (torndown) return;
       torndown = true;
@@ -366,6 +434,9 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
 
     function onData(buf: Buffer | string): void {
       const s = buf.toString();
+      // Compose mode swallows ALL keystrokes (so 'q', '?', etc. type as text);
+      // composeKey itself handles Ctrl-C (quit) and Esc (cancel).
+      if (composing) return composeKey(s);
       // Handle the common keys. Escape sequences for arrows arrive as one chunk.
       if (s === "\x03" || s === "q") return teardown(0); // Ctrl-C / q
       if (s === "?") {
@@ -414,6 +485,16 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         return setStatus(
           warn(`nudge ${agent.window_name ?? agent.short_id}? press y to confirm`, opts.color),
         );
+      }
+      if (s === "m") {
+        const idx = selectedIndex();
+        if (idx < 0) return;
+        const agent = snapshot.agents[idx];
+        if (agent.is_self) return setStatus(warn("can't message yourself", opts.color));
+        composing = true;
+        composeBuf = "";
+        composeTargetKey = agentKey(agent); // bind by session key for the whole compose
+        return paint();
       }
       // ignore everything else
     }
