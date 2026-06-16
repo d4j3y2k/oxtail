@@ -36,10 +36,15 @@ const PASTE_ON = "\x1b[?2004h"; // enable bracketed paste (terminal wraps pastes
 const PASTE_OFF = "\x1b[?2004l";
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
+const FOCUS_ON = "\x1b[?1004h"; // enable focus reporting (terminal sends \x1b[I / \x1b[O)
+const FOCUS_OFF = "\x1b[?1004l";
+const FOCUS_IN = "\x1b[I";
+const FOCUS_OUT = "\x1b[O";
 
 const WATCH_DIRS = ["sessions", "mailboxes", "received", "pending-ask"];
 const DEBOUNCE_MS = 200;
 const SLOW_TICK_MS = 1500;
+const ANIM_TICK_MS = 500; // selected-name animation cadence (focus-gated; SPIKE)
 const MAX_WAIT_ROWS = 8;
 const LOG_FETCH = 200; // comms messages pulled for the log view (windowed to fit)
 
@@ -118,6 +123,14 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     let composeNote = ""; // transient composer feedback (attach result)
     let pasting = false; // inside a bracketed-paste sequence
     let pasteBuf = ""; // accumulates paste content across data chunks
+    // SPIKE (item 1): focus-gated selected-name animation. Animate only while the
+    // cockpit is the FOCUSED terminal window (paused on blur) so a free-running
+    // repaint can't burn CPU when David's looking at another pane — the enabler that
+    // makes animation compatible with oxpit's idle-cheap ethos. Env kill-switch.
+    const animEnabled = process.env.OXTAIL_OXPIT_ANIM !== "off";
+    let focused = true; // assume focused until the terminal says otherwise
+    let animFrame = 0;
+    let animTick: NodeJS.Timeout | null = null;
 
     const stdin = process.stdin;
     const stdout = process.stdout;
@@ -166,6 +179,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         d("  ✉N unread   ⚑N open obligations   ⏳ awaiting a peer reply"),
         d("  ⛔ DEADLOCK (live cycle)   ⚠ stale/possible cycle   † orphaned (target dead)"),
         d("  comms: ⚑ delegation  ⚑✓ done  ⚑✗ blocked  ❓ ask  ↩ reply"),
+        d("  the selected row's name twinkles while the cockpit is focused · OXTAIL_OXPIT_ANIM=off"),
         "",
         d("  press ? or q to return"),
       ];
@@ -198,7 +212,33 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         maxWaitRows: MAX_WAIT_ROWS,
         paneActivity,
         toolActivity: activityCache, // sticky overlay — never mutates the snapshot
+        animFrame: animEnabled ? animFrame : undefined, // animated selected-name frame
       });
+    }
+
+    // SPIKE animation timer — runs ONLY while focused; advances the frame + repaints
+    // when the fleet (with a selection) is the visible view. Stopped on blur so it's
+    // genuinely zero-cost when the cockpit isn't being looked at.
+    function startAnim(): void {
+      if (!animEnabled || animTick || torndown) return;
+      animTick = setInterval(() => {
+        if (torndown || !focused) return;
+        if (composing || helpOpen || mode === "log" || selectedIndex() < 0) return;
+        animFrame = (animFrame + 1) % 1_000_000;
+        paint();
+      }, ANIM_TICK_MS);
+    }
+    function stopAnim(): void {
+      if (animTick) {
+        clearInterval(animTick);
+        animTick = null;
+      }
+    }
+    function setFocus(f: boolean): void {
+      if (f === focused) return;
+      focused = f;
+      if (f) startAnim();
+      else stopAnim();
     }
 
     // Capture the SELECTED agent's live pane bottom-line (the one exec-class signal).
@@ -723,6 +763,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       torndown = true;
       if (debounceTimer) clearTimeout(debounceTimer);
       if (slowTick) clearInterval(slowTick);
+      stopAnim();
       for (const w of watchers) {
         try {
           w.close();
@@ -742,7 +783,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         // ignore
       }
       stdin.pause();
-      stdout.write(PASTE_OFF + CURSOR_SHOW + ALT_OFF);
+      stdout.write(FOCUS_OFF + PASTE_OFF + CURSOR_SHOW + ALT_OFF);
       resolve(code);
     }
 
@@ -759,6 +800,10 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     // One keystroke chunk → action. (Compose mode swallows all keys so 'q','?' type
     // as text; composeKey handles its own Ctrl-C/Esc.)
     function handleKey(s: string): void {
+      // Terminal focus reports (gate the animation) — handled in every mode, before
+      // anything else, so they never reach the composer or a key action.
+      if (s === FOCUS_IN) return setFocus(true);
+      if (s === FOCUS_OUT) return setFocus(false);
       if (composing) return composeKey(s);
       if (s === "\x03" || s === "q") return teardown(0); // Ctrl-C / q
       if (s === "?") {
@@ -893,8 +938,8 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       paint();
     }
 
-    // ── enter raw mode + alt screen + bracketed paste ────────────────────────
-    stdout.write(ALT_ON + CURSOR_HIDE + PASTE_ON);
+    // ── enter raw mode + alt screen + bracketed paste + focus reporting ───────
+    stdout.write(ALT_ON + CURSOR_HIDE + PASTE_ON + (animEnabled ? FOCUS_ON : ""));
     try {
       stdin.setRawMode(true);
     } catch {
@@ -931,6 +976,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     // First paint is read-only (instant startup, C7); the first slow tick ~1.5s
     // later does the first selected-pane capture.
     refresh(true);
+    startAnim(); // begin the focus-gated selected-name animation (no-op if disabled)
   });
 }
 

@@ -43,6 +43,10 @@ export type RenderOptions = {
   // supply a sticky last-known badge on fast ticks WITHOUT mutating the snapshot
   // (don't fork buildSnapshot's truth; max review).
   toolActivity?: Map<string, AgentActivity | null>;
+  // Animation frame counter (TUI only; undefined = static). When set, the SELECTED
+  // row's name is wrapped in an animated frame whose phase = animFrame: a gentle
+  // twinkle when idle, an energetic pulse when active. (backlog item 1 — a SPIKE.)
+  animFrame?: number;
 };
 
 type Paint = (s: string, ...codes: string[]) => string;
@@ -56,6 +60,30 @@ function makePaint(color: boolean): Paint {
 // (not a full-row reverse bar — that inverted the emoji/badges into harsh blocks).
 // 256-color shade; bump it lighter/darker to taste.
 const SELECT_BG = "\x1b[48;5;238m";
+
+// SPIKE (backlog item 1): animated frame around the SELECTED agent's name, advanced
+// by the TUI's focus-gated animation timer (animFrame). Glyphs are 1-column dingbat
+// ornamental brackets (already in oxpit's vocabulary via ❯) so the name cell can't
+// mis-measure; TUNE the glyphs/cadence to taste. Active = an energetic pulse
+// (alternating heavy/light angle brackets); idle = a gentle twinkle (brackets fade
+// to spaces and back). Each entry is [left, right]; phase = animFrame % length.
+const FRAME_ACTIVE: [string, string][] = [
+  ["❰", "❱"],
+  ["❮", "❯"],
+  ["❰", "❱"],
+  ["❮", "❯"],
+];
+const FRAME_IDLE: [string, string][] = [
+  ["❮", "❯"],
+  ["❮", "❯"],
+  [" ", " "],
+  [" ", " "],
+];
+function nameFrame(liveness: Liveness, animFrame: number): [string, string] {
+  const set = liveness === "active" ? FRAME_ACTIVE : FRAME_IDLE;
+  const i = ((animFrame % set.length) + set.length) % set.length;
+  return set[i];
+}
 
 const GLYPH: Record<Liveness, string> = {
   active: "🟢",
@@ -269,6 +297,7 @@ function renderAgentRow(
   labels: Map<string, string>,
   paneAct: PaneActivity | undefined,
   act: AgentActivity | null, // resolved tool sub-state (overlay-aware)
+  animFrame: number | undefined, // animated name frame for the selected row (TUI)
 ): string {
   const marker = i === selected ? paint("›", C.cyan, C.bold) : " ";
   const glyph = GLYPH[a.liveness];
@@ -278,7 +307,14 @@ function renderAgentRow(
   // of the row renders exactly as an unselected one. paint() drops the codes in
   // no-color mode, so the › marker alone carries the cue there.
   let id: string;
-  if (i === selected) {
+  if (i === selected && animFrame !== undefined) {
+    // Animated frame around the name (replaces the static underline in the TUI).
+    const [lb, rb] = nameFrame(a.liveness, animFrame);
+    const inner = clip(idText, ID_W - 2); // leave 2 cols for the bracket pair
+    const framed = `${lb}${inner}${rb}`;
+    const pad = " ".repeat(Math.max(0, ID_W - displayWidth(framed)));
+    id = paint(framed + pad, SELECT_BG, ...(a.is_self ? [C.bold] : []));
+  } else if (i === selected) {
     const clipped = clip(idText, ID_W); // name only (no trailing pad) — underline this
     const pad = " ".repeat(Math.max(0, ID_W - clipped.length));
     const name = paint(clipped, SELECT_BG, C.underline, ...(a.is_self ? [C.bold] : []));
@@ -552,7 +588,7 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
     if (total <= cap) {
       for (let i = 0; i < total; i++) {
         const a = s.agents[i];
-        lines.push(renderAgentRow(a, i, paint, width, selected, rowLabel(a), labels, paneAct(a), resolveAct(a)));
+        lines.push(renderAgentRow(a, i, paint, width, selected, rowLabel(a), labels, paneAct(a), resolveAct(a), opts.animFrame));
       }
     } else {
       // Window that always keeps the selected row visible (centered when possible).
@@ -562,7 +598,7 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
       if (start > 0) lines.push(paint(`  ⋯ ${start} more above`, C.dim));
       for (let i = start; i < end; i++) {
         const a = s.agents[i];
-        lines.push(renderAgentRow(a, i, paint, width, selected, rowLabel(a), labels, paneAct(a), resolveAct(a)));
+        lines.push(renderAgentRow(a, i, paint, width, selected, rowLabel(a), labels, paneAct(a), resolveAct(a), opts.animFrame));
       }
       if (end < total) lines.push(paint(`  ⋯ ${total - end} more below`, C.dim));
     }
