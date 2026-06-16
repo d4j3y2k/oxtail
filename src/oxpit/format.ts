@@ -84,34 +84,39 @@ export function scrubBufferText(s: string, keepNewline: boolean): string {
   return out;
 }
 
-// Symbols allowed THROUGH sanitizeCaptured beyond printable ASCII — a curated set
-// of glyphs that appear in agent pane chrome AND render in exactly 1 column in
-// standard monospace terminals (spinner stars, bullets, arrows, dashes, prompt
-// marks). Anything else in captured terminal output (CJK/fullwidth/emoji/combining
-// — widths displayWidth can't know) is DROPPED, so the result is provably 1-column.
+// Symbols allowed THROUGH sanitizeCaptured beyond printable ASCII — ONLY glyphs that
+// are unambiguously 1 column (Unicode East-Asian-Width = Neutral): the dingbat
+// spinner stars + check/prompt marks. EAW=Ambiguous glyphs (· … ↑↓←→↔ — – • ★ ◐
+// box-drawing …) are DELIBERATELY excluded: under a CJK locale or a terminal set to
+// ambiguous-width=double they render in 2 columns while displayWidth counts 1 — an
+// undercount that could let a captured line exceed the terminal and WRAP, desyncing
+// the cursor-home repaint (compile-sim HIGH). Dropping them from UNTRUSTED capture
+// keeps the words/digits that carry the meaning and makes the 1-column guarantee real
+// (a broad displayWidth change is unsafe — the composer's "─".repeat(width) rule
+// relies on box-drawing staying 1-col).
 const CAPTURE_ALLOW = new Set([
-  "·", "•", "…", "—", "–", "↑", "↓", "←", "→", "↔", "─", "│", "❯", "›", "‹", "✓", "✗",
-  "✶", "✷", "✸", "✹", "✺", "✻", "✼", "✽", "✾", "✿", "❀", "✱", "✲", "✳", "✴", "✦", "✧",
-  "∗", "★", "☆", "◐", "◓", "◑", "◒",
+  "✓", "✗", "❯", "∗", "✦", "✧",
+  "✶", "✷", "✸", "✹", "✺", "✻", "✼", "✽", "✾", "✿", "❀", "✱", "✲", "✳", "✴",
 ]);
 
 // Sanitize UNTRUSTED captured terminal text (a tmux capture-pane line) for display.
 // First the shared scrubber removes C0/C1/bidi/zero-width, then allowlist-drop to a
-// provably 1-column character set so width accounting can never undercount and wrap
-// the TUI (codex review #2 — clipToWidth alone is unsafe for arbitrary capture). The
-// caller still clipToWidths the result; this just guarantees the width math is exact.
+// provably 1-column character set (ASCII + EAW-Neutral dingbats) so width accounting
+// can never undercount and wrap the TUI (codex review #2 + compile-sim HIGH —
+// clipToWidth alone is unsafe for arbitrary capture). Runs of spaces left by dropped
+// separators are collapsed so the result reads cleanly.
 export function sanitizeCaptured(s: string): string {
   let out = "";
   for (const ch of scrubBufferText(s, false)) {
     const c = ch.codePointAt(0) ?? 0;
     if (c >= 0x20 && c <= 0x7e) {
-      out += ch; // printable ASCII
+      out += ch; // printable ASCII (all 1 column)
       continue;
     }
     if (CAPTURE_ALLOW.has(ch)) out += ch;
-    // else: drop exotic/wide/combining — lose the glyph, never the layout
+    // else: drop exotic/wide/ambiguous/combining — lose the glyph, never the layout
   }
-  return out;
+  return out.replace(/ {2,}/g, " "); // tidy gaps left by dropped separators
 }
 
 // Truncate a (possibly ANSI-colored) string to at most `width` display columns,

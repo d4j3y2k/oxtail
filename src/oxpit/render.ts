@@ -5,7 +5,7 @@
 
 import { cell, clip, clipToWidth, displayWidth, fmtAge } from "./format.js";
 import { ACTIVE_WINDOW_S, type FleetAgent, type FleetSnapshot, type Liveness } from "./snapshot.js";
-import { agentKey, type PaneActivity, type ToolKind } from "./activity.js";
+import { agentKey, type AgentActivity, type PaneActivity, type ToolKind } from "./activity.js";
 import type { CommsMessage } from "./comms.js";
 
 const C = {
@@ -38,6 +38,11 @@ export type RenderOptions = {
   // Live pane bottom-line per agent (keyed by agentKey), from capture-pane. When an
   // agent has one it becomes the row's trailing detail, beating a stale purpose.
   paneActivity?: Map<string, PaneActivity>;
+  // Tool sub-state OVERLAY (keyed by agentKey). When a key is present it overrides
+  // FleetAgent.activity (an explicit null = "known to have no tool") — lets the TUI
+  // supply a sticky last-known badge on fast ticks WITHOUT mutating the snapshot
+  // (don't fork buildSnapshot's truth; max review).
+  toolActivity?: Map<string, AgentActivity | null>;
 };
 
 type Paint = (s: string, ...codes: string[]) => string;
@@ -121,6 +126,7 @@ function badges(
   a: FleetAgent,
   paint: Paint,
   labels: Map<string, string>, // short_id → display label
+  act: AgentActivity | null, // resolved tool sub-state (overlay ?? a.activity)
 ): { text: string; len: number } {
   const parts: string[] = [];
   let len = 0;
@@ -144,8 +150,7 @@ function badges(
   }
   // Live tool sub-state FIRST — "what it's doing right now". Bright (family color +
   // bold) while the call is in-flight; dim once it has returned ("last did X").
-  if (a.activity) {
-    const act = a.activity;
+  if (act) {
     const label = act.tool === "tool" ? shortRawTool(act.tool_raw) : act.tool;
     const raw = `${TOOL_GLYPH[act.tool]}${label}${act.tool_running ? "…" : ""}`;
     add(raw, paint(raw, ...(act.tool_running ? [toolColor(act.tool), C.bold] : [C.dim])));
@@ -263,6 +268,7 @@ function renderAgentRow(
   label: string,
   labels: Map<string, string>,
   paneAct: PaneActivity | undefined,
+  toolAct: AgentActivity | null | undefined,
 ): string {
   const marker = i === selected ? paint("›", C.cyan, C.bold) : " ";
   const glyph = GLYPH[a.liveness];
@@ -282,7 +288,9 @@ function renderAgentRow(
   }
   const type = paint(cell(agentLabel(a.client_type), TYPE_W), C.dim);
   const status = paint(cell(statusText(a), STATUS_W), livenessColor(a.liveness));
-  const b = badges(a, paint, labels);
+  // Resolve the tool sub-state: a TUI overlay (sticky last-known) overrides the
+  // snapshot's own field, without ever mutating the snapshot.
+  const b = badges(a, paint, labels, toolAct ?? a.activity);
 
   // Fixed prefix visible width: marker(1) sp glyph(2) sp id sp type sp status sp
   const prefixLen = 1 + 1 + 2 + 1 + ID_W + 1 + TYPE_W + 1 + STATUS_W + 1;
@@ -513,6 +521,8 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
   const { byShortId: labels } = computeAgentLabels(s.agents);
   const rowLabel = (a: FleetAgent): string => labels.get(a.short_id) ?? a.short_id;
   const paneAct = (a: FleetAgent): PaneActivity | undefined => opts.paneActivity?.get(agentKey(a));
+  const toolAct = (a: FleetAgent): AgentActivity | null | undefined =>
+    opts.toolActivity?.get(agentKey(a));
 
   if (s.agents.length === 0) {
     lines.push(paint("  no agents registered in this project scope", C.dim));
@@ -529,7 +539,7 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
     if (total <= cap) {
       for (let i = 0; i < total; i++) {
         const a = s.agents[i];
-        lines.push(renderAgentRow(a, i, paint, width, selected, rowLabel(a), labels, paneAct(a)));
+        lines.push(renderAgentRow(a, i, paint, width, selected, rowLabel(a), labels, paneAct(a), toolAct(a)));
       }
     } else {
       // Window that always keeps the selected row visible (centered when possible).
@@ -539,7 +549,7 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
       if (start > 0) lines.push(paint(`  ⋯ ${start} more above`, C.dim));
       for (let i = start; i < end; i++) {
         const a = s.agents[i];
-        lines.push(renderAgentRow(a, i, paint, width, selected, rowLabel(a), labels, paneAct(a)));
+        lines.push(renderAgentRow(a, i, paint, width, selected, rowLabel(a), labels, paneAct(a), toolAct(a)));
       }
       if (end < total) lines.push(paint(`  ⋯ ${total - end} more below`, C.dim));
     }

@@ -158,10 +158,11 @@ export function runStatus(
   }
   const color = a.color ?? autoColor();
   const width = a.width && Number.isFinite(a.width) ? a.width : process.stdout.columns || 100;
-  // Live pane bottom-line per agent (capture-pane, all eligible agents — on-demand
-  // exec cost is fine for a one-shot). Each pane is re-verified before capture.
+  // Live pane bottom-line per agent (capture-pane). EXEC-class, so auto-off when
+  // stdout isn't a TTY (piped / `watch` / scripts) — don't fork capture-pane for
+  // every agent in a non-interactive run. The read-class tool badges still show.
   let paneActivity: Map<string, PaneActivity> | undefined;
-  if (!a.noActivity) {
+  if (!a.noActivity && process.stdout.isTTY) {
     try {
       paneActivity = captureFleetPanes(snap.agents);
     } catch {

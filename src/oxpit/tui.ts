@@ -201,6 +201,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         maxAgentRows,
         maxWaitRows: MAX_WAIT_ROWS,
         paneActivity,
+        toolActivity: activityCache, // sticky overlay — never mutates the snapshot
       });
     }
 
@@ -225,10 +226,14 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         return;
       }
       const key = agentKey(a);
-      const activityAt =
-        a.pane_activity_age_s != null ? snapshot.generated_at - a.pane_activity_age_s : null;
+      // Use the ABSOLUTE pty-activity epoch (not the clamped relative age, which a
+      // future-dated/skewed timestamp would pin to nowSec → capture every tick). When
+      // tmux reports NO activity time (null) we can't change-detect, so refresh each
+      // tick anyway — it's one pane, cheap (max review: fixes both the skew→every-tick
+      // and the null→inert edges).
+      const activityAt = a.pane_activity_at;
       const changed = key !== lastCapKey;
-      const newer = activityAt != null && (lastCapAt == null || activityAt > lastCapAt);
+      const newer = activityAt == null || lastCapAt == null || activityAt > lastCapAt;
       if (!force && !changed && !newer) return;
       const pa = capturePaneActivity(a);
       lastCapKey = key;
@@ -378,16 +383,14 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
 
     function refresh(full: boolean): void {
       // readActivity rides the same `full` flag as checkProcSig: ON for the slow
-      // tick / forced refresh, OFF for the 200ms fast fs-debounce. On a full build
-      // we refresh the activity cache from the fresh reads; on a fast build we
-      // overlay the cache so badges persist (and don't flicker) between slow ticks.
+      // tick / forced refresh, OFF for the 200ms fast fs-debounce. On a full build we
+      // refresh the sticky tool-badge cache from the fresh reads. Fast builds do NOT
+      // recompute it and do NOT mutate the snapshot — the cache is handed to the
+      // renderer as an overlay (toolActivity) so badges persist between slow ticks
+      // without forking buildSnapshot's truth (max review).
       snapshot = buildSnapshot({ ...opts.buildOpts, checkProcSig: full, readActivity: full });
       if (full) {
         activityCache = new Map(snapshot.agents.map((a) => [agentKey(a), a.activity]));
-      } else {
-        for (const a of snapshot.agents) {
-          if (a.activity == null) a.activity = activityCache.get(agentKey(a)) ?? null;
-        }
       }
       reconcileSelection();
       paint();

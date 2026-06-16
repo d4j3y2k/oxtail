@@ -190,13 +190,21 @@ function splitBufferByNewline(buf: Buffer): Buffer[] {
 export function scanTailLines(
   path: string,
   onLine: (line: string) => "stop" | "continue",
-  opts: { chunkSize?: number } = {},
+  opts: { chunkSize?: number; maxBytes?: number } = {},
 ): { reachedBOF: boolean } {
   const chunkSize = Math.max(
     MIN_CHUNK_SIZE,
     Math.floor(finiteOr(opts.chunkSize, DEFAULT_CHUNK_SIZE)),
   );
+  // Optional byte budget on the reverse read — a backstop so a tail scan that never
+  // hits `onLine`'s stop (e.g. a long stretch with no matching line) can't read the
+  // whole multi-MB file backward. Unset ⇒ unbounded (read until stop / BOF).
+  const maxBytes =
+    opts.maxBytes != null && Number.isFinite(opts.maxBytes) && opts.maxBytes > 0
+      ? Math.floor(opts.maxBytes)
+      : Infinity;
   let stopped = false;
+  let bytesRead = 0;
   const fd = openSync(path, "r");
   try {
     let pos = fstatSync(fd).size;
@@ -206,6 +214,7 @@ export function scanTailLines(
       pos -= readSize;
       const chunk = Buffer.allocUnsafe(readSize);
       readSync(fd, chunk, 0, readSize, pos);
+      bytesRead += readSize;
       const buf = Buffer.concat([chunk, leftover]);
       const segments = splitBufferByNewline(buf);
       // segments[0] is the new leftmost partial (extends further left, unless we
@@ -220,6 +229,7 @@ export function scanTailLines(
           break;
         }
       }
+      if (bytesRead >= maxBytes) break; // byte budget exhausted — stop scanning back
     }
     // Consumed the whole file without ever stopping → the final leftover is the
     // file's first line; process it so a full scan accounts for every line.
@@ -255,20 +265,20 @@ function readTailScan(
   );
 
   const newestFirst: TranscriptMessage[] = [];
-  // `hitLimit` — we stopped because we collected `limit` messages, so MORE may
-  // exist above the window. Exactness keys on this, NOT on reaching byte-offset
-  // 0: a small file fits in one chunk, so we can read every byte yet still cap
-  // out mid-chunk having skipped older messages. The total is exact only when we
-  // never capped — i.e. we accounted for every message in the file.
-  let hitLimit = false;
+  // Fetch one PAST the limit (a sentinel): if a (limit+1)th message exists, MORE are
+  // above the window ⇒ inexact; if we hit BOF with ≤ limit, the read is exact. This
+  // restores byte-identity with the original full-scan/BOF-push semantics — a file
+  // holding exactly `limit` messages whose oldest is the first physical line (so it
+  // arrives via the BOF leftover) must read as EXACT, not truncated (max review).
+  let exceeded = false;
   scanTailLines(
     path,
     (line) => {
       const m = parseLine(line);
       if (m) {
         newestFirst.push(m);
-        if (newestFirst.length >= limit) {
-          hitLimit = true;
+        if (newestFirst.length > limit) {
+          exceeded = true;
           return "stop";
         }
       }
@@ -276,8 +286,9 @@ function readTailScan(
     },
     { chunkSize },
   );
+  if (exceeded) newestFirst.pop(); // drop the sentinel; keep exactly `limit` newest
 
-  const exact = !hitLimit; // every message accounted for iff we never capped
+  const exact = !exceeded; // exact iff we accounted for every message (never exceeded)
   const chronological = newestFirst.slice().reverse();
   const { kept, bytesTruncated } = applyByteBudget(chronological, maxBytes);
   const messages = kept.map((m) => ({

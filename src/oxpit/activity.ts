@@ -49,10 +49,12 @@ export function agentKey(a: { session_id: string | null; server_pid: number }): 
   return a.session_id ?? `pid:${a.server_pid}`;
 }
 
-// Safety cap on lines scanned newest-first before giving up. The latest tool call
-// is almost always within the last handful of lines; this only bounds the
-// pathological "huge transcript with no recent tool" case (→ honest null).
+// Backstops on the newest-first scan before giving up (→ honest null). The latest
+// tool call is almost always within the last handful of lines; these only bound the
+// pathological "huge transcript with no recent tool" case. BOTH a line cap and a
+// byte cap (the generic reverse reader is otherwise unbounded once maxBytes-less).
 const MAX_SCAN_LINES = 2000;
+const MAX_SCAN_BYTES = 512 * 1024;
 
 const OXTAIL_VERBS = new Set([
   "claim_session",
@@ -146,7 +148,7 @@ export function scanLatestTool(
         }
       }
       return "continue";
-    });
+    }, { maxBytes: MAX_SCAN_BYTES });
   } catch {
     return null; // fd/read error — honest unknown
   }
@@ -193,23 +195,37 @@ export function capturePaneActivity(agent: AgentRef, deps: CaptureDeps = {}): Pa
   const verifyPane =
     deps.verifyPane ??
     ((e: RegistryEntry) =>
-      chooseVerifiedWakePane({
-        tmux_pane: e.tmux_pane,
-        server_pid: e.server_pid,
-        proc_sig: e.proc_sig,
-      }));
+      // No proc_sig (legacy/unclaimed entry) ⇒ identity unprovable ⇒ refuse. Capture
+      // is stricter than wake: a missed capture is a harmless null; a wrong one leaks
+      // a stranger's pane (compile-sim/codex — close the fail-open on legacy entries).
+      e.proc_sig
+        ? chooseVerifiedWakePane({
+            tmux_pane: e.tmux_pane,
+            server_pid: e.server_pid,
+            proc_sig: e.proc_sig,
+          })
+        : null);
 
   const entry = resolveEntry(agent);
   if (!entry) return null;
   const pane = verifyPane(entry);
-  if (!pane) return null; // recycled / dead / pid-reused — refuse rather than leak
+  if (!pane) return null; // recycled / dead / pid-reused / no proc_sig — refuse
 
   let raw: string;
   try {
-    raw = run(["capture-pane", "-p", "-t", pane]);
+    raw = run(["capture-pane", "-p", "-J", "-t", pane]); // -J joins wrapped lines (parity w/ wake)
   } catch {
     return null;
   }
+
+  // TOCTOU guard (codex): the agent could have exited / the pane been repurposed
+  // BETWEEN verify and the capture exec. Re-resolve + re-verify; if the pane no
+  // longer provably hosts this agent, DISCARD the captured bytes rather than render
+  // a stranger's terminal. (Can't stop bytes briefly entering memory, but never
+  // displays wrong-pane content.)
+  const entry2 = resolveEntry(agent);
+  if (!entry2 || verifyPane(entry2) !== pane) return null;
+
   const lines = raw
     .split("\n")
     .map((l) => l.replace(/[ \t]+$/u, ""))
@@ -225,6 +241,11 @@ export function capturePaneActivity(agent: AgentRef, deps: CaptureDeps = {}): Pa
 // Anything matched is sanitized (untrusted) → provably 1-column.
 export function extractPaneActivity(lines: string[], _clientType: ClientType): PaneActivity {
   const busy = lines.some((l) => /esc to interrupt/i.test(l));
+  // Gate the tail on busy (codex): an IDLE pane still showing old text like "Working
+  // (notes)" / "Gallivanting… (eg)" would otherwise match and — since renderAgentRow
+  // prefers pane_tail over purpose — masquerade as live activity. Only a pane that is
+  // actively processing ("esc to interrupt") gets a live tail.
+  if (!busy) return { pane_tail: null, pane_busy: false };
   let tail: string | null = null;
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i];
@@ -242,7 +263,7 @@ export function extractPaneActivity(lines: string[], _clientType: ClientType): P
     }
   }
   const cleaned = tail ? sanitizeCaptured(tail).trim() : ""; // sanitizeCaptured scrubs first
-  return { pane_tail: cleaned ? cleaned : null, pane_busy: busy };
+  return { pane_tail: cleaned ? cleaned : null, pane_busy: true };
 }
 
 // Fields capturePaneActivity + the skip rules need — a structural subset of
@@ -253,18 +274,25 @@ type CapturableAgent = AgentRef & {
   is_self: boolean;
 };
 
-// Capture EVERY eligible agent's pane (one exec each) — for the one-shot `oxtail
-// status`, where on-demand exec cost is acceptable. The TUI does NOT use this (it
-// captures the selected row only). Skips dead (nothing to show), is_self (the
-// cockpit's own pane — a hall of mirrors), and pane-less agents. Returns a sparse
-// map keyed by agentKey (only agents with something live to show).
+// Soft cap on exec-class pane captures in a single `status` pass — a backstop so
+// `status --all` across many projects can't fork dozens of capture-panes (max).
+export const CAPTURE_FLEET_CAP = 16;
+
+// Capture EVERY eligible agent's pane (one exec each, up to CAPTURE_FLEET_CAP) — for
+// the one-shot `oxtail status`, where on-demand exec cost is acceptable. The TUI does
+// NOT use this (it captures the selected row only). Skips dead (nothing to show),
+// is_self (the cockpit's own pane — a hall of mirrors), and pane-less agents. Returns
+// a sparse map keyed by agentKey (only agents with something live to show).
 export function captureFleetPanes(
   agents: ReadonlyArray<CapturableAgent>,
   deps: CaptureDeps = {},
 ): Map<string, PaneActivity> {
   const out = new Map<string, PaneActivity>();
+  let captured = 0;
   for (const a of agents) {
     if (a.liveness === "dead" || a.is_self || !a.tmux_pane) continue;
+    if (captured >= CAPTURE_FLEET_CAP) break; // bound the fork count
+    captured++;
     const pa = capturePaneActivity(a, deps);
     if (pa && (pa.pane_tail || pa.pane_busy)) out.set(agentKey(a), pa);
   }

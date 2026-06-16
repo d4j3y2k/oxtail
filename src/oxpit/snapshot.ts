@@ -128,6 +128,11 @@ export type FleetAgent = {
   // spinner repaint bumps it) — surfaced as a "·✽Ns" hint so a cold transcript that
   // is still repainting reads as thinking-before-output. null = no pane / no tmux.
   pane_activity_age_s: number | null;
+  // The raw ABSOLUTE pty-activity epoch (unix seconds) behind that age. Carried so
+  // the TUI's capture change-detector compares stable epochs instead of round-tripping
+  // through the clamped relative age (a skew-clamped age→0 would otherwise re-track
+  // nowSec and capture every tick). null = no pane / no tmux activity time.
+  pane_activity_at: number | null;
 
   // Self-reported caption (cross-checked, never authority).
   purpose: string | null;
@@ -518,6 +523,7 @@ function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
     transcript_age_s: transcriptAgeS,
     proc_sig: procSig,
     pane_activity_age_s: paneActivityAgeS,
+    pane_activity_at: paneActAt != null && Number.isFinite(paneActAt) ? paneActAt : null,
     purpose,
     purpose_age_s: purposeAgeS,
     purpose_stale: purposeStale,

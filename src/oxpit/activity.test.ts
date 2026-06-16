@@ -152,8 +152,10 @@ const CODEX_ACTIVE = ["• Working (38s · esc to interrupt)", "› ghost", "  g
 test("extractPaneActivity — Claude active: spinner line + busy", () => {
   const r = extractPaneActivity(CLAUDE_ACTIVE.split("\n"), "claude-code");
   assert.equal(r.pane_busy, true);
-  assert.ok(r.pane_tail?.startsWith("Gallivanting…"), `got: ${r.pane_tail}`);
+  // sanitizeCaptured drops ambiguous-width glyphs (… · ↓) so the line stays 1-col.
+  assert.ok(r.pane_tail?.startsWith("Gallivanting"), `got: ${r.pane_tail}`);
   assert.ok(r.pane_tail?.includes("7.4k tokens"));
+  assert.ok(!r.pane_tail?.includes("…"), "ambiguous ellipsis dropped");
 });
 
 test("extractPaneActivity — Claude idle: no tail, not busy", () => {
@@ -165,7 +167,14 @@ test("extractPaneActivity — Claude idle: no tail, not busy", () => {
 test("extractPaneActivity — Codex working line", () => {
   const r = extractPaneActivity(CODEX_ACTIVE.split("\n"), "codex");
   assert.equal(r.pane_busy, true);
-  assert.equal(r.pane_tail, "Working (38s · esc to interrupt)");
+  assert.equal(r.pane_tail, "Working (38s esc to interrupt)"); // · dropped (ambiguous-width)
+});
+
+test("extractPaneActivity — idle pane with STALE 'Working (...)' text is NOT live (codex)", () => {
+  // No "esc to interrupt" anywhere ⇒ not busy ⇒ a historical match must not surface.
+  const idleWithOldText = ["Working (old notes from a past turn)", "❯ ", "  gpt-5.5 xhigh · ~/x"];
+  const r = extractPaneActivity(idleWithOldText, "codex");
+  assert.deepEqual(r, { pane_tail: null, pane_busy: false });
 });
 
 test("extractPaneActivity — busy but no extractable spinner ⇒ tail null, busy true", () => {
@@ -187,7 +196,7 @@ test("extractPaneActivity — hostile wide-Unicode/bidi line can't survive to wr
 test("sanitizeCaptured — drops wide/bidi, keeps ASCII + allowlisted glyphs", () => {
   assert.equal(sanitizeCaptured("abc你好def"), "abcdef");
   assert.equal(sanitizeCaptured("x‮y"), "xy");
-  assert.equal(sanitizeCaptured("✽ ok · done…"), "✽ ok · done…"); // allowlisted survive
+  assert.equal(sanitizeCaptured("✽ ok · done…"), "✽ ok done"); // narrow ✽ survives; ambiguous ·… dropped
   const wide = sanitizeCaptured("ＦＵＬＬ width");
   assert.equal(displayWidth(wide), [...wide].length); // 1-col guarantee
 });
@@ -216,7 +225,7 @@ test("capturePaneActivity — verified pane is captured + extracted", () => {
     { session_id: "s1", server_pid: 1, client_type: "claude-code" },
     { resolveEntry: () => fakeEntry, verifyPane: () => "%5", runTmux: () => CLAUDE_ACTIVE },
   );
-  assert.ok(r?.pane_tail?.startsWith("Gallivanting…"));
+  assert.ok(r?.pane_tail?.startsWith("Gallivanting")); // … dropped by sanitize (ambiguous-width)
   assert.equal(r?.pane_busy, true);
 });
 
@@ -226,4 +235,35 @@ test("capturePaneActivity — no fresh registry entry ⇒ null", () => {
     { resolveEntry: () => null, verifyPane: () => "%9", runTmux: () => CODEX_ACTIVE },
   );
   assert.equal(r, null);
+});
+
+test("capturePaneActivity — pane that MOVES between verify and capture is discarded (TOCTOU, codex)", () => {
+  // verifyPane returns %5 on the pre-capture check, then %6 on the post-capture
+  // re-verify (the agent exited / pane repurposed) ⇒ discard the captured bytes.
+  let call = 0;
+  const r = capturePaneActivity(
+    { session_id: "s1", server_pid: 1, client_type: "claude-code" },
+    {
+      resolveEntry: () => fakeEntry,
+      verifyPane: () => (++call === 1 ? "%5" : "%6"),
+      runTmux: () => CLAUDE_ACTIVE,
+    },
+  );
+  assert.equal(r, null, "wrong-pane capture must be discarded");
+});
+
+test("capturePaneActivity — pane STABLE across verify+capture is returned", () => {
+  const r = capturePaneActivity(
+    { session_id: "s1", server_pid: 1, client_type: "claude-code" },
+    { resolveEntry: () => fakeEntry, verifyPane: () => "%5", runTmux: () => CLAUDE_ACTIVE },
+  );
+  assert.ok(r?.pane_busy);
+});
+
+test("sanitizeCaptured — every output char is provably ≤1 column (displayWidth == codepoints)", () => {
+  // Throw the kitchen sink of wide/ambiguous/combining/emoji at it; the survivors
+  // must measure exactly their codepoint count (no undercount → no wrap).
+  const hostile = "✽ Gallivanting… (2m · ↓ 7k) 你好 🇯🇵 👨‍👩‍👧 é ★ ─ │ A→B";
+  const out = sanitizeCaptured(hostile);
+  assert.equal(displayWidth(out), [...out].length, `not 1-col: ${JSON.stringify(out)}`);
 });

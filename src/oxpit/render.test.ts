@@ -25,6 +25,7 @@ function agent(partial: Partial<FleetAgent>): FleetAgent {
     transcript_age_s: 120,
     proc_sig: "ok",
     pane_activity_age_s: null,
+    pane_activity_at: null,
     purpose: null,
     purpose_age_s: null,
     purpose_stale: false,
@@ -551,4 +552,31 @@ test("render: purpose still shows when there is no pane capture", () => {
     { color: false, width: 120, paneActivity: new Map() },
   );
   assert.ok(out.includes("declared thing"));
+});
+
+// ── tool-activity overlay (immutable, max review) ───────────────────────────────
+test("render: toolActivity overlay supplies a badge without the snapshot carrying one", () => {
+  const overlay = new Map([["sess1", { tool: "bash" as const, tool_raw: "Bash", tool_running: true }]]);
+  const out = renderSnapshot(
+    snap([agent({ session_id: "sess1", activity: null })]), // snapshot has no activity (fast tick)
+    { color: false, width: 120, toolActivity: overlay },
+  );
+  assert.ok(out.includes("⚙bash…"), `overlay badge expected, got:\n${out}`);
+});
+
+test("render: no overlay entry → falls back to the snapshot's own activity (status path)", () => {
+  const out = renderSnapshot(
+    snap([agent({ session_id: "sess1", activity: { tool: "bash", tool_raw: "Bash", tool_running: true } })]),
+    { color: false, width: 120, toolActivity: new Map() }, // empty overlay
+  );
+  assert.ok(out.includes("⚙bash…"), "snapshot activity shows when the overlay has no entry");
+});
+
+test("render: overlay null entry on a fast tick (no snapshot activity) → no badge", () => {
+  const overlay = new Map<string, null>([["sess1", null]]);
+  const out = renderSnapshot(
+    snap([agent({ session_id: "sess1", activity: null })]), // fast tick: snapshot read no activity
+    { color: false, width: 120, toolActivity: overlay },
+  );
+  assert.ok(!out.includes("⚙bash"), "a null overlay over a null snapshot shows nothing");
 });
