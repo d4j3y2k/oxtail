@@ -172,7 +172,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "                attach: drag a file then ⌃A · ⌃V pastes a clipboard image (copy then ⌃V)",
         "  l             toggle the comms-log bottom panel (fleet stays visible above)",
         "  w             open the selected agent's full thread in the panel (per-agent)",
-        "                in the panel: ↑↓ walk agents · ⇧↑↓ scroll (or PgUp/PgDn) · w full · f filter · ⏎ jump",
+        "                in the panel: ↑↓ scroll · j/k walk agents · Space/b page · w full · f filter · ⏎ jump",
         "  r             force refresh    ?  toggle help    q / Ctrl-C  quit",
         "",
         d("  🟢 active   🟡 idle   ⚫ dead (exited / pid-reused)"),
@@ -330,7 +330,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       const d = (s: string) => dim(s, opts.color);
       const sep = d("─".repeat(Math.max(4, width)));
       const footerKeys = d(
-        `  ↑↓ move · ⇧↑↓ scroll · w ${logFull ? "snippet" : "full"} · f filter${logFilterSelf ? "*" : ""} · ⏎ jump · l global · Esc close`,
+        `  ↑↓ scroll · jk agents · w ${logFull ? "snippet" : "full"} · f filter${logFilterSelf ? "*" : ""} · ⏎ jump · l global · Esc close`,
       );
       const { bySession } = computeAgentLabels(snapshot.agents);
       let comms: CommsMessage[] = buildCommsLog(snapshot.agents, { limit: LOG_FETCH });
@@ -836,18 +836,17 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (s === "r") return refresh(true);
       if (mode === "log") {
         if (s === "\x1b") return closeLog(); // Esc → close the panel (lone ESC, not an arrow)
-        // ↑↓ MOVE the fleet selection (panel follows it when filtered, item 4). History
-        // scrolls with ⇧↑/⇧↓ — the primary, laptop-friendly scroll (Mac has no real
-        // PgUp/PgDn) — plus PgUp/PgDn, Space/b (page), and [ / ] (line). So reaching
-        // for plain ↑ to read up can't silently swap threads.
-        if (s === "\x1b[1;2A") return logScroll(logPageSize()); // Shift+Up — older
-        if (s === "\x1b[1;2B") return logScroll(-logPageSize()); // Shift+Down — newer
-        if (s === "\x1b[A" || s === "k") return move(-1);
-        if (s === "\x1b[B" || s === "j") return move(1);
-        if (s === "\x1b[5~" || s === "b") return logScroll(logPageSize()); // PgUp — older
-        if (s === "\x1b[6~" || s === " ") return logScroll(-logPageSize()); // PgDn/Space — newer
-        if (s === "[") return logScroll(1); // older (line)
-        if (s === "]") return logScroll(-1); // newer (line)
+        // ↑↓ SCROLL the log (what you're reading) — PLAIN arrows, reliable everywhere
+        // (macOS Terminal eats Shift+arrows for its own scrollback, so those never
+        // arrive). j/k still WALK the fleet (panel follows when filtered) so the
+        // master-detail model is preserved for power users. Space/b and PgUp/PgDn
+        // (Fn+↑↓ on a Mac) page.
+        if (s === "\x1b[A") return logScroll(1); // ↑ — older
+        if (s === "\x1b[B") return logScroll(-1); // ↓ — newer
+        if (s === "k") return move(-1); // walk the fleet up (panel follows when filtered)
+        if (s === "j") return move(1); // walk the fleet down
+        if (s === " " || s === "\x1b[6~") return logScroll(-logPageSize()); // Space/PgDn — page newer
+        if (s === "b" || s === "\x1b[5~") return logScroll(logPageSize()); // b/PgUp — page older
         if (s === "\r" || s === "\n") return doJump(); // jump to the selected agent
         if (s === "w") {
           logFull = !logFull; // toggle full word-wrap vs snippet
