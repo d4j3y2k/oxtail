@@ -11,9 +11,9 @@
 //     SIGINT/SIGTERM, and uncaught errors, so a crash never wedges the terminal.
 
 import { watch, type FSWatcher } from "node:fs";
-import { existsSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { buildSnapshot, type FleetAgent, type FleetSnapshot } from "./snapshot.js";
 import { attentionLine, commsBodyLines, computeAgentLabels, renderSnapshot } from "./render.js";
 import { buildCommsLog, type CommsMessage } from "./comms.js";
@@ -21,6 +21,7 @@ import { clipToWidth } from "./format.js";
 import { jumpToAgent } from "./jump.js";
 import { NUDGE_TEXT, sendOperatorMessage } from "./operator.js";
 import { formatAttachmentNote, stageAttachment, type StagedAttachment } from "./attachments.js";
+import { captureClipboardImage } from "./clipboard.js";
 import { parseStatusArgs, USAGE } from "./cli.js";
 
 const ALT_ON = "\x1b[?1049h";
@@ -180,7 +181,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "  ⏎             jump to the selected agent's tmux pane",
         "  n             nudge the selected agent (canned operator message; y to confirm)",
         "  m             compose a message (Enter send · ⌥⏎/⌃J newline · ⌃X unattach · Esc cancel)",
-        "                attach: drag a file into the composer, then press ⌃A (or type a path + ⌃A)",
+        "                attach: drag a file then ⌃A · ⌃V pastes a clipboard image (copy then ⌃V)",
         "  l             comms-log (fleet ⇄ log); in log: w full-text · f filter · ↑↓ scroll",
         "  r             force refresh    ?  toggle help    q / Ctrl-C  quit",
         "",
@@ -305,7 +306,9 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (composeNote) foot.push(d("  " + composeNote));
       foot.push("");
       const undo = composeAttachments.length ? " · ⌃X unattach" : "";
-      foot.push(d(`  Enter send · ⌥⏎/⌃J newline · drag a file then ⌃A attach${undo} · Esc cancel`));
+      foot.push(
+        d(`  Enter send · ⌥⏎/⌃J newline · drag+⌃A attach · ⌃V paste image${undo} · Esc cancel`),
+      );
       const avail = Math.max(3, rows - 2 - foot.length); // header(2) + footer chrome
       lines.push(...(body.length > avail ? body.slice(body.length - avail) : body));
       lines.push(...foot);
@@ -508,6 +511,34 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       paint();
     }
 
+    // ⌃V paste a clipboard IMAGE. A terminal can't deliver image bytes over stdin, so
+    // we grab the clipboard out-of-band (macOS osascript) to a temp file and stage
+    // that by reference — same copy-to-attachments path as a drag. The temp dir is
+    // removed once stageAttachment has frozen its own copy.
+    function pasteClipboardImage(): void {
+      composeNote = "reading clipboard image…";
+      paint();
+      const c = captureClipboardImage();
+      if (!c.ok) {
+        composeNote = `✗ ${c.reason}`;
+        return paint();
+      }
+      const r = stageAttachment(c.path);
+      try {
+        rmSync(dirname(c.path), { recursive: true, force: true });
+      } catch {
+        // temp cleanup is best-effort
+      }
+      if (!r.ok) {
+        composeNote = `✗ ${r.reason}`;
+        return paint();
+      }
+      composeAttachments.push(r.attachment);
+      composeAttachSources.push(""); // no meaningful source path to restore on ⌃X
+      composeNote = `📎 ${r.attachment.name} (${r.attachment.bytes}B) — ⌃X to undo`;
+      paint();
+    }
+
     // Undo the last attachment and restore its source path into the buffer as text —
     // the safety net for the paste-auto-attach ambiguity (max review): "I meant that
     // path as text, not a file."
@@ -563,6 +594,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (s[0] === "\x1b") return;
       if (s === "\x18") return unattachLast(); // Ctrl-X: undo last attachment
       if (s === "\x01") return attachFromBuffer(); // Ctrl-A: attach a path from the buffer
+      if (s === "\x16") return pasteClipboardImage(); // Ctrl-V: paste a clipboard image
       if (s === "\r") return sendCompose(); // Enter sends
       if (s === "\n") return composeInsert("\n"); // Ctrl-J newline
       if (s === "\x7f" || s === "\b") {
