@@ -179,7 +179,8 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "  ↑/k  ↓/j      move selection (fleet) / scroll (log)",
         "  ⏎             jump to the selected agent's tmux pane",
         "  n             nudge the selected agent (canned operator message; y to confirm)",
-        "  m             compose (Enter send · ⌥⏎/⌃J newline · ⌃A/drag attach · ⌃X unattach · Esc cancel)",
+        "  m             compose a message (Enter send · ⌥⏎/⌃J newline · ⌃X unattach · Esc cancel)",
+        "                attach: drag a file into the composer, then press ⌃A (or type a path + ⌃A)",
         "  l             comms-log (fleet ⇄ log); in log: w full-text · f filter · ↑↓ scroll",
         "  r             force refresh    ?  toggle help    q / Ctrl-C  quit",
         "",
@@ -304,7 +305,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (composeNote) foot.push(d("  " + composeNote));
       foot.push("");
       const undo = composeAttachments.length ? " · ⌃X unattach" : "";
-      foot.push(d(`  Enter send · ⌥⏎/⌃J newline · ⌃A/drag attach${undo} · Esc cancel`));
+      foot.push(d(`  Enter send · ⌥⏎/⌃J newline · drag a file then ⌃A attach${undo} · Esc cancel`));
       const avail = Math.max(3, rows - 2 - foot.length); // header(2) + footer chrome
       lines.push(...(body.length > avail ? body.slice(body.length - avail) : body));
       lines.push(...foot);
@@ -474,15 +475,37 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
 
     function attachPath(p: string): boolean {
       const r = stageAttachment(p);
-      if (r.ok) {
-        composeAttachments.push(r.attachment);
-        composeAttachSources.push(p); // remember the source so ⌃X can restore it as text
-        composeNote = `📎 ${r.attachment.name} (${r.attachment.bytes}B) — ⌃X to undo`;
-      } else {
-        composeNote = `✗ ${r.reason}`;
-      }
+      if (!r.ok) return false; // caller decides what to show (may try a fallback)
+      composeAttachments.push(r.attachment);
+      composeAttachSources.push(p); // remember the source so ⌃X can restore it as text
+      composeNote = `📎 ${r.attachment.name} (${r.attachment.bytes}B) — ⌃X to undo`;
       paint();
-      return r.ok;
+      return true;
+    }
+
+    // ⌃A attach. Two cases: (1) the whole buffer is a path (drag into an empty
+    // composer, or a typed path). (2) a path got APPENDED to typed text — many
+    // terminals inject a drag-and-drop as plain keystrokes (NOT a bracketed paste),
+    // so onPaste never sees it and the path lands in the buffer as text. So also
+    // extract a trailing absolute path token (backslash-escaped spaces included),
+    // attach it, and keep the rest of the message. stageAttachment unescapes.
+    function attachFromBuffer(): void {
+      const whole = composeBuf.trim();
+      if (!whole) {
+        composeNote = "✗ drag a file or type a path, then ⌃A";
+        return paint();
+      }
+      if (attachPath(whole)) {
+        composeBuf = "";
+        return paint();
+      }
+      const m = composeBuf.match(/(\/(?:\\ |\S)+)\s*$/); // trailing /abs/path (esc spaces)
+      if (m && attachPath(m[1])) {
+        composeBuf = composeBuf.slice(0, m.index).replace(/\s+$/, "");
+        return paint();
+      }
+      composeNote = "✗ no attachable file found (drag a file, then ⌃A)";
+      paint();
     }
 
     // Undo the last attachment and restore its source path into the buffer as text —
@@ -539,17 +562,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       // buffer as text (max review — verified composer bug).
       if (s[0] === "\x1b") return;
       if (s === "\x18") return unattachLast(); // Ctrl-X: undo last attachment
-      if (s === "\x01") {
-        // Ctrl-A: treat the current line as a file path and attach it (drag-to-attach
-        // works too, via onPaste). Clear the buffer only on a successful stage.
-        const p = composeBuf.trim();
-        if (!p) {
-          composeNote = "✗ type a file path, then ⌃A to attach";
-          return paint();
-        }
-        if (attachPath(p)) composeBuf = "";
-        return paint();
-      }
+      if (s === "\x01") return attachFromBuffer(); // Ctrl-A: attach a path from the buffer
       if (s === "\r") return sendCompose(); // Enter sends
       if (s === "\n") return composeInsert("\n"); // Ctrl-J newline
       if (s === "\x7f" || s === "\b") {
