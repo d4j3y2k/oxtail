@@ -10,6 +10,7 @@ import {
   type OperatorSendResult,
   type OperatorTarget,
 } from "./operator.js";
+import { formatAttachmentNote, stageAttachment } from "./attachments.js";
 import type { FleetAgent } from "./snapshot.js";
 
 export type StatusArgs = {
@@ -137,12 +138,14 @@ export function runStatus(
 
 // ── oxtail message — operator send (act-from-cockpit, one-shot) ────────────────
 
-export const MESSAGE_USAGE = `oxtail message <target> <message…>   — send a human-authorized message to one agent
-oxtail message <target> --nudge       — send the canned "check your work" nudge
-oxtail message --broadcast --yes <message…>  — send to every live agent in scope
+export const MESSAGE_USAGE = `oxtail message <target> <message…>            — message one agent
+oxtail message <target> --nudge               — canned "check your work" nudge
+oxtail message <target> --attach <path> [msg] — attach a file (staged; agent reads it)
+oxtail message --broadcast --yes <message…>   — send to every live agent in scope
 
 target: a session id, short id, or tmux window name (see oxtail status)
-flags:  --nudge   --no-wake   --broadcast --yes [--cap N] [--include-main]   --all   --project PATH
+flags:  --nudge  --attach <path> (repeatable)  --no-wake  --broadcast --yes [--cap N]
+        [--include-main]  --all  --project PATH
 
 Operator messages are human-authorized but untrusted transport: they carry no agent
 identity (origin=operator), are one-way (the recipient cannot reply to them), and
@@ -160,6 +163,7 @@ type MessageArgs = {
   all: boolean;
   project: string | undefined;
   includeMain: boolean; // include your own/main session in a broadcast
+  attach: string[]; // file paths to stage + attach (repeatable --attach)
   help: boolean;
 };
 
@@ -174,6 +178,7 @@ export function parseMessageArgs(argv: string[]): MessageArgs {
     all: false,
     project: undefined,
     includeMain: false,
+    attach: [],
     help: false,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -184,6 +189,8 @@ export function parseMessageArgs(argv: string[]): MessageArgs {
     else if (arg === "--broadcast") a.broadcast = true;
     else if (arg === "--yes" || arg === "-y") a.yes = true;
     else if (arg === "--include-main") a.includeMain = true;
+    else if (arg === "--attach") a.attach.push(argv[++i] ?? "");
+    else if (arg.startsWith("--attach=")) a.attach.push(arg.slice("--attach=".length));
     else if (arg === "--all") a.all = true;
     else if (arg === "--cap") a.cap = Number(argv[++i]);
     else if (arg.startsWith("--cap=")) a.cap = Number(arg.slice("--cap=".length));
@@ -231,6 +238,19 @@ function formatResult(r: OperatorSendResult): string {
   return `✓ operator → ${r.target_short_id}  (${r.message_id})${wake}${unc}`;
 }
 
+// Stage every --attach path; fail-closed (don't send a partial attachment set).
+// Returns the body note to append (empty if no attachments).
+function stageAll(paths: string[]): { ok: true; note: string } | { ok: false; reason: string } {
+  const staged = [];
+  for (const p of paths) {
+    if (!p.trim()) continue;
+    const r = stageAttachment(p);
+    if (!r.ok) return { ok: false, reason: `attach '${p}': ${r.reason}` };
+    staged.push(r.attachment);
+  }
+  return { ok: true, note: formatAttachmentNote(staged) };
+}
+
 export async function runMessage(
   argv: string[],
   out: (line: string) => void = (s) => process.stdout.write(s + "\n"),
@@ -243,9 +263,9 @@ export async function runMessage(
   const snap = buildSnapshot({ allProjects: a.all, projectRoot: a.project });
 
   if (a.broadcast) {
-    const body = a.nudge ? NUDGE_TEXT : a.positionals.join(" ");
-    if (!body.trim()) {
-      out("error: empty message (give text or --nudge)");
+    const baseBody = a.nudge ? NUDGE_TEXT : a.positionals.join(" ");
+    if (!baseBody.trim() && a.attach.length === 0) {
+      out("error: empty message (give text, --nudge, or --attach)");
       return 1;
     }
     // Live + claimed only; dead/unclaimed excluded; and your OWN/main session is
@@ -266,10 +286,17 @@ export async function runMessage(
     }
     const names = targets.map((t) => t.window_name ?? t.short_id).join(", ");
     if (!a.yes) {
-      out(`broadcast to ${targets.length} agent(s): ${names}`);
+      const att = a.attach.length ? ` + ${a.attach.length} attachment(s)` : "";
+      out(`broadcast to ${targets.length} agent(s)${att}: ${names}`);
       out("re-run with --yes to send.");
       return 1;
     }
+    const staged = stageAll(a.attach); // stage only on the actual send
+    if (!staged.ok) {
+      out("error: " + staged.reason);
+      return 1;
+    }
+    const body = baseBody + staged.note;
     let failures = 0;
     for (const ag of targets) {
       const r = await sendOperatorMessage(targetOf(ag), body, { wake: !a.noWake });
@@ -284,9 +311,14 @@ export async function runMessage(
     out(MESSAGE_USAGE);
     return 1;
   }
-  const body = a.nudge ? NUDGE_TEXT : a.positionals.slice(1).join(" ");
+  const staged = stageAll(a.attach);
+  if (!staged.ok) {
+    out("error: " + staged.reason);
+    return 1;
+  }
+  const body = (a.nudge ? NUDGE_TEXT : a.positionals.slice(1).join(" ")) + staged.note;
   if (!body.trim()) {
-    out("error: empty message (give text or --nudge)");
+    out("error: empty message (give text, --nudge, or --attach)");
     return 1;
   }
   const res = resolveAgent(snap.agents, target);

@@ -20,6 +20,7 @@ import { buildCommsLog, type CommsMessage } from "./comms.js";
 import { clipToWidth } from "./format.js";
 import { jumpToAgent } from "./jump.js";
 import { NUDGE_TEXT, sendOperatorMessage } from "./operator.js";
+import { formatAttachmentNote, stageAttachment, type StagedAttachment } from "./attachments.js";
 import { parseStatusArgs, USAGE } from "./cli.js";
 
 const ALT_ON = "\x1b[?1049h";
@@ -105,6 +106,8 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     let composeBuf = ""; // the message being typed
     let composeTargetKey: string | null = null; // agentKey the message is bound to
     const COMPOSE_MAX = 7000; // generous cap; mailbox bodies are ≤8KB
+    let composeAttachments: StagedAttachment[] = []; // staged files for the message
+    let composeNote = ""; // transient composer feedback (attach result)
     let pasting = false; // inside a bracketed-paste sequence
     let pasteBuf = ""; // accumulates paste content across data chunks
 
@@ -150,7 +153,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "  ↑/k  ↓/j      move selection (fleet) / scroll (log)",
         "  ⏎             jump to the selected agent's tmux pane",
         "  n             nudge the selected agent (canned operator message; y to confirm)",
-        "  m             compose a message (Enter send · ⌥⏎/⌃J newline · paste ok · Esc cancel)",
+        "  m             compose a message (Enter send · ⌥⏎/⌃J newline · ⌃A/drag attach · Esc cancel)",
         "  l             comms-log (fleet ⇄ log); in log: w full-text · f filter · ↑↓ scroll",
         "  r             force refresh    ?  toggle help    q / Ctrl-C  quit",
         "",
@@ -259,11 +262,16 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       }
       if (body.length === 0) body.push("  ");
       body[body.length - 1] += "█";
-      // Keep the tail visible if the message is taller than the screen.
-      const avail = Math.max(3, rows - 5);
+      // Footer chrome (attachments list + note + blank + hint) is rendered below the
+      // buffer; reserve its rows so the buffer tail stays visible on a tall message.
+      const foot: string[] = [];
+      for (const att of composeAttachments) foot.push(d(`  📎 ${att.name} (${att.bytes}B)`));
+      if (composeNote) foot.push(d("  " + composeNote));
+      foot.push("");
+      foot.push(d("  Enter send · ⌥⏎ / ⌃J newline · ⌃A attach (or drag a file) · Esc cancel"));
+      const avail = Math.max(3, rows - 2 - foot.length); // header(2) + footer chrome
       lines.push(...(body.length > avail ? body.slice(body.length - avail) : body));
-      lines.push("");
-      lines.push(d("  Enter send · ⌥⏎ / ⌃J newline · Esc cancel"));
+      lines.push(...foot);
       return lines.map((l) => clipToWidth(l, width) + CLEAR_EOL).join("\n");
     }
 
@@ -379,18 +387,24 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     // so churn can't re-point it), then leave compose mode.
     function sendCompose(): void {
       const body = composeBuf.trim();
+      const atts = composeAttachments;
       const key = composeTargetKey;
       composing = false;
       composeBuf = "";
       composeTargetKey = null;
-      if (!body) return setStatus(warn("empty message — cancelled", opts.color));
+      composeAttachments = [];
+      composeNote = "";
+      // Attach-only sends are allowed (drag a file, hit Enter) — but a wholly empty
+      // composer (no text, no files) is a cancel, not a send.
+      if (!body && atts.length === 0) return setStatus(warn("empty message — cancelled", opts.color));
       const agent = key ? snapshot.agents.find((a) => agentKey(a) === key) : undefined;
       if (!agent) return setStatus(warn("agent gone — message cancelled", opts.color));
       const label = agent.window_name ?? agent.short_id;
+      const full = body + formatAttachmentNote(atts);
       setStatus(dim(`sending to ${label}…`, opts.color));
       sendOperatorMessage(
         { session_id: agent.session_id, server_pid: agent.server_pid, short_id: label },
-        body,
+        full,
         {},
       )
         .then((r) => {
@@ -406,6 +420,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
 
     function composeInsert(t: string): void {
       if (!t) return;
+      composeNote = ""; // typing dismisses any attach feedback
       composeBuf = (composeBuf + t).slice(0, COMPOSE_MAX);
       paint();
     }
@@ -414,13 +429,38 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       composing = false;
       composeBuf = "";
       composeTargetKey = null;
+      composeAttachments = [];
+      composeNote = "";
       paint();
     }
 
-    // Bracketed-paste content: insert literally, newlines preserved (normalized),
-    // control chars stripped — so a multi-line paste never fires-send or corrupts.
+    function attachPath(p: string): boolean {
+      const r = stageAttachment(p);
+      if (r.ok) {
+        composeAttachments.push(r.attachment);
+        composeNote = `📎 ${r.attachment.name} (${r.attachment.bytes}B)`;
+      } else {
+        composeNote = `✗ ${r.reason}`;
+      }
+      paint();
+      return r.ok;
+    }
+
+    // Bracketed-paste content. A single-line paste that resolves to a stageable file
+    // = drag-to-attach; otherwise insert as text (newlines preserved, control
+    // stripped — so a multi-line paste never fires-send or corrupts).
     function onPaste(content: string): void {
       if (!composing) return; // paste only meaningful in the composer
+      const single = content.trim();
+      if (single && !single.includes("\n")) {
+        const r = stageAttachment(single);
+        if (r.ok) {
+          composeAttachments.push(r.attachment);
+          composeNote = `📎 ${r.attachment.name} (${r.attachment.bytes}B)`;
+          return paint();
+        }
+        // not a file → fall through and insert as text
+      }
       const norm = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
       let clean = "";
       for (const ch of norm) if (ch === "\n" || (ch >= " " && ch !== "\x7f" && ch !== "\x1b")) clean += ch;
@@ -434,6 +474,17 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (s === "\x03") return teardown(0);
       if (s === "\x1b") return cancelCompose(); // lone ESC
       if (s === "\x1b\r" || s === "\x1b\n") return composeInsert("\n"); // Alt+Enter
+      if (s === "\x01") {
+        // Ctrl-A: treat the current line as a file path and attach it (drag-to-attach
+        // works too, via onPaste). Clear the buffer only on a successful stage.
+        const p = composeBuf.trim();
+        if (!p) {
+          composeNote = "✗ type a file path, then ⌃A to attach";
+          return paint();
+        }
+        if (attachPath(p)) composeBuf = "";
+        return paint();
+      }
       if (s === "\r") return sendCompose(); // Enter sends
       if (s === "\n") return composeInsert("\n"); // Ctrl-J newline
       if (s === "\x7f" || s === "\b") {
