@@ -11,6 +11,7 @@ const C = {
   reset: "\x1b[0m",
   bold: "\x1b[1m",
   dim: "\x1b[2m",
+  underline: "\x1b[4m",
   red: "\x1b[31m",
   green: "\x1b[32m",
   yellow: "\x1b[33m",
@@ -199,14 +200,18 @@ function renderAgentRow(
   const glyph = GLYPH[a.liveness];
   const idText = label + (a.is_self ? "*" : "");
   // Selection emphasis is confined to the AGENT column (David): a soft gray bg chip
-  // across just the padded name cell. The rest of the row renders exactly as an
-  // unselected one. paint() drops the codes in no-color mode, so the ❯/› marker
-  // alone carries the cue there.
-  const idCell = cell(idText, ID_W);
-  const id =
-    i === selected
-      ? paint(idCell, SELECT_BG, ...(a.is_self ? [C.bold] : []))
-      : paint(idCell, a.is_self ? C.bold : C.reset);
+  // across the padded name cell, with the NAME underlined for a touch more. The rest
+  // of the row renders exactly as an unselected one. paint() drops the codes in
+  // no-color mode, so the › marker alone carries the cue there.
+  let id: string;
+  if (i === selected) {
+    const clipped = clip(idText, ID_W); // name only (no trailing pad) — underline this
+    const pad = " ".repeat(Math.max(0, ID_W - clipped.length));
+    const name = paint(clipped, SELECT_BG, C.underline, ...(a.is_self ? [C.bold] : []));
+    id = name + (pad ? paint(pad, SELECT_BG) : ""); // bg continues under the pad, no underline
+  } else {
+    id = paint(cell(idText, ID_W), a.is_self ? C.bold : C.reset);
+  }
   const type = paint(cell(agentLabel(a.client_type), TYPE_W), C.dim);
   const status = paint(cell(statusText(a), STATUS_W), livenessColor(a.liveness));
   const b = badges(a, paint, labels);
