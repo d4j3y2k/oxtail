@@ -17,7 +17,7 @@ import { dirname, join } from "node:path";
 import { buildSnapshot, type FleetAgent, type FleetSnapshot } from "./snapshot.js";
 import { attentionLine, commsBodyLines, computeAgentLabels, renderSnapshot } from "./render.js";
 import { buildCommsLog, type CommsMessage } from "./comms.js";
-import { agentKey, type AgentActivity } from "./activity.js";
+import { agentKey, capturePaneActivity, type AgentActivity, type PaneActivity } from "./activity.js";
 import { clipToWidth, scrubBufferText } from "./format.js";
 import { jumpToAgent } from "./jump.js";
 import { NUDGE_TEXT, sendOperatorMessage } from "./operator.js";
@@ -90,6 +90,11 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     // for the whole fleet; the cheap 200ms fast ticks (readActivity off) reuse it so
     // the badge stays steady instead of flickering off on an unrelated mailbox event.
     let activityCache = new Map<string, AgentActivity | null>();
+    // Live pane-tail for the SELECTED row only (the one exec-class signal). Captured
+    // on selection-change + when the selected pane repaints; holds at most one entry.
+    let paneActivity = new Map<string, PaneActivity>();
+    let lastCapKey: string | null = null; // agentKey of the last pane we captured
+    let lastCapAt: number | null = null; // absolute pty-activity epoch at that capture
     let status = "";
     let statusUntil = 0;
     let debounceTimer: NodeJS.Timeout | null = null;
@@ -195,7 +200,42 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         selected: selectedIndex(),
         maxAgentRows,
         maxWaitRows: MAX_WAIT_ROWS,
+        paneActivity,
       });
+    }
+
+    // Capture the SELECTED agent's live pane bottom-line (the one exec-class signal).
+    // EXEC-cheap because it's one pane, gated by a change-detector: only when the
+    // selection changed (force) or the selected pane has produced new output since
+    // our last capture (window_activity advanced). Skipped while typing / in an
+    // overlay / log mode, and for dead·self·pane-less rows. capturePaneActivity
+    // re-verifies the pane id (a recycled id never captures a stranger).
+    function maybeCaptureSelected(force: boolean): void {
+      if (composing || helpOpen || mode === "log") return;
+      const idx = selectedIndex();
+      const a = idx >= 0 ? snapshot.agents[idx] : undefined;
+      if (!a || a.liveness === "dead" || a.is_self || !a.tmux_pane) {
+        // nothing capturable selected — drop any stale tail so it can't linger.
+        if (paneActivity.size) {
+          paneActivity = new Map();
+          lastCapKey = null;
+          lastCapAt = null;
+          paint();
+        }
+        return;
+      }
+      const key = agentKey(a);
+      const activityAt =
+        a.pane_activity_age_s != null ? snapshot.generated_at - a.pane_activity_age_s : null;
+      const changed = key !== lastCapKey;
+      const newer = activityAt != null && (lastCapAt == null || activityAt > lastCapAt);
+      if (!force && !changed && !newer) return;
+      const pa = capturePaneActivity(a);
+      lastCapKey = key;
+      lastCapAt = activityAt;
+      paneActivity = new Map();
+      if (pa && (pa.pane_tail || pa.pane_busy)) paneActivity.set(key, pa);
+      paint();
     }
 
     // Comms-log body, LINE-windowed to terminal height and scroll-positioned by
@@ -374,6 +414,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       idx = (idx + delta + snapshot.agents.length) % snapshot.agents.length;
       selectedKey = agentKey(snapshot.agents[idx]);
       paint();
+      maybeCaptureSelected(true); // capture the newly-selected pane immediately
     }
 
     function doJump(): void {
@@ -773,11 +814,16 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       }
     }
 
-    // ── slow fallback tick (ages mtime liveness; full proc_sig check) ─────────
+    // ── slow fallback tick (ages mtime liveness; full proc_sig check; refreshes
+    // tool badges; change-detected selected-pane capture) ─────────────────────
     slowTick = setInterval(() => {
-      if (!torndown) refresh(true);
+      if (torndown) return;
+      refresh(true);
+      maybeCaptureSelected(false);
     }, SLOW_TICK_MS);
 
+    // First paint is read-only (instant startup, C7); the first slow tick ~1.5s
+    // later does the first selected-pane capture.
     refresh(true);
   });
 }

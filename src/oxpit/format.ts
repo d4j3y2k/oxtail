@@ -84,6 +84,36 @@ export function scrubBufferText(s: string, keepNewline: boolean): string {
   return out;
 }
 
+// Symbols allowed THROUGH sanitizeCaptured beyond printable ASCII — a curated set
+// of glyphs that appear in agent pane chrome AND render in exactly 1 column in
+// standard monospace terminals (spinner stars, bullets, arrows, dashes, prompt
+// marks). Anything else in captured terminal output (CJK/fullwidth/emoji/combining
+// — widths displayWidth can't know) is DROPPED, so the result is provably 1-column.
+const CAPTURE_ALLOW = new Set([
+  "·", "•", "…", "—", "–", "↑", "↓", "←", "→", "↔", "─", "│", "❯", "›", "‹", "✓", "✗",
+  "✶", "✷", "✸", "✹", "✺", "✻", "✼", "✽", "✾", "✿", "❀", "✱", "✲", "✳", "✴", "✦", "✧",
+  "∗", "★", "☆", "◐", "◓", "◑", "◒",
+]);
+
+// Sanitize UNTRUSTED captured terminal text (a tmux capture-pane line) for display.
+// First the shared scrubber removes C0/C1/bidi/zero-width, then allowlist-drop to a
+// provably 1-column character set so width accounting can never undercount and wrap
+// the TUI (codex review #2 — clipToWidth alone is unsafe for arbitrary capture). The
+// caller still clipToWidths the result; this just guarantees the width math is exact.
+export function sanitizeCaptured(s: string): string {
+  let out = "";
+  for (const ch of scrubBufferText(s, false)) {
+    const c = ch.codePointAt(0) ?? 0;
+    if (c >= 0x20 && c <= 0x7e) {
+      out += ch; // printable ASCII
+      continue;
+    }
+    if (CAPTURE_ALLOW.has(ch)) out += ch;
+    // else: drop exotic/wide/combining — lose the glyph, never the layout
+  }
+  return out;
+}
+
 // Truncate a (possibly ANSI-colored) string to at most `width` display columns,
 // preserving escape sequences and closing any open SGR with a reset. The TUI's
 // safety net against wrap: every physical line is passed through this before the

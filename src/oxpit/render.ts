@@ -4,8 +4,8 @@
 // here, so tests get deterministic plain output.
 
 import { cell, clip, clipToWidth, displayWidth, fmtAge } from "./format.js";
-import type { FleetAgent, FleetSnapshot, Liveness } from "./snapshot.js";
-import type { ToolKind } from "./activity.js";
+import { ACTIVE_WINDOW_S, type FleetAgent, type FleetSnapshot, type Liveness } from "./snapshot.js";
+import { agentKey, type PaneActivity, type ToolKind } from "./activity.js";
 import type { CommsMessage } from "./comms.js";
 
 const C = {
@@ -35,6 +35,9 @@ export type RenderOptions = {
   // Max wait-graph body lines (cycles + non-cycle waiters) to render; extras are
   // summarized as "⋯ N more waits". Unset = render all.
   maxWaitRows?: number;
+  // Live pane bottom-line per agent (keyed by agentKey), from capture-pane. When an
+  // agent has one it becomes the row's trailing detail, beating a stale purpose.
+  paneActivity?: Map<string, PaneActivity>;
 };
 
 type Paint = (s: string, ...codes: string[]) => string;
@@ -125,6 +128,20 @@ function badges(
     parts.push(painted);
     len += displayWidth(raw) + 1; // +1 for the joining space; width-aware (emoji=2)
   };
+  // Orthogonal PANE-RECENT hint (the item-5 fix): a cold transcript (idle glyph) but
+  // the pane repainted within the active window ⇒ thinking-before-output. Rendered
+  // here, right after the status column, NOT promoted to the active glyph — pane
+  // output is not agent work (a /rc overlay repaint would otherwise lie "active").
+  // (A ✽ badge in the flex cluster, not an inline status suffix: the 13-col status
+  // cell would clip it.)
+  if (
+    a.liveness === "idle" &&
+    a.pane_activity_age_s != null &&
+    a.pane_activity_age_s <= ACTIVE_WINDOW_S
+  ) {
+    const raw = `✽${fmtAge(a.pane_activity_age_s)}`;
+    add(raw, paint(raw, C.green)); // green = pane is alive right now, despite idle glyph
+  }
   // Live tool sub-state FIRST — "what it's doing right now". Bright (family color +
   // bold) while the call is in-flight; dim once it has returned ("last did X").
   if (a.activity) {
@@ -245,6 +262,7 @@ function renderAgentRow(
   selected: number,
   label: string,
   labels: Map<string, string>,
+  paneAct: PaneActivity | undefined,
 ): string {
   const marker = i === selected ? paint("›", C.cyan, C.bold) : " ";
   const glyph = GLYPH[a.liveness];
@@ -270,13 +288,26 @@ function renderAgentRow(
   const prefixLen = 1 + 1 + 2 + 1 + ID_W + 1 + TYPE_W + 1 + STATUS_W + 1;
   let line = `${marker} ${glyph} ${id} ${type} ${status} ${b.text}`;
 
-  // Trailing purpose caption, clipped to remaining width. Grayed when stale.
-  if (a.purpose) {
+  // Trailing detail, clipped to remaining width. A LIVE pane line (the spinner /
+  // "working…") beats the self-reported purpose — observed > declared. Falls back to
+  // the purpose caption (grayed when stale) when there's no live capture.
+  let detailText: string | null = null;
+  let detailColor: string = C.dim;
+  if (paneAct?.pane_tail) {
+    detailText = paneAct.pane_tail;
+    detailColor = C.cyan;
+  } else if (paneAct?.pane_busy) {
+    detailText = "working…";
+    detailColor = C.cyan;
+  } else if (a.purpose) {
+    detailText = a.purpose;
+    detailColor = a.purpose_stale ? C.gray : C.dim;
+  }
+  if (detailText) {
     const used = prefixLen + b.len + (b.len > 0 ? 1 : 0);
     const remaining = width - used - 2;
     if (remaining >= 6) {
-      const cap = clip(a.purpose, remaining);
-      line += "  " + paint(cap, a.purpose_stale ? C.gray : C.dim);
+      line += "  " + paint(clip(detailText, remaining), detailColor);
     }
   }
   return line;
@@ -481,6 +512,7 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
 
   const { byShortId: labels } = computeAgentLabels(s.agents);
   const rowLabel = (a: FleetAgent): string => labels.get(a.short_id) ?? a.short_id;
+  const paneAct = (a: FleetAgent): PaneActivity | undefined => opts.paneActivity?.get(agentKey(a));
 
   if (s.agents.length === 0) {
     lines.push(paint("  no agents registered in this project scope", C.dim));
@@ -496,7 +528,8 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
     const cap = opts.maxAgentRows && opts.maxAgentRows > 0 ? opts.maxAgentRows : total;
     if (total <= cap) {
       for (let i = 0; i < total; i++) {
-        lines.push(renderAgentRow(s.agents[i], i, paint, width, selected, rowLabel(s.agents[i]), labels));
+        const a = s.agents[i];
+        lines.push(renderAgentRow(a, i, paint, width, selected, rowLabel(a), labels, paneAct(a)));
       }
     } else {
       // Window that always keeps the selected row visible (centered when possible).
@@ -505,7 +538,8 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
       const end = start + cap;
       if (start > 0) lines.push(paint(`  ⋯ ${start} more above`, C.dim));
       for (let i = start; i < end; i++) {
-        lines.push(renderAgentRow(s.agents[i], i, paint, width, selected, rowLabel(s.agents[i]), labels));
+        const a = s.agents[i];
+        lines.push(renderAgentRow(a, i, paint, width, selected, rowLabel(a), labels, paneAct(a)));
       }
       if (end < total) lines.push(paint(`  ⋯ ${total - end} more below`, C.dim));
     }

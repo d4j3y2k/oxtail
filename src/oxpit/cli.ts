@@ -2,6 +2,7 @@
 // (interactive TUI). Both are thin wrappers over the pure snapshot/render layer.
 
 import { buildSnapshot } from "./snapshot.js";
+import { captureFleetPanes, type PaneActivity } from "./activity.js";
 import { computeAgentLabels, fleetTrouble, renderCommsLog, renderSnapshot } from "./render.js";
 import { buildCommsLog } from "./comms.js";
 import {
@@ -157,7 +158,17 @@ export function runStatus(
   }
   const color = a.color ?? autoColor();
   const width = a.width && Number.isFinite(a.width) ? a.width : process.stdout.columns || 100;
-  out(renderSnapshot(snap, { color, width }));
+  // Live pane bottom-line per agent (capture-pane, all eligible agents — on-demand
+  // exec cost is fine for a one-shot). Each pane is re-verified before capture.
+  let paneActivity: Map<string, PaneActivity> | undefined;
+  if (!a.noActivity) {
+    try {
+      paneActivity = captureFleetPanes(snap.agents);
+    } catch {
+      paneActivity = undefined; // tmux absent / capture failed — degrade silently
+    }
+  }
+  out(renderSnapshot(snap, { color, width, paneActivity }));
   if (a.log) {
     const { bySession } = computeAgentLabels(snap.agents);
     out("");

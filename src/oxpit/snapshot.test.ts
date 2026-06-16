@@ -84,7 +84,7 @@ function buildOne(entry: RegistryEntry): FleetAgent {
     nowMs: NOW_MS,
     checkProcSig: false,
     selfSessionId: null,
-    resolveWindowNames: () => new Map(), // hermetic — don't hit the real tmux
+    resolvePaneInfo: () => new Map(), // hermetic — don't hit the real tmux
   });
   assert.equal(snap.agents.length, 1, "expected exactly one agent");
   return snap.agents[0];
@@ -195,7 +195,7 @@ test("window_name: resolved from the agent's pane via the injected resolver", ()
       nowMs: NOW_MS,
       checkProcSig: false,
       selfSessionId: null,
-      resolveWindowNames: () => new Map([["%9", "max"]]),
+      resolvePaneInfo: () => new Map([["%9", { name: "max", activity_at: null }]]),
     });
     assert.equal(snap.agents.length, 1);
     assert.equal(snap.agents[0].window_name, "max");
@@ -349,7 +349,7 @@ test("wait-graph: an ask with an observed reply is NOT a wait (H1 killer)", () =
       nowMs: NOW_MS,
       checkProcSig: false,
       selfSessionId: null,
-      resolveWindowNames: () => new Map(),
+      resolvePaneInfo: () => new Map(),
     });
     assert.equal(snap.agents.length, 1);
     assert.equal(snap.agents[0].waiting, null, "an answered ask must not render as waiting");
@@ -366,7 +366,7 @@ test("wait-graph: an ask with no observed reply still shows as waiting", () => {
       nowMs: NOW_MS,
       checkProcSig: false,
       selfSessionId: null,
-      resolveWindowNames: () => new Map(),
+      resolvePaneInfo: () => new Map(),
     });
     assert.equal(snap.agents.length, 1);
     assert.ok(snap.agents[0].waiting, "an unanswered ask shows as waiting");
@@ -389,7 +389,7 @@ test("sort: a troubled (waiting) agent floats above a higher-work healthy one in
       nowMs: NOW_MS,
       checkProcSig: false,
       selfSessionId: null,
-      resolveWindowNames: () => new Map(),
+      resolvePaneInfo: () => new Map(),
     });
     assert.equal(snap.agents.length, 2);
     // Both idle. A has 2 open obligations (more raw work); B is merely waiting. The

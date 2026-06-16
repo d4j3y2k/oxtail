@@ -24,6 +24,7 @@ function agent(partial: Partial<FleetAgent>): FleetAgent {
     liveness_reason: "idle",
     transcript_age_s: 120,
     proc_sig: "ok",
+    pane_activity_age_s: null,
     purpose: null,
     purpose_age_s: null,
     purpose_stale: false,
@@ -496,4 +497,58 @@ test("activity badge: absent when no activity", () => {
   for (const g of ["⚙", "↔", "✎", "▤", "⌕", "↗", "⎇", "☰"]) {
     assert.ok(!out.includes(g), `unexpected tool glyph ${g} with no activity`);
   }
+});
+
+// ── orthogonal pane-recent (·✽) hint ────────────────────────────────────────────
+test("pane-recent: idle agent with a fresh pane shows ✽age (item-5 fix)", () => {
+  const out = renderSnapshot(
+    snap([agent({ liveness: "idle", transcript_age_s: 200, pane_activity_age_s: 2 })]),
+    { color: false, width: 120 },
+  );
+  assert.ok(out.includes("✽2s"), `expected pane-recent hint, got:\n${out}`);
+  assert.match(out, /🟡/); // glyph stays idle — never promoted to active
+});
+
+test("pane-recent: stale pane (beyond active window) shows no hint", () => {
+  const out = renderSnapshot(
+    snap([agent({ liveness: "idle", transcript_age_s: 600, pane_activity_age_s: 120 })]),
+    { color: false, width: 120 },
+  );
+  assert.ok(!out.includes("✽"), "a long-quiet pane must not show the hint");
+});
+
+test("pane-recent: active agent gets no ✽ hint (idle band only)", () => {
+  const out = renderSnapshot(
+    snap([agent({ liveness: "active", transcript_age_s: 3, pane_activity_age_s: 1 })]),
+    { color: false, width: 120 },
+  );
+  assert.ok(!out.includes("✽"), "active rows already read live; no redundant hint");
+});
+
+// ── live pane-tail detail (beats purpose) ───────────────────────────────────────
+test("render: live pane_tail beats the purpose caption", () => {
+  const m = new Map([["sess1", { pane_tail: "Gallivanting… (2m)", pane_busy: true }]]);
+  const out = renderSnapshot(
+    snap([agent({ session_id: "sess1", purpose: "old declared purpose" })]),
+    { color: false, width: 120, paneActivity: m },
+  );
+  assert.ok(out.includes("Gallivanting"), "shows the live pane tail");
+  assert.ok(!out.includes("old declared purpose"), "observed pane line beats declared purpose");
+});
+
+test("render: pane_busy with no extractable tail shows working…", () => {
+  const m = new Map([["sess1", { pane_tail: null, pane_busy: true }]]);
+  const out = renderSnapshot(
+    snap([agent({ session_id: "sess1", purpose: "p" })]),
+    { color: false, width: 120, paneActivity: m },
+  );
+  assert.ok(out.includes("working…"), `expected working… got:\n${out}`);
+});
+
+test("render: purpose still shows when there is no pane capture", () => {
+  const out = renderSnapshot(
+    snap([agent({ session_id: "sess1", purpose: "declared thing" })]),
+    { color: false, width: 120, paneActivity: new Map() },
+  );
+  assert.ok(out.includes("declared thing"));
 });

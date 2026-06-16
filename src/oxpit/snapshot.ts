@@ -41,7 +41,7 @@ import {
 } from "../received.js";
 import { defaultPendingAskDir, listLivePendingAsks } from "../pending-ask.js";
 import { inferProjectRoot, pathBelongsToProjectScope, safeRealpath } from "../scope.js";
-import { paneWindowNames } from "./jump.js";
+import { panePresence, type PaneInfo } from "./jump.js";
 import { scanLatestTool, type AgentActivity } from "./activity.js";
 
 function envPosInt(name: string, def: number, env: NodeJS.ProcessEnv = process.env): number {
@@ -123,6 +123,11 @@ export type FleetAgent = {
   liveness_reason: LivenessReason;
   transcript_age_s: number | null; // null = no transcript file resolved/found
   proc_sig: "ok" | "reused" | "unknown";
+  // Seconds since the agent's tmux pane last produced OUTPUT (pty activity). An
+  // ORTHOGONAL signal to liveness — never folded into the enum (a status overlay /
+  // spinner repaint bumps it) — surfaced as a "·✽Ns" hint so a cold transcript that
+  // is still repainting reads as thinking-before-output. null = no pane / no tmux.
+  pane_activity_age_s: number | null;
 
   // Self-reported caption (cross-checked, never authority).
   purpose: string | null;
@@ -190,9 +195,10 @@ export type BuildSnapshotOptions = {
   // Source of registry entries. Defaults to the canonical readAll(); injectable
   // so tests can supply synthetic fleets without spawning live processes.
   readEntries?: () => RegistryEntry[];
-  // Resolve pane_id → tmux window name (for the human-facing label). Defaults to a
-  // single batched tmux call; injectable for tests / to disable (return new Map()).
-  resolveWindowNames?: () => Map<string, string>;
+  // Resolve pane_id → {window name, last pty-activity time} in one batched tmux
+  // call (window label + the orthogonal pane-recent hint). Injectable for tests /
+  // to disable (return new Map()).
+  resolvePaneInfo?: () => Map<string, PaneInfo>;
 };
 
 function errMsg(e: unknown): string {
@@ -374,7 +380,7 @@ type AgentCtx = {
   pending: Map<string, PendingAsk>;
   checkProcSig: boolean;
   readActivity: boolean;
-  windowNames: Map<string, string>;
+  paneInfo: Map<string, PaneInfo>;
 };
 
 function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
@@ -409,6 +415,15 @@ function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
       transcriptAgeS = null;
     }
   }
+
+  // Orthogonal pane-recent signal (window-scoped pty activity). Clamp ≥0 and guard
+  // a non-finite/empty reading — it's a wall-clock time_t that can be stale or
+  // garbage. NOT used for liveness; only the "·✽Ns" status hint + the TUI's
+  // capture change-detector.
+  const paneInfo = e.tmux_pane ? ctx.paneInfo.get(e.tmux_pane) : undefined;
+  const paneActAt = paneInfo?.activity_at ?? null;
+  const paneActivityAgeS =
+    paneActAt != null && Number.isFinite(paneActAt) ? Math.max(0, ctx.nowSec - paneActAt) : null;
 
   let liveness: Liveness;
   let reason: LivenessReason;
@@ -493,7 +508,7 @@ function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
   return {
     session_id: sid,
     short_id: shortId(sid, e.server_pid),
-    window_name: e.tmux_pane ? ctx.windowNames.get(e.tmux_pane) ?? null : null,
+    window_name: paneInfo?.name ?? null,
     client_type: e.client.type,
     server_pid: e.server_pid,
     cwd: e.client.cwd,
@@ -502,6 +517,7 @@ function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
     liveness_reason: reason,
     transcript_age_s: transcriptAgeS,
     proc_sig: procSig,
+    pane_activity_age_s: paneActivityAgeS,
     purpose,
     purpose_age_s: purposeAgeS,
     purpose_stale: purposeStale,
@@ -614,11 +630,11 @@ export function buildSnapshot(opts: BuildSnapshotOptions = {}): FleetSnapshot {
     }
   }
   for (const sid of answeredWaiters) pending.delete(sid);
-  let windowNames: Map<string, string>;
+  let paneInfo: Map<string, PaneInfo>;
   try {
-    windowNames = (opts.resolveWindowNames ?? paneWindowNames)();
+    paneInfo = (opts.resolvePaneInfo ?? panePresence)();
   } catch {
-    windowNames = new Map(); // tmux absent / failed — labels fall back to short_id
+    paneInfo = new Map(); // tmux absent / failed — labels fall back to short_id
   }
   const ctx: AgentCtx = {
     nowMs,
@@ -628,7 +644,7 @@ export function buildSnapshot(opts: BuildSnapshotOptions = {}): FleetSnapshot {
     pending,
     checkProcSig,
     readActivity,
-    windowNames,
+    paneInfo,
   };
 
   const agents: FleetAgent[] = [];

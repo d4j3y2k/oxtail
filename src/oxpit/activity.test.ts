@@ -131,3 +131,99 @@ test("agentKey — session id else pid", () => {
   assert.equal(agentKey({ session_id: "abc", server_pid: 1 }), "abc");
   assert.equal(agentKey({ session_id: null, server_pid: 7 }), "pid:7");
 });
+
+// ── EXEC class: capture-pane activity ───────────────────────────────────────────
+import { capturePaneActivity, extractPaneActivity } from "./activity.js";
+import { sanitizeCaptured, displayWidth } from "./format.js";
+import type { RegistryEntry } from "../registry.js";
+
+const CLAUDE_ACTIVE = [
+  "  ⎿  Waiting…",
+  "✽ Gallivanting… (2m 2s · ↓ 7.4k tokens)",
+  "──────────────────────────",
+  "❯ ",
+  "──────────────────────────",
+  "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt",
+].join("\n");
+
+const CLAUDE_IDLE = ["❯ ", "─────", "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"].join("\n");
+const CODEX_ACTIVE = ["• Working (38s · esc to interrupt)", "› ghost", "  gpt-5.5 xhigh · ~/dev/oxtail"].join("\n");
+
+test("extractPaneActivity — Claude active: spinner line + busy", () => {
+  const r = extractPaneActivity(CLAUDE_ACTIVE.split("\n"), "claude-code");
+  assert.equal(r.pane_busy, true);
+  assert.ok(r.pane_tail?.startsWith("Gallivanting…"), `got: ${r.pane_tail}`);
+  assert.ok(r.pane_tail?.includes("7.4k tokens"));
+});
+
+test("extractPaneActivity — Claude idle: no tail, not busy", () => {
+  const r = extractPaneActivity(CLAUDE_IDLE.split("\n"), "claude-code");
+  assert.equal(r.pane_tail, null);
+  assert.equal(r.pane_busy, false);
+});
+
+test("extractPaneActivity — Codex working line", () => {
+  const r = extractPaneActivity(CODEX_ACTIVE.split("\n"), "codex");
+  assert.equal(r.pane_busy, true);
+  assert.equal(r.pane_tail, "Working (38s · esc to interrupt)");
+});
+
+test("extractPaneActivity — busy but no extractable spinner ⇒ tail null, busy true", () => {
+  const r = extractPaneActivity(["doing stuff · esc to interrupt"], "claude-code");
+  assert.equal(r.pane_tail, null);
+  assert.equal(r.pane_busy, true);
+});
+
+test("extractPaneActivity — hostile wide-Unicode/bidi line can't survive to wrap (codex #2)", () => {
+  const hostile = ["Working (‮5s · 你好世界 · esc to interrupt)"];
+  const r = extractPaneActivity(hostile, "codex");
+  assert.ok(r.pane_tail, "still extracts the working line");
+  assert.ok(!r.pane_tail!.includes("‮"), "bidi override stripped");
+  assert.ok(!/[一-鿿]/.test(r.pane_tail!), "CJK dropped");
+  // provably 1-column: displayWidth equals codepoint count after sanitize.
+  assert.equal(displayWidth(r.pane_tail!), [...r.pane_tail!].length);
+});
+
+test("sanitizeCaptured — drops wide/bidi, keeps ASCII + allowlisted glyphs", () => {
+  assert.equal(sanitizeCaptured("abc你好def"), "abcdef");
+  assert.equal(sanitizeCaptured("x‮y"), "xy");
+  assert.equal(sanitizeCaptured("✽ ok · done…"), "✽ ok · done…"); // allowlisted survive
+  const wide = sanitizeCaptured("ＦＵＬＬ width");
+  assert.equal(displayWidth(wide), [...wide].length); // 1-col guarantee
+});
+
+const fakeEntry = {} as RegistryEntry;
+
+test("capturePaneActivity — stale/unverifiable pane captures NOTHING (codex #1)", () => {
+  let ran = false;
+  const r = capturePaneActivity(
+    { session_id: "s1", server_pid: 1, client_type: "claude-code" },
+    {
+      resolveEntry: () => fakeEntry,
+      verifyPane: () => null, // recycled / pid-reused → refuse
+      runTmux: () => {
+        ran = true;
+        return "STRANGER PANE";
+      },
+    },
+  );
+  assert.equal(r, null, "must not capture an unverified pane");
+  assert.equal(ran, false, "capture-pane must not even run for an unverified pane");
+});
+
+test("capturePaneActivity — verified pane is captured + extracted", () => {
+  const r = capturePaneActivity(
+    { session_id: "s1", server_pid: 1, client_type: "claude-code" },
+    { resolveEntry: () => fakeEntry, verifyPane: () => "%5", runTmux: () => CLAUDE_ACTIVE },
+  );
+  assert.ok(r?.pane_tail?.startsWith("Gallivanting…"));
+  assert.equal(r?.pane_busy, true);
+});
+
+test("capturePaneActivity — no fresh registry entry ⇒ null", () => {
+  const r = capturePaneActivity(
+    { session_id: "gone", server_pid: 9, client_type: "codex" },
+    { resolveEntry: () => null, verifyPane: () => "%9", runTmux: () => CODEX_ACTIVE },
+  );
+  assert.equal(r, null);
+});

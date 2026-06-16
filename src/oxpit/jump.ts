@@ -62,23 +62,56 @@ export function listPanes(run: TmuxRunner): PaneRow[] {
   return rows;
 }
 
-// Map live pane_id → its tmux window name, in one batched call. The cockpit uses
-// this for the human-facing AGENT label (you `rename-window main/max/codex` and it
-// shows that instead of a hex session id). Pure display — identity/jump stay keyed
-// on session_id, so a rename can never mis-target. Empty map when tmux is absent.
-export function paneWindowNames(run: TmuxRunner = realTmux): Map<string, string> {
+export type PaneInfo = {
+  name: string | null; // tmux window name (human label), null when unnamed
+  // Last pty-output time (epoch seconds). This is OUTPUT activity, NOT agent
+  // liveness — a status overlay / spinner repaint bumps it — so the cockpit
+  // surfaces it ONLY as an orthogonal "pane repainted Ns ago" hint, never folded
+  // into the liveness enum. Prefers pane_activity (pane-scoped); falls back to
+  // window_activity (window-scoped) on tmux builds that don't populate the former.
+  activity_at: number | null;
+};
+
+function toEpochSeconds(s: string | undefined): number | null {
+  if (!s) return null;
+  const n = Number(s);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+// One batched list-panes call: pane_id → window name + last pty-activity time. The
+// cockpit uses the name for the human-facing AGENT label (you `rename-window
+// main/max/codex` and it shows that instead of a hex session id; identity/jump stay
+// keyed on session_id so a rename can never mis-target) and the activity time for
+// the orthogonal pane-recent hint. Empty map when tmux is absent.
+export function panePresence(run: TmuxRunner = realTmux): Map<string, PaneInfo> {
   let out: string;
   try {
-    out = run(["list-panes", "-a", "-F", "#{pane_id}\t#{window_name}"]);
+    out = run([
+      "list-panes",
+      "-a",
+      "-F",
+      "#{pane_id}\t#{window_name}\t#{pane_activity}\t#{window_activity}",
+    ]);
   } catch {
     return new Map();
   }
-  const m = new Map<string, string>();
+  const m = new Map<string, PaneInfo>();
   for (const line of out.split("\n")) {
     if (!line) continue;
-    const [pane, name] = line.split("\t");
-    if (pane && name) m.set(pane, name);
+    const [pane, name, paneAct, winAct] = line.split("\t");
+    if (!pane) continue;
+    m.set(pane, {
+      name: name || null,
+      activity_at: toEpochSeconds(paneAct) ?? toEpochSeconds(winAct),
+    });
   }
+  return m;
+}
+
+// Back-compat: pane_id → window name only, derived from the one batched call.
+export function paneWindowNames(run: TmuxRunner = realTmux): Map<string, string> {
+  const m = new Map<string, string>();
+  for (const [pane, info] of panePresence(run)) if (info.name) m.set(pane, info.name);
   return m;
 }
 
@@ -142,13 +175,17 @@ export function chooseClient(
   return { client: selfClient ?? others[0].name, ambiguous: true, candidates: others.map((c) => c.name) };
 }
 
-// Re-resolve the agent's CURRENT registry entry by session identity (handles MCP
+// Re-resolve an agent's CURRENT registry entry by session identity (handles MCP
 // child pid rotation since the snapshot was taken). Falls back to server_pid for
-// unclaimed agents.
-function freshEntry(agent: FleetAgent): RegistryEntry | null {
+// unclaimed agents. Exported so the activity capture path re-verifies a pane against
+// the SAME fresh entry jump does (a recycled pane id must never be captured blind).
+export function freshEntry(
+  agent: { session_id: string | null; server_pid: number },
+  read: () => RegistryEntry[] = readAll,
+): RegistryEntry | null {
   let entries: RegistryEntry[];
   try {
-    entries = readAll();
+    entries = read();
   } catch {
     return null;
   }

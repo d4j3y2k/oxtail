@@ -18,6 +18,9 @@
 
 import type { ClientType } from "../clients.js";
 import { scanTailLines } from "../transcripts.js";
+import { chooseVerifiedWakePane, readAllPassive, type RegistryEntry } from "../registry.js";
+import { freshEntry, realTmux, type TmuxRunner } from "./jump.js";
+import { sanitizeCaptured } from "./format.js";
 
 // Normalized tool family. The badge maps this → glyph/color in render.ts; the raw
 // name is kept for unknown tools + debugging.
@@ -151,4 +154,119 @@ export function scanLatestTool(
   if (!found) return null;
   const f = found as { name: string; running: boolean };
   return { tool: normalizeTool(f.name), tool_raw: f.name, tool_running: f.running };
+}
+
+// ── EXEC class: live pane bottom-line via capture-pane ──────────────────────────
+// The only process fork in the activity layer. The agent's CURRENT pane chrome —
+// catches the think-before-output window the transcript can't. Fragile (client-
+// specific chrome that changes between versions), so it's best-effort: the robust
+// core is the binary "esc to interrupt" present/absent; the spinner line is gravy,
+// degrading to null (never garbage). Captured text is UNTRUSTED — every line is
+// scrubbed + allowlist-sanitized before it can reach the screen or a width budget.
+
+export type PaneActivity = {
+  pane_tail: string | null; // the spinner / working line, sanitized; null when unextractable
+  pane_busy: boolean; // pane chrome says actively processing ("esc to interrupt")
+};
+
+type AgentRef = { session_id: string | null; server_pid: number; client_type: ClientType };
+
+export type CaptureDeps = {
+  runTmux?: TmuxRunner;
+  // Re-resolve the agent's fresh registry entry (default: jump.freshEntry).
+  resolveEntry?: (a: { session_id: string | null; server_pid: number }) => RegistryEntry | null;
+  // Verify+resolve the pane that PROVABLY still hosts this agent (default:
+  // chooseVerifiedWakePane — proc_sig ok + current-pane-for-pid == target).
+  verifyPane?: (e: RegistryEntry) => string | null;
+};
+
+// Pull a peer's live pane bottom-line. CRITICAL (codex #1 / max C1, HIGH): never
+// capture-pane a stored pane id blind — re-resolve the FRESH registry entry and run
+// it through the same proc_sig + current-pane verifier the jump/wake path uses, so a
+// recycled pane id can't make us render a STRANGER's terminal as this agent. Returns
+// null (no pane shown) on any verification/exec failure — fail closed.
+export function capturePaneActivity(agent: AgentRef, deps: CaptureDeps = {}): PaneActivity | null {
+  const run = deps.runTmux ?? realTmux;
+  // VIEW discipline: re-resolve via readAllPassive (NOT readAll) — a passive capture
+  // must never reap dead registry entries as a side effect.
+  const resolveEntry = deps.resolveEntry ?? ((a) => freshEntry(a, readAllPassive));
+  const verifyPane =
+    deps.verifyPane ??
+    ((e: RegistryEntry) =>
+      chooseVerifiedWakePane({
+        tmux_pane: e.tmux_pane,
+        server_pid: e.server_pid,
+        proc_sig: e.proc_sig,
+      }));
+
+  const entry = resolveEntry(agent);
+  if (!entry) return null;
+  const pane = verifyPane(entry);
+  if (!pane) return null; // recycled / dead / pid-reused — refuse rather than leak
+
+  let raw: string;
+  try {
+    raw = run(["capture-pane", "-p", "-t", pane]);
+  } catch {
+    return null;
+  }
+  const lines = raw
+    .split("\n")
+    .map((l) => l.replace(/[ \t]+$/u, ""))
+    .filter((l) => l.length > 0);
+  return extractPaneActivity(lines, agent.client_type);
+}
+
+// Client-aware extraction from captured pane lines (scanned bottom-up — the spinner
+// sits just above the input box, NOT on the last line, which is the persistent mode
+// chrome). Robust core = "esc to interrupt" ⇒ busy. Spinner line is best-effort:
+//   Claude: "<glyph> Gerund… (2m 2s · ↓ 7.4k tokens)"
+//   Codex:  "• Working (38s · esc to interrupt)"
+// Anything matched is sanitized (untrusted) → provably 1-column.
+export function extractPaneActivity(lines: string[], _clientType: ClientType): PaneActivity {
+  const busy = lines.some((l) => /esc to interrupt/i.test(l));
+  let tail: string | null = null;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    // Claude spinner: a gerund ending in "…" followed by a parenthetical.
+    const g = line.match(/([A-Za-z][A-Za-z'-]*…)\s*(\([^)]*\))/);
+    if (g) {
+      tail = `${g[1]} ${g[2]}`;
+      break;
+    }
+    // Codex (or Claude) working line: a verb + parenthetical, optional leading bullet.
+    const w = line.match(/(?:Working|Thinking|Running|Generating|Processing)\b[^()]*\([^)]*\)/i);
+    if (w) {
+      tail = w[0].trim();
+      break;
+    }
+  }
+  const cleaned = tail ? sanitizeCaptured(tail).trim() : ""; // sanitizeCaptured scrubs first
+  return { pane_tail: cleaned ? cleaned : null, pane_busy: busy };
+}
+
+// Fields capturePaneActivity + the skip rules need — a structural subset of
+// FleetAgent so callers pass agents directly without an import cycle.
+type CapturableAgent = AgentRef & {
+  liveness: "active" | "idle" | "dead";
+  tmux_pane: string | null;
+  is_self: boolean;
+};
+
+// Capture EVERY eligible agent's pane (one exec each) — for the one-shot `oxtail
+// status`, where on-demand exec cost is acceptable. The TUI does NOT use this (it
+// captures the selected row only). Skips dead (nothing to show), is_self (the
+// cockpit's own pane — a hall of mirrors), and pane-less agents. Returns a sparse
+// map keyed by agentKey (only agents with something live to show).
+export function captureFleetPanes(
+  agents: ReadonlyArray<CapturableAgent>,
+  deps: CaptureDeps = {},
+): Map<string, PaneActivity> {
+  const out = new Map<string, PaneActivity>();
+  for (const a of agents) {
+    if (a.liveness === "dead" || a.is_self || !a.tmux_pane) continue;
+    const pa = capturePaneActivity(a, deps);
+    if (pa && (pa.pane_tail || pa.pane_busy)) out.set(agentKey(a), pa);
+  }
+  return out;
 }
