@@ -142,7 +142,7 @@ oxtail message <target> --nudge       — send the canned "check your work" nudg
 oxtail message --broadcast --yes <message…>  — send to every live agent in scope
 
 target: a session id, short id, or tmux window name (see oxtail status)
-flags:  --nudge   --no-wake   --broadcast --yes [--cap N]   --all   --project PATH
+flags:  --nudge   --no-wake   --broadcast --yes [--cap N] [--include-main]   --all   --project PATH
 
 Operator messages are human-authorized but untrusted transport: they carry no agent
 identity (origin=operator), are one-way (the recipient cannot reply to them), and
@@ -159,6 +159,7 @@ type MessageArgs = {
   cap: number;
   all: boolean;
   project: string | undefined;
+  includeMain: boolean; // include your own/main session in a broadcast
   help: boolean;
 };
 
@@ -172,6 +173,7 @@ export function parseMessageArgs(argv: string[]): MessageArgs {
     cap: BROADCAST_CAP_DEFAULT,
     all: false,
     project: undefined,
+    includeMain: false,
     help: false,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -181,6 +183,7 @@ export function parseMessageArgs(argv: string[]): MessageArgs {
     else if (arg === "--no-wake") a.noWake = true;
     else if (arg === "--broadcast") a.broadcast = true;
     else if (arg === "--yes" || arg === "-y") a.yes = true;
+    else if (arg === "--include-main") a.includeMain = true;
     else if (arg === "--all") a.all = true;
     else if (arg === "--cap") a.cap = Number(argv[++i]);
     else if (arg.startsWith("--cap=")) a.cap = Number(arg.slice("--cap=".length));
@@ -245,10 +248,13 @@ export async function runMessage(
       out("error: empty message (give text or --nudge)");
       return 1;
     }
-    // Live + claimed only; dead/unclaimed excluded by default (codex guardrail).
-    const targets = snap.agents.filter((ag) => ag.liveness !== "dead" && ag.session_id);
+    // Live + claimed only; dead/unclaimed excluded; and your OWN/main session is
+    // excluded unless --include-main (codex guardrail: don't blast your own thread).
+    const targets = snap.agents.filter(
+      (ag) => ag.liveness !== "dead" && ag.session_id && (a.includeMain || !ag.is_self),
+    );
     if (targets.length === 0) {
-      out("no live, claimed agents to broadcast to in scope");
+      out("no live, claimed agents to broadcast to in scope (main excluded; --include-main to add)");
       return 1;
     }
     // A malformed --cap (NaN / ≤0) must FAIL CLOSED to the default, not disable the

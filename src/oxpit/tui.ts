@@ -29,6 +29,10 @@ const CURSOR_SHOW = "\x1b[?25h";
 const HOME = "\x1b[H";
 const CLEAR_BELOW = "\x1b[J";
 const CLEAR_EOL = "\x1b[K";
+const PASTE_ON = "\x1b[?2004h"; // enable bracketed paste (terminal wraps pastes)
+const PASTE_OFF = "\x1b[?2004l";
+const PASTE_START = "\x1b[200~";
+const PASTE_END = "\x1b[201~";
 
 const WATCH_DIRS = ["sessions", "mailboxes", "received", "pending-ask"];
 const DEBOUNCE_MS = 200;
@@ -100,7 +104,9 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     let composing = false; // typing a custom operator message in the TUI
     let composeBuf = ""; // the message being typed
     let composeTargetKey: string | null = null; // agentKey the message is bound to
-    const COMPOSE_MAX = 2000; // generous cap; mailbox bodies are ≤8KB anyway
+    const COMPOSE_MAX = 7000; // generous cap; mailbox bodies are ≤8KB
+    let pasting = false; // inside a bracketed-paste sequence
+    let pasteBuf = ""; // accumulates paste content across data chunks
 
     const stdin = process.stdin;
     const stdout = process.stdout;
@@ -122,14 +128,6 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     }
 
     function footer(): string {
-      if (composing) {
-        const a = composeTargetKey
-          ? snapshot.agents.find((ag) => agentKey(ag) === composeTargetKey)
-          : undefined;
-        const to = a ? a.window_name ?? a.short_id : "?";
-        const prompt = opts.color ? `\x1b[1m\x1b[36m  ✉ ${to} ▸ \x1b[0m` : `  ✉ ${to} ▸ `;
-        return "\n" + prompt + composeBuf + "█" + dim("   (Enter send · Esc cancel)", opts.color);
-      }
       let keys: string;
       if (mode === "log") {
         const pos = logOffset === 0 ? "live" : `↑${logOffset}`;
@@ -152,7 +150,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "  ↑/k  ↓/j      move selection (fleet) / scroll (log)",
         "  ⏎             jump to the selected agent's tmux pane",
         "  n             nudge the selected agent (canned operator message; y to confirm)",
-        "  m             compose a custom message to the selected agent (Enter send, Esc cancel)",
+        "  m             compose a message (Enter send · ⌥⏎/⌃J newline · paste ok · Esc cancel)",
         "  l             comms-log (fleet ⇄ log); in log: w full-text · f filter · ↑↓ scroll",
         "  r             force refresh    ?  toggle help    q / Ctrl-C  quit",
         "",
@@ -234,6 +232,41 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       return out.join("\n");
     }
 
+    // Hard char-wrap a single logical line to `w` columns.
+    function wrapText(s: string, w: number): string[] {
+      if (w <= 0 || s.length <= w) return [s];
+      const out: string[] = [];
+      for (let i = 0; i < s.length; i += w) out.push(s.slice(i, i + w));
+      return out;
+    }
+
+    // Full-screen compose modal: target + multi-line wrapped buffer + cursor + hint.
+    // Full-screen (not overlaid on the fleet) so a long multi-line message has room
+    // and can't overflow/desync the fleet repaint.
+    function composeFrame(width: number, rows: number): string {
+      const a = composeTargetKey
+        ? snapshot.agents.find((ag) => agentKey(ag) === composeTargetKey)
+        : undefined;
+      const to = a ? a.window_name ?? a.short_id : "?";
+      const b = (s: string) => (opts.color ? `\x1b[1m\x1b[36m${s}\x1b[0m` : s);
+      const d = (s: string) => dim(s, opts.color);
+      const mark = a?.is_self ? d("  → your primary session") : "";
+      const lines: string[] = [b(`✉ message to ${to}`) + mark, ""];
+      // Render the buffer: each logical line (\n-split) wrapped; cursor on the last.
+      const body: string[] = [];
+      for (const logical of composeBuf.split("\n")) {
+        for (const seg of wrapText(logical, width - 2)) body.push("  " + seg);
+      }
+      if (body.length === 0) body.push("  ");
+      body[body.length - 1] += "█";
+      // Keep the tail visible if the message is taller than the screen.
+      const avail = Math.max(3, rows - 5);
+      lines.push(...(body.length > avail ? body.slice(body.length - avail) : body));
+      lines.push("");
+      lines.push(d("  Enter send · ⌥⏎ / ⌃J newline · Esc cancel"));
+      return lines.map((l) => clipToWidth(l, width) + CLEAR_EOL).join("\n");
+    }
+
     function paint(): void {
       if (torndown) return;
       const width = stdout.columns || 100;
@@ -242,6 +275,10 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         return;
       }
       const rows = stdout.rows || 24;
+      if (composing) {
+        stdout.write(HOME + composeFrame(width, rows) + CLEAR_BELOW);
+        return;
+      }
       const frame = (mode === "log" ? logFrame(width, rows) : fleetFrame(width, rows)) + footer();
       // Clip every physical line to the terminal width (ANSI-aware) so none wraps —
       // a wrapped line would push the cursor-home repaint out of sync and corrupt
@@ -320,7 +357,6 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     // session key, never re-resolved from the live selection — so fleet churn during
     // the y-confirm can't mis-point it at a different agent).
     function doNudge(agent: FleetAgent): void {
-      if (agent.is_self) return setStatus(warn("can't nudge yourself", opts.color));
       const label = agent.window_name ?? agent.short_id;
       setStatus(dim(`nudging ${label}…`, opts.color));
       sendOperatorMessage(
@@ -368,30 +404,47 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         });
     }
 
-    // Raw-mode line editing for the composer. Returns having handled the keystroke.
+    function composeInsert(t: string): void {
+      if (!t) return;
+      composeBuf = (composeBuf + t).slice(0, COMPOSE_MAX);
+      paint();
+    }
+
+    function cancelCompose(): void {
+      composing = false;
+      composeBuf = "";
+      composeTargetKey = null;
+      paint();
+    }
+
+    // Bracketed-paste content: insert literally, newlines preserved (normalized),
+    // control chars stripped — so a multi-line paste never fires-send or corrupts.
+    function onPaste(content: string): void {
+      if (!composing) return; // paste only meaningful in the composer
+      const norm = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      let clean = "";
+      for (const ch of norm) if (ch === "\n" || (ch >= " " && ch !== "\x7f" && ch !== "\x1b")) clean += ch;
+      composeInsert(clean);
+    }
+
+    // Raw-mode line editing for the composer (one keystroke chunk).
+    //   Enter (\r) = send · Ctrl-J (\n) or Alt+Enter (ESC+CR/LF) = newline ·
+    //   Esc = cancel · Ctrl-C = quit · Backspace = delete.
     function composeKey(s: string): void {
-      if (s === "\x03") return teardown(0); // Ctrl-C still quits
-      if (s === "\x1b") {
-        // lone ESC cancels; an arrow (\x1b[A…) is multi-char and falls through to
-        // the printable filter below, which strips it.
-        composing = false;
-        composeBuf = "";
-        composeTargetKey = null;
-        return paint();
-      }
-      if (s === "\r" || s === "\n") return sendCompose();
+      if (s === "\x03") return teardown(0);
+      if (s === "\x1b") return cancelCompose(); // lone ESC
+      if (s === "\x1b\r" || s === "\x1b\n") return composeInsert("\n"); // Alt+Enter
+      if (s === "\r") return sendCompose(); // Enter sends
+      if (s === "\n") return composeInsert("\n"); // Ctrl-J newline
       if (s === "\x7f" || s === "\b") {
         composeBuf = composeBuf.slice(0, -1);
         return paint();
       }
-      // Append printable input (single keypress OR a paste burst), stripping any
-      // control chars (incl. embedded newlines and stray escape sequences).
+      // Printable typed input; strip control + stray escapes (newlines come via the
+      // explicit branches above or via onPaste).
       let printable = "";
       for (const ch of s) if (ch >= " " && ch !== "\x7f" && ch !== "\x1b") printable += ch;
-      if (printable && composeBuf.length < COMPOSE_MAX) {
-        composeBuf = (composeBuf + printable).slice(0, COMPOSE_MAX);
-        paint();
-      }
+      composeInsert(printable);
     }
 
     function teardown(code: number): void {
@@ -418,7 +471,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         // ignore
       }
       stdin.pause();
-      stdout.write(CURSOR_SHOW + ALT_OFF);
+      stdout.write(PASTE_OFF + CURSOR_SHOW + ALT_OFF);
       resolve(code);
     }
 
@@ -432,12 +485,10 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       console.error(err);
     }
 
-    function onData(buf: Buffer | string): void {
-      const s = buf.toString();
-      // Compose mode swallows ALL keystrokes (so 'q', '?', etc. type as text);
-      // composeKey itself handles Ctrl-C (quit) and Esc (cancel).
+    // One keystroke chunk → action. (Compose mode swallows all keys so 'q','?' type
+    // as text; composeKey handles its own Ctrl-C/Esc.)
+    function handleKey(s: string): void {
       if (composing) return composeKey(s);
-      // Handle the common keys. Escape sequences for arrows arrive as one chunk.
       if (s === "\x03" || s === "q") return teardown(0); // Ctrl-C / q
       if (s === "?") {
         helpOpen = !helpOpen;
@@ -470,6 +521,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
           logOffset = 0;
           return paint();
         }
+        if (s === "m") return startCompose(); // compose to the filtered/selected agent
         return; // ignore other keys in log mode
       }
       // fleet mode
@@ -480,23 +532,57 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         const idx = selectedIndex();
         if (idx < 0) return;
         const agent = snapshot.agents[idx];
-        if (agent.is_self) return setStatus(warn("can't nudge yourself", opts.color));
         pendingNudgeKey = agentKey(agent); // bind identity now; confirm resolves THIS key
+        const tag = agent.is_self ? " (your primary session)" : "";
         return setStatus(
-          warn(`nudge ${agent.window_name ?? agent.short_id}? press y to confirm`, opts.color),
+          warn(`nudge ${agent.window_name ?? agent.short_id}${tag}? press y to confirm`, opts.color),
         );
       }
-      if (s === "m") {
-        const idx = selectedIndex();
-        if (idx < 0) return;
-        const agent = snapshot.agents[idx];
-        if (agent.is_self) return setStatus(warn("can't message yourself", opts.color));
-        composing = true;
-        composeBuf = "";
-        composeTargetKey = agentKey(agent); // bind by session key for the whole compose
-        return paint();
-      }
+      if (s === "m") return startCompose();
       // ignore everything else
+    }
+
+    // Open the composer for the selected agent (messaging main IS allowed now — the
+    // compose frame marks it "→ your primary session" and Enter is the confirm).
+    function startCompose(): void {
+      const idx = selectedIndex();
+      if (idx < 0) return;
+      composing = true;
+      composeBuf = "";
+      composeTargetKey = agentKey(snapshot.agents[idx]); // bind by session key
+      paint();
+    }
+
+    // Bracketed-paste-aware input: split each chunk on the paste markers, route paste
+    // content to onPaste (literal insert) and the rest to the key dispatch. A paste
+    // may span multiple data chunks — pasting/pasteBuf carry the state across them.
+    function onData(buf: Buffer | string): void {
+      let s = buf.toString();
+      while (s.length > 0) {
+        if (pasting) {
+          const end = s.indexOf(PASTE_END);
+          if (end === -1) {
+            pasteBuf += s;
+            s = "";
+          } else {
+            pasteBuf += s.slice(0, end);
+            s = s.slice(end + PASTE_END.length);
+            pasting = false;
+            onPaste(pasteBuf);
+            pasteBuf = "";
+          }
+        } else {
+          const start = s.indexOf(PASTE_START);
+          if (start === -1) {
+            handleKey(s);
+            s = "";
+          } else {
+            if (start > 0) handleKey(s.slice(0, start));
+            s = s.slice(start + PASTE_START.length);
+            pasting = true;
+          }
+        }
+      }
     }
 
     function onSignal(): void {
@@ -507,8 +593,8 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       paint();
     }
 
-    // ── enter raw mode + alt screen ──────────────────────────────────────────
-    stdout.write(ALT_ON + CURSOR_HIDE);
+    // ── enter raw mode + alt screen + bracketed paste ────────────────────────
+    stdout.write(ALT_ON + CURSOR_HIDE + PASTE_ON);
     try {
       stdin.setRawMode(true);
     } catch {
