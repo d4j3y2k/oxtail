@@ -4,7 +4,7 @@
 // here, so tests get deterministic plain output.
 
 import { cell, clip, clipToWidth, displayWidth, fmtAge, scrubBufferText } from "./format.js";
-import { ACTIVE_WINDOW_S, type FleetAgent, type FleetSnapshot, type Liveness } from "./snapshot.js";
+import type { FleetAgent, FleetSnapshot, Liveness } from "./snapshot.js";
 import { agentKey, type AgentActivity, type PaneActivity, type ToolKind } from "./activity.js";
 import type { CommsMessage } from "./comms.js";
 
@@ -139,7 +139,13 @@ function statusText(a: FleetAgent): string {
   if (a.liveness === "dead") {
     return a.liveness_reason === "pid_reused" ? "dead·reused" : "dead·gone";
   }
-  if (a.liveness === "active") return `active ${fmtAge(a.transcript_age_s)}`;
+  if (a.liveness === "active") {
+    // Show the freshest signal behind the active glyph (always an honest raw age).
+    // pane_fresh reports the pane-repaint age — the transcript can be minutes stale
+    // mid-turn — so a working agent reads "active ✽0s", not "active 2m".
+    if (a.liveness_reason === "pane_fresh") return `active ✽${fmtAge(a.pane_activity_age_s)}`;
+    return `active ${fmtAge(a.transcript_age_s)}`;
+  }
   if (a.liveness_reason === "no_transcript") return "idle·no-tx";
   return `idle ${fmtAge(a.transcript_age_s)}`;
 }
@@ -159,20 +165,9 @@ function badges(
     parts.push(painted);
     len += displayWidth(raw) + 1; // +1 for the joining space; width-aware (emoji=2)
   };
-  // Orthogonal PANE-RECENT hint (the item-5 fix): a cold transcript (idle glyph) but
-  // the pane repainted within the active window ⇒ thinking-before-output. Rendered
-  // here, right after the status column, NOT promoted to the active glyph — pane
-  // output is not agent work (a /rc overlay repaint would otherwise lie "active").
-  // (A ✽ badge in the flex cluster, not an inline status suffix: the 13-col status
-  // cell would clip it.)
-  if (
-    a.liveness === "idle" &&
-    a.pane_activity_age_s != null &&
-    a.pane_activity_age_s <= ACTIVE_WINDOW_S
-  ) {
-    const raw = `✽${fmtAge(a.pane_activity_age_s)}`;
-    add(raw, paint(raw, C.green)); // green = pane is alive right now, despite idle glyph
-  }
+  // (The pane-recent signal now folds straight into liveness as pane_fresh ⇒ active
+  // — see snapshot.ts buildAgent — so the old "idle-but-✽" badge is gone; statusText
+  // renders the pane age behind the active glyph instead.)
   // Live tool sub-state FIRST — "what it's doing right now". Bright (family color +
   // bold) while the call is in-flight; dim once it has returned ("last did X").
   if (act) {

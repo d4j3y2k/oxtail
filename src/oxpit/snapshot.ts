@@ -78,6 +78,8 @@ export type Liveness = "active" | "idle" | "dead";
 
 export type LivenessReason =
   | "transcript_fresh"
+  | "pane_fresh" // pane repainted within the active window (producing output / spinner)
+  | "tool_running" // a tool call is in-flight while transcript & pane are otherwise quiet
   | "idle"
   | "no_transcript"
   | "exited" // server_pid no longer alive (clean exit / crash, not yet reaped)
@@ -424,32 +426,62 @@ function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
     }
   }
 
-  // Orthogonal pane-recent signal (window-scoped pty activity). Clamp ≥0 and guard
-  // a non-finite/empty reading — it's a wall-clock time_t that can be stale or
-  // garbage. NOT used for liveness; only the "·✽Ns" status hint + the TUI's
-  // capture change-detector.
+  // Pane-recent signal (pty output time). Clamp ≥0 and guard a non-finite/empty
+  // reading — it's a wall-clock time_t that can be stale or garbage. Folds into
+  // liveness (pane_fresh ⇒ active, below) AND drives the TUI capture change-detector.
   const paneInfo = e.tmux_pane ? ctx.paneInfo.get(e.tmux_pane) : undefined;
   const paneActAt = paneInfo?.activity_at ?? null;
   const paneActivityAgeS =
     paneActAt != null && Number.isFinite(paneActAt) ? Math.max(0, ctx.nowSec - paneActAt) : null;
 
+  // Liveness + the real-time tool sub-state are decided together: transcript mtime
+  // alone LAGS during a long thinking/tool turn (David watched a clearly-working
+  // agent read idle at 158s tx-age while its pane was 0s), so we fold in two more
+  // live-work signals — a fresh pane repaint and a tool currently running. Any one
+  // ⇒ active; the order of the active branches is display-only (freshest first).
+  const transcriptPath = e.client.transcript_path ?? null;
   let liveness: Liveness;
   let reason: LivenessReason;
+  let activity: AgentActivity | null = null;
   if (!pidAlive) {
     liveness = "dead";
     reason = "exited";
   } else if (procSig === "reused") {
     liveness = "dead";
     reason = "pid_reused";
-  } else if (transcriptAgeS !== null && transcriptAgeS <= ctx.activeWindowS) {
-    liveness = "active";
-    reason = "transcript_fresh";
-  } else if (transcriptAgeS === null) {
-    liveness = "idle";
-    reason = "no_transcript";
   } else {
-    liveness = "idle";
-    reason = "idle";
+    // Alive ⇒ read the bounded transcript tail (gated by readActivity) for the tool
+    // sub-state. Done ONLY for live agents: a dead agent's last tool_use often lacks
+    // a result and would render a misleading "running" badge (the ⚫ glyph suffices).
+    if (ctx.readActivity && transcriptPath) {
+      try {
+        activity = scanLatestTool(transcriptPath, e.client.type);
+      } catch {
+        activity = null; // tail read failed — leave the badge off
+      }
+    }
+    if (transcriptAgeS !== null && transcriptAgeS <= ctx.activeWindowS) {
+      liveness = "active";
+      reason = "transcript_fresh";
+    } else if (paneActivityAgeS !== null && paneActivityAgeS <= ctx.activeWindowS) {
+      // Pane repainted within the window ⇒ producing output / spinner = working.
+      // (Reverses max's Q3 "window_activity stays out of the enum": dogfood showed
+      // idle panes go stale 27–56s while a working pane reads 0s, so the 20s window
+      // separates them cleanly. Pane output ≠ proof, so the raw age stays visible.)
+      liveness = "active";
+      reason = "pane_fresh";
+    } else if (activity?.tool_running) {
+      // A tool is in-flight while transcript & pane are both quiet (a silent long
+      // call — sleeping bash, slow fetch) — still actively working, not idle.
+      liveness = "active";
+      reason = "tool_running";
+    } else if (transcriptAgeS === null) {
+      liveness = "idle";
+      reason = "no_transcript";
+    } else {
+      liveness = "idle";
+      reason = "idle";
+    }
   }
 
   const purpose = e.state?.purpose ?? null;
@@ -484,20 +516,6 @@ function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
       openWork = countOpenObligations(sid);
     } catch {
       // leave 0; ledger unreadable
-    }
-  }
-
-  // Read-class real-time sub-state (latest tool + running). Bounded transcript-tail
-  // read, gated by readActivity. Skipped for dead agents — a dead agent's last
-  // tool_use often has no result (died mid-call) and would render a misleading
-  // "running" badge; the ⚫ glyph already tells that story.
-  const transcriptPath = e.client.transcript_path ?? null;
-  let activity: AgentActivity | null = null;
-  if (ctx.readActivity && transcriptPath && liveness !== "dead") {
-    try {
-      activity = scanLatestTool(transcriptPath, e.client.type);
-    } catch {
-      activity = null; // tail read failed — leave the badge off
     }
   }
 

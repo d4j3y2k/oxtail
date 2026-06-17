@@ -119,6 +119,107 @@ test("liveness: missing transcript ⇒ idle/no_transcript", () => {
   });
 });
 
+// ── item-5: working-but-quiet-transcript agents must read ACTIVE ────────────────
+// David watched a clearly-thinking agent read idle because transcript mtime lags
+// during a long turn. A fresh pane repaint OR an in-flight tool now promotes it.
+
+test("liveness: stale transcript but a fresh pane ⇒ active/pane_fresh (item-5)", () => {
+  withHome((home) => {
+    const tx = writeTranscript(home, "tx-quiet.jsonl", 600); // transcript cold 10m
+    const snap = buildSnapshot({
+      readEntries: () => [makeEntry({ tmux_pane: "%1", client: { transcript_path: tx } as never })],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      // pane repainted 2s ago ⇒ the agent is producing output / spinning right now.
+      resolvePaneInfo: () =>
+        new Map([["%1", { name: "main", activity_at: NOW_S - 2, window_index: 0 }]]),
+    });
+    const a = snap.agents[0];
+    assert.equal(a.liveness, "active");
+    assert.equal(a.liveness_reason, "pane_fresh");
+    assert.equal(a.pane_activity_age_s, 2);
+    assert.equal(a.transcript_age_s, 600); // raw transcript age still reported, unhidden
+  });
+});
+
+test("liveness: stale transcript AND a stale pane ⇒ stays idle (negative control)", () => {
+  withHome((home) => {
+    const tx = writeTranscript(home, "tx-quiet2.jsonl", 600);
+    const snap = buildSnapshot({
+      readEntries: () => [makeEntry({ tmux_pane: "%1", client: { transcript_path: tx } as never })],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      resolvePaneInfo: () =>
+        new Map([["%1", { name: "main", activity_at: NOW_S - 120, window_index: 0 }]]),
+    });
+    const a = snap.agents[0];
+    assert.equal(a.liveness, "idle");
+    assert.equal(a.liveness_reason, "idle");
+    assert.equal(a.pane_activity_age_s, 120);
+  });
+});
+
+test("liveness: stale transcript + stale pane but a tool in-flight ⇒ active/tool_running", () => {
+  withHome((home) => {
+    // A claude transcript whose last tool_use has no matching tool_result ⇒ running.
+    const path = join(home, "tx-tool.jsonl");
+    writeFileSync(
+      path,
+      JSON.stringify({ message: { content: [{ type: "tool_use", name: "Bash", id: "toolu_1" }] } }) +
+        "\n",
+    );
+    const mtime = NOW_S - 300; // cold 5m (a silent long bash: no transcript/pane motion)
+    utimesSync(path, mtime, mtime);
+    const snap = buildSnapshot({
+      readEntries: () => [makeEntry({ tmux_pane: "%1", client: { transcript_path: path } as never })],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      readActivity: true, // tool sub-state is gated on this
+      resolvePaneInfo: () =>
+        new Map([["%1", { name: "main", activity_at: NOW_S - 300, window_index: 0 }]]), // pane also stale
+    });
+    const a = snap.agents[0];
+    assert.equal(a.activity?.tool_running, true);
+    assert.equal(a.liveness, "active");
+    assert.equal(a.liveness_reason, "tool_running");
+  });
+});
+
+test("liveness: a dead pid never reads activity, even with a fresh pane + in-flight tool", () => {
+  withHome((home) => {
+    const path = join(home, "tx-dead-tool.jsonl");
+    writeFileSync(
+      path,
+      JSON.stringify({ message: { content: [{ type: "tool_use", name: "Bash", id: "x" }] } }) + "\n",
+    );
+    const snap = buildSnapshot({
+      readEntries: () => [
+        makeEntry({
+          server_pid: 2_000_000_000, // never alive ⇒ dead/exited short-circuits first
+          tmux_pane: "%1",
+          client: { transcript_path: path } as never,
+        }),
+      ],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      readActivity: true,
+      resolvePaneInfo: () =>
+        new Map([["%1", { name: "main", activity_at: NOW_S - 1, window_index: 0 }]]),
+    });
+    const a = snap.agents[0];
+    assert.equal(a.liveness, "dead");
+    assert.equal(a.activity, null); // activity tail is NOT read for dead agents
+  });
+});
+
 test("purpose: stale caption when set well before last activity", () => {
   withHome((home) => {
     const tx = writeTranscript(home, "tx.jsonl", 5); // active 5s ago

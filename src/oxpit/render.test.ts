@@ -510,30 +510,49 @@ test("activity badge: absent when no activity", () => {
   }
 });
 
-// ── orthogonal pane-recent (·✽) hint ────────────────────────────────────────────
-test("pane-recent: idle agent with a fresh pane shows ✽age (item-5 fix)", () => {
+// ── pane_fresh: a fresh pane reads ACTIVE, ✽age behind the glyph ────────────────
+test("pane_fresh: working-but-quiet-transcript agent reads active ✽age (item-5 fix)", () => {
+  // David's case: transcript minutes stale mid-turn but the pane repainted just now.
+  // snapshot.ts promotes it to active/pane_fresh; render shows the fresh PANE age.
   const out = renderSnapshot(
-    snap([agent({ liveness: "idle", transcript_age_s: 200, pane_activity_age_s: 2 })]),
+    snap([
+      agent({
+        liveness: "active",
+        liveness_reason: "pane_fresh",
+        transcript_age_s: 200,
+        pane_activity_age_s: 2,
+      }),
+    ]),
     { color: false, width: 120 },
   );
-  assert.ok(out.includes("✽2s"), `expected pane-recent hint, got:\n${out}`);
-  assert.match(out, /🟡/); // glyph stays idle — never promoted to active
+  assert.ok(out.includes("active ✽2s"), `expected pane-fresh status, got:\n${out}`);
+  assert.match(out, /🟢/); // promoted to the active glyph
+  assert.ok(!out.includes("2m"), "must show the fresh pane age, not the stale 200s transcript");
 });
 
-test("pane-recent: stale pane (beyond active window) shows no hint", () => {
+test("pane_fresh: a long-quiet idle agent shows no ✽ and stays idle", () => {
   const out = renderSnapshot(
     snap([agent({ liveness: "idle", transcript_age_s: 600, pane_activity_age_s: 120 })]),
     { color: false, width: 120 },
   );
   assert.ok(!out.includes("✽"), "a long-quiet pane must not show the hint");
+  assert.match(out, /🟡/);
 });
 
-test("pane-recent: active agent gets no ✽ hint (idle band only)", () => {
+test("pane_fresh: a transcript_fresh active agent shows the transcript age, no ✽", () => {
   const out = renderSnapshot(
-    snap([agent({ liveness: "active", transcript_age_s: 3, pane_activity_age_s: 1 })]),
+    snap([
+      agent({
+        liveness: "active",
+        liveness_reason: "transcript_fresh",
+        transcript_age_s: 3,
+        pane_activity_age_s: 1,
+      }),
+    ]),
     { color: false, width: 120 },
   );
-  assert.ok(!out.includes("✽"), "active rows already read live; no redundant hint");
+  assert.ok(out.includes("active 3s"), `expected transcript-fresh status, got:\n${out}`);
+  assert.ok(!out.includes("✽"), "transcript-fresh rows read live directly; no ✽ suffix");
 });
 
 // ── live pane-tail detail (beats purpose) ───────────────────────────────────────
