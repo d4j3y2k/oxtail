@@ -85,10 +85,19 @@ export const HOOK_MARKER_KEY = "_oxtailHook";
 //       drifts; the startup freshness nudge (NOT a protocol bump — argv contract
 //       and HOOK_DRAIN_PROTOCOL stay 1) drives the re-install. A stale pre-v13
 //       helper renders the prior envelope: degraded (no tag/steer), never wrong.
+//  v14: operator-origin messages. mailbox.ts serializes origin:"operator" +
+//       operator_source (additive, after body — FIELD_ORDER_PREFIX intact, so a
+//       legacy awk hook still reads the body), and hook-drain.ts renders an
+//       operator branch with the "untrusted context, one-way, no reply target"
+//       steer instead of a from_session_id. Helper-only change (no .sh edits) —
+//       hook-drain.js + mailbox.js hashes drift; the startup freshness nudge
+//       drives re-install (argv contract + HOOK_DRAIN_PROTOCOL stay 1). A stale
+//       pre-v14 helper just renders an operator message as a plain peer message
+//       with no from: degraded (no operator steer), never wrong.
 // INVARIANT: any change to an assets/*.sh script or the helper sources MUST
 // bump this version, so existing installs are forced to re-install.
 // scripts/check-hook-version.mjs enforces this in CI.
-export const HOOK_MARKER_VERSION = 13;
+export const HOOK_MARKER_VERSION = 14;
 
 const HOOKS_DIR = path.join(os.homedir(), ".oxtail", "hooks");
 
