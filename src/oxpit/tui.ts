@@ -44,7 +44,7 @@ const FOCUS_OUT = "\x1b[O";
 const WATCH_DIRS = ["sessions", "mailboxes", "received", "pending-ask"];
 const DEBOUNCE_MS = 200;
 const SLOW_TICK_MS = 1500;
-const ANIM_TICK_MS = 500; // selected-name animation cadence (focus-gated; SPIKE)
+const ANIM_TICK_MS = Math.round(1000 / 6); // ~6fps selected-name animation (focus-gated; SPIKE)
 const MAX_WAIT_ROWS = 8;
 const LOG_FETCH = 200; // comms messages pulled for the log view (windowed to fit)
 

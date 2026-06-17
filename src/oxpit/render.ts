@@ -62,29 +62,22 @@ function makePaint(color: boolean): Paint {
 const SELECT_BG = "\x1b[48;5;238m";
 
 // SPIKE (backlog item 1): animated frame around the SELECTED agent's name, advanced
-// by the TUI's focus-gated animation timer (animFrame). Each entry is [left, right];
-// phase = animFrame % length.
-// The frame is a little DOT DANCE — the math dot-relation glyphs morph (∴ → ∶ → ∵ →
-// ∷) so the dots seem to shuffle around the name (David's idea). ACTIVE runs the full
-// morph; IDLE does a gentle up→down→rest twinkle. (These are EAW-Ambiguous → 1-col
-// here / maybe 2-col on a CJK terminal; it's only the selected NAME cell, so a CJK
-// mis-measure is cosmetic, never a wrap.) Tune freely — this is the cute knob.
-const FRAME_ACTIVE: [string, string][] = [
+// by the TUI's focus-gated animation timer (animFrame, ~6fps). A little DOT DANCE —
+// David's morphing sequence ∴ → ⋄ → ⋇ → ∵ → ⋄ — so the glyphs shuffle around the
+// name. One sequence for any liveness (the active/idle split is gone; David wanted a
+// single dance). Each entry is [left, right]; phase = animFrame % length. (These are
+// EAW-Ambiguous → 1-col here / maybe 2-col on a CJK terminal; it's only the selected
+// NAME cell, so a CJK mis-measure is cosmetic, never a wrap.) The cute knob — riff away.
+const FRAME_SEQ: [string, string][] = [
   ["∴", "∴"],
-  ["∶", "∶"],
+  ["⋄", "⋄"],
+  ["⋇", "⋇"],
   ["∵", "∵"],
-  ["∷", "∷"],
+  ["⋄", "⋄"],
 ];
-const FRAME_IDLE: [string, string][] = [
-  ["∴", "∴"],
-  ["∵", "∵"],
-  [" ", " "],
-  [" ", " "],
-];
-function nameFrame(liveness: Liveness, animFrame: number): [string, string] {
-  const set = liveness === "active" ? FRAME_ACTIVE : FRAME_IDLE;
-  const i = ((animFrame % set.length) + set.length) % set.length;
-  return set[i];
+function nameFrame(animFrame: number): [string, string] {
+  const i = ((animFrame % FRAME_SEQ.length) + FRAME_SEQ.length) % FRAME_SEQ.length;
+  return FRAME_SEQ[i];
 }
 
 const GLYPH: Record<Liveness, string> = {
@@ -311,7 +304,7 @@ function renderAgentRow(
   let id: string;
   if (i === selected && animFrame !== undefined) {
     // Animated frame around the name (replaces the static underline in the TUI).
-    const [lb, rb] = nameFrame(a.liveness, animFrame);
+    const [lb, rb] = nameFrame(animFrame);
     const inner = clip(idText, ID_W - 2); // leave 2 cols for the bracket pair
     const framed = `${lb}${inner}${rb}`;
     const pad = " ".repeat(Math.max(0, ID_W - displayWidth(framed)));
