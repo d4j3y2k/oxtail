@@ -438,18 +438,20 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       }
       const clipEOL = (l: string) => clipToWidth(l, width) + CLEAR_EOL;
       if (mode === "log") {
-        // item 3: comms as a BOTTOM PANEL with the fleet table still visible above
-        // (the selection up top is the agent the per-agent thread follows). Panel ~half
-        // the height (the fleet is the anchor), fleet keeps ≥3 rows. topAvail+panelRows
-        // == rows exactly (logPanelLines returns EXACTLY its requested rows), so the
-        // frame is exactly `rows` lines; the final slice only guards a degenerate tiny
-        // terminal (rows < the fleet minimum).
-        const desiredPanel = Math.max(7, Math.floor(rows * 0.5));
-        const topAvail = Math.max(3, rows - desiredPanel);
-        const panelRows = Math.max(0, rows - topAvail);
-        const top = fleetFrame(width, topAvail).split("\n").slice(0, topAvail).map(clipEOL);
+        // Size the fleet to its NATURAL height (show all agents) and give the comms
+        // panel EVERYTHING below it — no wasted middle gap (David). On a huge fleet,
+        // cap the fleet so the panel keeps a minimum height. topAvail + panelRows ==
+        // rows exactly (logPanelLines returns EXACTLY its requested rows); the final
+        // slice only guards a degenerate tiny terminal.
+        const MIN_PANEL = 6;
+        const natural = fleetFrame(width, snapshot.agents.length + 24).split("\n");
+        const maxTop = Math.max(3, rows - MIN_PANEL);
+        const topAvail = Math.min(natural.length, maxTop);
+        const top = (natural.length <= maxTop ? natural : fleetFrame(width, maxTop).split("\n"))
+          .slice(0, topAvail)
+          .map(clipEOL);
         while (top.length < topAvail) top.push(CLEAR_EOL);
-        const panel = logPanelLines(width, panelRows).map(clipEOL);
+        const panel = logPanelLines(width, rows - topAvail).map(clipEOL);
         stdout.write(HOME + [...top, ...panel].slice(0, rows).join("\n") + CLEAR_BELOW);
         return;
       }
