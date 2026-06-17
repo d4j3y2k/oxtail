@@ -504,6 +504,12 @@ export function commsBodyLines(
     // directive-in, not a missing half of a two-way exchange (the recipient never
     // sends back an "agent→operator").
     const isOperator = m.from_session_id == null && m.origin === "operator";
+    // → (U+2192) and ⇒ (U+21D2) are EAW-Ambiguous (also the wait-graph chain join +
+    // the TUI compose marker). KEPT AS-IS BY DELIBERATE CHOICE (David, 2026-06-17):
+    // they're flawless 1-col on a US terminal and there is no clean 1-col Neutral arrow
+    // (the alternatives are long ⟶/⟹, decorated ↦, or the emoji-presentation dingbat
+    // arrows ➜➝ that render 2-col). The residual is CJK-portability only — do NOT
+    // "fix" these to chase the audit; it was weighed and declined.
     const arrow = isOperator ? "⇒" : "→";
     // The cursor'd message (TUI nav) gets a › marker in place of the leading space +
     // a brightened (non-dim) head so the eye lands on the selected message.
