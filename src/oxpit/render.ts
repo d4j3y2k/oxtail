@@ -92,19 +92,22 @@ function livenessColor(l: Liveness): string {
   return l === "active" ? C.green : l === "idle" ? C.yellow : C.gray;
 }
 
-// Tool-family glyphs for the live activity badge. Deliberately 1-column text-
-// presentation symbols (NOT emoji w/ VS16) so displayWidth counts them right and
-// no line under-measures and wraps — clipToWidth remains the backstop regardless.
+// Tool-family glyphs for the live activity badge. All VERIFIED 1-column against
+// EastAsianWidth-17: the four that were EAW-Ambiguous (↔ ▤ ↗ •, which mis-measure 2-col
+// on a CJK/ambiguous-wide terminal) were swapped to genuinely-Neutral text-presentation
+// lookalikes (⇄ ▭ ⇗ ∙ — NOT the EAW-Neutral dingbat arrows ➜➝➞, which carry emoji
+// presentation and render 2-col). ☰plan is EAW-Wide and handled by WIDE_GLYPHS (so it's
+// counted 2, not under-measured); ⚙ ✎ ⌕ ⎇ are Neutral. clipToWidth stays the backstop.
 const TOOL_GLYPH: Record<ToolKind, string> = {
-  oxtail: "↔",
+  oxtail: "⇄",
   bash: "⚙",
   edit: "✎",
-  read: "▤",
+  read: "▭",
   search: "⌕",
-  web: "↗",
+  web: "⇗",
   task: "⎇",
   plan: "☰",
-  tool: "•",
+  tool: "∙",
 };
 
 function toolColor(k: ToolKind): string {

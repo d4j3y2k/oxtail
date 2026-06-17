@@ -578,8 +578,8 @@ test("activity badge: completed tool drops the ellipsis", () => {
     snap([agent({ activity: { tool: "oxtail", tool_raw: "mcp__oxtail__ask_peer", tool_running: false } })]),
     { color: false, width: 120 },
   );
-  assert.ok(out.includes("↔oxtail"), `expected oxtail badge, got:\n${out}`);
-  assert.ok(!out.includes("↔oxtail…"), "completed tool must not show the running ellipsis");
+  assert.ok(out.includes("⇄oxtail"), `expected oxtail badge, got:\n${out}`);
+  assert.ok(!out.includes("⇄oxtail…"), "completed tool must not show the running ellipsis");
 });
 
 test("activity badge: unknown tool family shows shortened raw name", () => {
@@ -587,12 +587,12 @@ test("activity badge: unknown tool family shows shortened raw name", () => {
     snap([agent({ activity: { tool: "tool", tool_raw: "mcp__foo__do_thing", tool_running: true } })]),
     { color: false, width: 120 },
   );
-  assert.ok(out.includes("•thing…"), `expected shortened unknown-tool badge, got:\n${out}`);
+  assert.ok(out.includes("∙thing…"), `expected shortened unknown-tool badge, got:\n${out}`);
 });
 
 test("activity badge: absent when no activity", () => {
   const out = renderSnapshot(snap([agent({ activity: null })]), { color: false, width: 120 });
-  for (const g of ["⚙", "↔", "✎", "▤", "⌕", "↗", "⎇", "☰"]) {
+  for (const g of ["⚙", "⇄", "✎", "▭", "⌕", "⇗", "⎇", "☰"]) {
     assert.ok(!out.includes(g), `unexpected tool glyph ${g} with no activity`);
   }
 });

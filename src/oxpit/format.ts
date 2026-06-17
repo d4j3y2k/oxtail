@@ -35,7 +35,12 @@ export function cell(s: string, width: number): string {
 // estimate lets a line exceed the terminal and WRAP — which desyncs the TUI's
 // cursor-home repaint and corrupts the screen (max M3). This is not a full wcwidth;
 // it just has to cover the glyphs we render.
-const WIDE_GLYPHS = new Set(["🟢", "🟡", "⚫", "⏳", "⛔", "⚠", "✉", "⚑", "🙋"]);
+// ☰ U+2630 (plan badge) and ❓ U+2753 (comms ask marker) are EAW-WIDE (verified vs
+// EastAsianWidth-17) — counted here so displayWidth doesn't UNDER-count them, which on a
+// terminal that honors the width (❓ renders as a 2-col emoji on most) would let a line
+// exceed the terminal and wrap. Over-counting a glyph a terminal happens to draw narrow
+// only truncates a hair early (harmless); under-counting wraps and desyncs the TUI (bad).
+const WIDE_GLYPHS = new Set(["🟢", "🟡", "⚫", "⏳", "⛔", "⚠", "✉", "⚑", "🙋", "☰", "❓"]);
 
 // Matches a CSI escape sequence (e.g. the SGR color codes "\x1b[..m"). Such
 // sequences occupy ZERO display columns.
