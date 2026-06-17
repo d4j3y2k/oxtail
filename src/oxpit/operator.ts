@@ -124,6 +124,10 @@ export type SendDeps = {
   resolveEntry?: (t: OperatorTarget) => RegistryEntry | null;
   deliver?: typeof deliverToPeer;
   wake?: (peer: RegistryEntry, wakeText?: string) => Promise<WakeStatus>;
+  // proc-sig reader for the pid-reuse guard. Injectable so the guard's behavior is
+  // tested deterministically rather than depending on the ambient `ps` (which a
+  // sandbox can refuse, making a real `processStartSig` read inconclusive).
+  procSig?: typeof processStartSig;
 };
 
 // Send one human-authorized operator message to a target agent. wake defaults on
@@ -138,6 +142,7 @@ export async function sendOperatorMessage(
   const resolveEntry = deps.resolveEntry ?? freshEntry;
   const deliver = deps.deliver ?? deliverToPeer;
   const wake = deps.wake ?? wakeForSend;
+  const procSig = deps.procSig ?? processStartSig;
   const base = { target_short_id: target.short_id, target_session_id: target.session_id };
 
   if (!body.trim()) return { ok: false, ...base, reason: "empty message" };
@@ -152,7 +157,7 @@ export async function sendOperatorMessage(
   // proc_sig. (Empty reading = transient ps failure → inconclusive, let it through;
   // the wake path re-verifies the pane anyway.)
   if (entry.proc_sig) {
-    const liveSig = processStartSig(entry.server_pid);
+    const liveSig = procSig(entry.server_pid);
     if (liveSig && liveSig !== entry.proc_sig) {
       return { ok: false, ...base, reason: "target pid was recycled (proc_sig mismatch)" };
     }

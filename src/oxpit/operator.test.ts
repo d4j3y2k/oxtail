@@ -148,16 +148,37 @@ test("sendOperatorMessage: dead target pid refused", async () => {
 test("sendOperatorMessage: refuses on proc_sig mismatch (pid-reuse guard)", async () => {
   await withHome(async () => {
     const { deliver, calls } = captureDeliver();
-    // Live pid (process.pid) but a proc_sig that won't match the real one ⇒ the
-    // pid was recycled to an unrelated process; must refuse before delivering.
+    // Registered proc_sig differs from the live reading ⇒ the pid was recycled to an
+    // unrelated process; must refuse before delivering. The proc-sig reader is INJECTED
+    // (returns a definite, different sig) so the guard is exercised deterministically
+    // rather than depending on the ambient `ps` (a sandbox without ps reads empty →
+    // inconclusive → the guard wouldn't fire, masking this case).
     const r = await sendOperatorMessage(TARGET, "hi", {}, {
-      resolveEntry: () => entry({ proc_sig: "stale-sig-that-will-not-match" }),
+      resolveEntry: () => entry({ proc_sig: "registered-sig" }),
+      procSig: () => "live-sig-differs",
       deliver,
       wake: async () => "fired",
     });
     assert.equal(r.ok, false);
     assert.match(r.reason!, /recycled|proc_sig/);
     assert.equal(calls.length, 0, "nothing delivered to a recycled pid");
+  });
+});
+
+test("sendOperatorMessage: inconclusive (empty) proc_sig reading delivers — deliberate fail-open", async () => {
+  await withHome(async () => {
+    const { deliver, calls } = captureDeliver();
+    // A transient/failed proc-sig read (e.g. ps refused) is inconclusive, NOT a
+    // mismatch. Policy (mirrors resolveTarget): let it through — the wake path
+    // re-verifies the pane — rather than fail closed and drop a legitimate send.
+    const r = await sendOperatorMessage(TARGET, "hi", {}, {
+      resolveEntry: () => entry({ proc_sig: "registered-sig" }),
+      procSig: () => "",
+      deliver,
+      wake: async () => "fired",
+    });
+    assert.equal(r.ok, true, "inconclusive proc_sig does not block delivery");
+    assert.equal(calls.length, 1);
   });
 });
 
