@@ -1,0 +1,163 @@
+// Small presentation helpers shared by the oxpit renderers (one-shot table +
+// interactive TUI). Kept dependency-free and pure so both call sites — and their
+// tests — format identically.
+
+// Compact human age: seconds → "12s" / "3m" / "2h" / "5d". null → em dash.
+export function fmtAge(seconds: number | null): string {
+  if (seconds == null) return "—";
+  if (seconds < 0) return "0s";
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86_400) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.floor(seconds / 86_400)}d`;
+}
+
+// Truncate a string to `width` columns, appending "…" when clipped. Used so a
+// long purpose line can't blow out the table layout. Width <= 0 → "".
+export function clip(s: string, width: number): string {
+  if (width <= 0) return "";
+  // Collapse newlines/tabs to spaces first: a purpose card or message body can
+  // contain them and they'd corrupt the single-line table layout.
+  const flat = s.replace(/\s+/g, " ").trim();
+  if (flat.length <= width) return flat;
+  if (width === 1) return "…";
+  return flat.slice(0, width - 1) + "…";
+}
+
+// Pad/truncate to exactly `width` visible columns (left-justified).
+export function cell(s: string, width: number): string {
+  const c = clip(s, width);
+  return c.length >= width ? c : c + " ".repeat(width - c.length);
+}
+
+// The 2-column glyphs oxpit emits. We bias toward counting a glyph as wide: a
+// wide-count over-estimate truncates a hair early (harmless), whereas an under-
+// estimate lets a line exceed the terminal and WRAP — which desyncs the TUI's
+// cursor-home repaint and corrupts the screen (max M3). This is not a full wcwidth;
+// it just has to cover the glyphs we render.
+// ☰ U+2630 (plan badge) and ❓ U+2753 (comms ask marker) are EAW-WIDE (verified vs
+// EastAsianWidth-17) — counted here so displayWidth doesn't UNDER-count them, which on a
+// terminal that honors the width (❓ renders as a 2-col emoji on most) would let a line
+// exceed the terminal and wrap. Over-counting a glyph a terminal happens to draw narrow
+// only truncates a hair early (harmless); under-counting wraps and desyncs the TUI (bad).
+const WIDE_GLYPHS = new Set(["🟢", "🟡", "⚫", "⏳", "⛔", "⚠", "✉", "⚑", "🙋", "☰", "❓"]);
+
+// Matches a CSI escape sequence (e.g. the SGR color codes "\x1b[..m"). Such
+// sequences occupy ZERO display columns.
+const CSI_RE = /^\x1b\[[0-9;?]*[ -/]*[@-~]/;
+
+// Visible column width of a string, ignoring ANSI escapes and counting known wide
+// glyphs as 2. Used to budget the trailing purpose column and to clip lines.
+export function displayWidth(s: string): number {
+  let w = 0;
+  let i = 0;
+  while (i < s.length) {
+    if (s[i] === "\x1b") {
+      const m = CSI_RE.exec(s.slice(i));
+      i += m ? m[0].length : 1;
+      continue;
+    }
+    const ch = String.fromCodePoint(s.codePointAt(i)!);
+    i += ch.length;
+    w += WIDE_GLYPHS.has(ch) ? 2 : 1;
+  }
+  return w;
+}
+
+// Strip terminal-dangerous characters from text that will be rendered RAW and/or
+// sent VERBATIM to a peer (the TUI compose buffer, an ⌃X-restored attachment path,
+// captured pane text). The one shared sanitizer — every untrusted-text path funnels
+// through here so a hostile filename / pane line (ANSI/C0/C1/bidi/zero-width) can't
+// corrupt the operator's terminal or reach a peer's context. Newlines survive only
+// when keepNewline (a multi-line paste or an explicit newline key).
+export function scrubBufferText(s: string, keepNewline: boolean): string {
+  let out = "";
+  for (const ch of s) {
+    if (keepNewline && ch === "\n") {
+      out += ch;
+      continue;
+    }
+    const c = ch.codePointAt(0) ?? 0;
+    if (c < 0x20 || c === 0x7f || (c >= 0x80 && c <= 0x9f)) continue; // C0 / DEL / C1
+    if (c >= 0x200b && c <= 0x200f) continue; // zero-width + bidi marks
+    if (c === 0x2028 || c === 0x2029) continue; // line / paragraph separators
+    if (c >= 0x202a && c <= 0x202e) continue; // bidi embeddings / overrides
+    if (c >= 0x2066 && c <= 0x2069) continue; // bidi isolates
+    if (c === 0xfeff) continue; // BOM / zero-width no-break space
+    out += ch;
+  }
+  return out;
+}
+
+// Symbols allowed THROUGH sanitizeCaptured beyond printable ASCII — ONLY glyphs that
+// are unambiguously 1 column (Unicode East-Asian-Width = Neutral): the dingbat
+// spinner stars + check/prompt marks. EAW=Ambiguous glyphs (· … ↑↓←→↔ — – • ★ ◐
+// box-drawing …) are DELIBERATELY excluded: under a CJK locale or a terminal set to
+// ambiguous-width=double they render in 2 columns while displayWidth counts 1 — an
+// undercount that could let a captured line exceed the terminal and WRAP, desyncing
+// the cursor-home repaint (compile-sim HIGH). Dropping them from UNTRUSTED capture
+// keeps the words/digits that carry the meaning and makes the 1-column guarantee real
+// (a broad displayWidth change is unsafe — the composer's "─".repeat(width) rule
+// relies on box-drawing staying 1-col). Verified against EastAsianWidth-17: every
+// member below is EAW-Neutral. (✽ U+273D was REMOVED — it is the lone EAW-Ambiguous
+// dingbat in this visual family, so it could render 2-col on a CJK/ambiguous-wide
+// terminal and re-open the exact wrap-desync this allowlist exists to prevent; the
+// "provably 1-col" test passed it only because displayWidth itself undercounts
+// Ambiguous glyphs. Its sanitized-capture loss is nil — a spinner glyph is never part
+// of the extracted tail. codex review.)
+const CAPTURE_ALLOW = new Set([
+  "✓", "✗", "❯", "∗", "✦", "✧",
+  "✶", "✷", "✸", "✹", "✺", "✻", "✼", "✾", "✿", "❀", "✱", "✲", "✳", "✴",
+]);
+
+// Sanitize UNTRUSTED captured terminal text (a tmux capture-pane line) for display.
+// First the shared scrubber removes C0/C1/bidi/zero-width, then allowlist-drop to a
+// provably 1-column character set (ASCII + EAW-Neutral dingbats) so width accounting
+// can never undercount and wrap the TUI (codex review #2 + compile-sim HIGH —
+// clipToWidth alone is unsafe for arbitrary capture). Runs of spaces left by dropped
+// separators are collapsed so the result reads cleanly.
+export function sanitizeCaptured(s: string): string {
+  let out = "";
+  for (const ch of scrubBufferText(s, false)) {
+    const c = ch.codePointAt(0) ?? 0;
+    if (c >= 0x20 && c <= 0x7e) {
+      out += ch; // printable ASCII (all 1 column)
+      continue;
+    }
+    if (CAPTURE_ALLOW.has(ch)) out += ch;
+    // else: drop exotic/wide/ambiguous/combining — lose the glyph, never the layout
+  }
+  return out.replace(/ {2,}/g, " "); // tidy gaps left by dropped separators
+}
+
+// Truncate a (possibly ANSI-colored) string to at most `width` display columns,
+// preserving escape sequences and closing any open SGR with a reset. The TUI's
+// safety net against wrap: every physical line is passed through this before the
+// cursor-home repaint, so no line can ever exceed the terminal width.
+export function clipToWidth(s: string, width: number): string {
+  if (width <= 0) return "";
+  let w = 0;
+  let i = 0;
+  let out = "";
+  let sawSgr = false;
+  while (i < s.length) {
+    if (s[i] === "\x1b") {
+      const m = CSI_RE.exec(s.slice(i));
+      if (m) {
+        out += m[0];
+        sawSgr = true;
+        i += m[0].length;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    const ch = String.fromCodePoint(s.codePointAt(i)!);
+    const cw = WIDE_GLYPHS.has(ch) ? 2 : 1;
+    if (w + cw > width) return sawSgr ? out + "\x1b[0m" : out;
+    out += ch;
+    w += cw;
+    i += ch.length;
+  }
+  return s; // fits as-is (keeps any trailing reset intact)
+}

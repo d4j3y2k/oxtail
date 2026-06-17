@@ -21,7 +21,7 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 **Claude Code** — add to `~/.claude.json` (global) or any project's `.mcp.json`:
 
 ```jsonc
-{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.20.0"] } } }
+{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.21.0"] } } }
 ```
 
 **Codex CLI** — add to `~/.codex/config.toml`:
@@ -29,14 +29,14 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 ```toml
 [mcp_servers.oxtail]
 command = "npx"
-args = ["-y", "oxtail@0.20.0"]
+args = ["-y", "oxtail@0.21.0"]
 ```
 
 **Claude slash command** (`/oxtail-join`) — optional once the hooks are installed (the v0.17 SessionStart hook auto-joins Claude Code sessions; see [How session_id resolution works](#how-session_id-resolution-works-v040)); still the explicit fallback:
 
 ```sh
 mkdir -p ~/.claude/commands
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.20.0/.claude/commands/oxtail-join.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.21.0/.claude/commands/oxtail-join.md \
   -o ~/.claude/commands/oxtail-join.md
 ```
 
@@ -44,9 +44,9 @@ curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.20.0/.claude/command
 
 ```sh
 mkdir -p ~/.codex/skills/oxtail-join/agents
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.20.0/integrations/codex/oxtail-join/SKILL.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.21.0/integrations/codex/oxtail-join/SKILL.md \
   -o ~/.codex/skills/oxtail-join/SKILL.md
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.20.0/integrations/codex/oxtail-join/agents/openai.yaml \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.21.0/integrations/codex/oxtail-join/agents/openai.yaml \
   -o ~/.codex/skills/oxtail-join/agents/openai.yaml
 ```
 
@@ -76,7 +76,7 @@ Contributing? `git clone https://github.com/d4j3y2k/oxtail && cd oxtail && npm i
 - `register_my_session` — pin this MCP server's `session_id` directly. Kept for debugging; prefer `claim_session`.
 - `get_my_session` — return this MCP server's own registry entry plus a per-strategy detection diagnosis. Useful for debugging.
 
-See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.20.0/AGENTS.md) for scope and architecture.
+See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.21.0/AGENTS.md) for scope and architecture.
 
 ## Usage from an agent
 
@@ -251,7 +251,7 @@ All wake paths funnel through one place, which **coalesces** rapid repeat wakes 
 If `ask_peer` returns an abort error before its built-in 60s timeout fires, your MCP client's tool-call ceiling is lower than 60s. Override the bound at server startup:
 
 ```sh
-OXTAIL_ASK_PEER_TIMEOUT_MS=30000 npx -y oxtail@0.20.0
+OXTAIL_ASK_PEER_TIMEOUT_MS=30000 npx -y oxtail@0.21.0
 ```
 
 The server reads the env var once at boot and uses it as the fixed timeout for all `ask_peer` calls in that session. Values must be positive numbers; anything else falls back to the 60000ms default.
@@ -328,10 +328,39 @@ to get a summary — counts by `wake_status`, broken down by tool — so "is the
 
 A scheduled CI job (`.github/workflows/codex-drift.yml`, also runnable on demand) fetches Codex's upstream `PASTE_ENTER_SUPPRESS_WINDOW` and fails if it drifts past oxtail's 500ms Codex wake gap — so a future Codex release that would break the wake surfaces as a red job rather than a silent field regression.
 
+## Fleet cockpit — `oxtail status` / `oxtail oxpit` (experimental)
+
+A mission-control view of every agent in a project, for a separate terminal. Two entry points over one engine:
+
+- **`oxtail status`** — print the fleet once and exit. Scriptable (`watch -n1 oxtail status`), CI-friendly (`--json`), no TTY required.
+- **`oxtail oxpit`** — a live interactive cockpit (raw-ANSI, zero deps): `↑↓`/`jk` to select, `⏎` to **jump** to that agent's tmux pane, `n` nudge, `m` message, `l` to toggle the **comms-log panel**, `w` to open the selected agent's **thread**, `r` to refresh, `?` for help, `⌃C` to quit. It refreshes event-driven (`fs.watch` on `~/.oxtail` + debounce) with a slow fallback tick, restores the terminal on every exit path (including uncaught errors), and windows the agent table to the terminal height so a large fleet can't overflow.
+
+```
+oxpit  oxtail  3 agents (1 active)
+     agent          type    status        work / purpose
+ 🟢 main*          claude  active 4s     ⚙bash…  refactoring the mailbox dedup path
+ 🟡 max            claude  idle 3m  ✽2s  ↔oxtail ✉1 ⚑2 ⏳codex 45s  Cogitating… (1m · 12k)
+ 🟡 codex          codex   idle 12m      ↔oxtail ✉1
+
+wait-graph
+  ⏳ max awaiting reply from codex (45s)
+```
+
+The **agent label** is its tmux window name (so `rename-window max` makes the row, badges, and wait-graph read `max`), falling back to the short session id when a window is unnamed or names collide. Per agent: a **liveness glyph** (🟢 active / 🟡 idle / ⚫ dead) with the raw age always shown (the glyph is never the only signal), plus an independent **badge set** — `✉N` unread, `⚑N` open obligations, `⏳` awaiting a peer reply. The **wait-graph** is the headline: it renders who is awaiting whom and flags a `⛔ DEADLOCK` only when every member of a wait cycle is alive (a stale/abandoned cycle shows as `⚠ possible wait cycle`), and an orphaned wait when its target has died — the one thing you cannot see by tabbing through panes. `state.purpose` is shown as a caption but cross-checked against transcript activity (grayed when stale).
+
+The **real-time activity layer** answers "what is each agent doing *right now*", beyond mtime-based liveness. A **tool badge** (`⚙bash` `↔oxtail` `✎edit` `▤read` `⌕find` `↗web` …) shows the latest tool the agent invoked — bright while it's in flight, dim once it returns — read from a bounded transcript tail (`call_id`-correlated, no terminal scraping). The selected agent also gets a **live pane-tail** (its `tmux capture-pane` bottom line — e.g. the spinner `Cogitating… (1m · 12k)`) as the trailing detail, beating a stale `purpose`; the captured pane is re-verified before *and* after capture (a recycled pane id can never leak a stranger's terminal) and the untrusted text is sanitized to a provably 1-column set. An orthogonal `✽Ns` hint marks a cold transcript whose pane just repainted (thinking-before-output) — surfaced *without* touching the liveness glyph, since pane output isn't agent work. `oxtail status --no-activity` skips the activity reads; exec-class pane capture is auto-off when stdout isn't a TTY.
+
+The **comms-log** (`l` toggles a bottom panel under the fleet, or `oxtail status --log [-n N]`, `--json` for full bodies) renders the inter-agent conversation as a chronological feed built from the agents' received-ledgers — making the zero-relay coordination visible and auditable, with delegation-lifecycle (`⚑`/`⚑✓`/`⚑✗`) and ask/reply (`❓`/`↩`) markers. In the TUI the panel **follows the selection**: `↑↓` walk the fleet and `w` opens that agent's **full per-agent thread** (filter + full bodies), `[`/`]` scroll history, `f` toggles the filter. It's a recent tail (the ledgers prune), snippet-only, scrubbed of terminal-control sequences, and never written to disk. The same ledger evidence feeds the wait-graph: an ask whose reply is observable in the requester's ledger is treated as **answered, not waiting** — so the cockpit trusts observed messages over the (up-to-1h) pending-ask file and won't cry a phantom deadlock.
+
+Design: oxpit is a **read-only VIEW**. It never drains a mailbox or takes a lock, and it consumes the same canonical modules the hooks and MCP tools use (`registry`, `received`, `pending-ask`, `mailbox`) rather than re-deriving their semantics — so it cannot silently drift from the truth. Liveness, work, and waits are **inferred from observed facts** (transcript mtime, `proc_sig`, the obligation ledger, the pending-ask registry); self-reported state is a cross-checked hint, never authority. `jump` re-validates the target pane live at action time (the same `proc_sig` + process-tree guard the wake path uses) and drives an explicit tmux client — refusing rather than guessing when multiple clients are attached (`--client <name>` to choose). Flags: `--json` / `--pretty`, `--no-color`, `--no-activity` (skip the real-time tool/pane reads), `--all` (all projects, not just the current one), `--width N`, `--project PATH`, `--client NAME` (oxpit), `-h` / `--help`.
+
+The one thing oxpit *writes* is an **operator message** (`m` to compose, `n` to nudge, or `oxtail message` from a script): a human-authorized note delivered through the same mailbox path agents use, stamped `origin: "operator"` with **no `from_session_id`**. That origin is **provenance, not authentication** — the receiving agent's hook and `read_my_messages` frame it as *untrusted, one-way context with no reply target* (so the peer's `reply_to_message` fails closed), and **no MCP peer can forge it**: no `send_message` path or tool schema exposes `origin`, and the only site that sets `"operator"` is the local cockpit binary. A same-user process tampering with the on-disk JSONL could of course forge any field — mailbox files are local provenance, not an auth boundary — which is out of oxtail's local-trust threat model.
+
 ## Status
 
-v0.20.0. Minor — closes **hook-path obligation blindness**, the top friction from the v0.19 durable-delegation live test. The PreToolUse/Stop hook envelope now tags each `action_required` message and, when a delivered batch carries an obligation, steers the receiver to close it with `complete_work` / `block_work` (not `reply_to_message`) — inserted *before* the message bodies so it isn't buried. Previously a hooked Claude's primary delivery path never surfaced the obligation, so it could answer a delegation and leave it OPEN forever on its ledger; only a hookless Codex (which must call `read_my_messages`, where `open_work_count` already shows) was well served. Hooks **v13** — re-run `npx oxtail install-hook` on upgrade (helper-only change; the startup freshness check nudges you). Also: `reply_to_message` cross-links to the obligation-close path, and the unclaimed-peer send note steers senders to re-send after the peer claims.
+v0.21.0. Minor — ships the experimental **oxpit fleet cockpit**: a passive, read-only mission-control VIEW over the agent fleet, in two entry points over one engine — `oxtail status` (one-shot, scriptable, `--json` / `--check`, no TTY required) and `oxtail oxpit` (live interactive TUI). It *infers* liveness, a wait-graph with live-deadlock and orphaned-wait detection, real-time tool/pane activity, a cross-fleet comms-log, jump-to-pane, and operator messaging/attachments — all from the same canonical `registry` / `received` / `pending-ask` / `mailbox` modules the hooks and MCP tools use, so it cannot drift from the truth; it never drains a mailbox or takes a lock. Work **or mail** stranded on a dead owner surfaces as fleet trouble (and trips `--check`). Hooks **v14** (the operator-message hook surface — re-run `npx oxtail install-hook` on upgrade; helper-only, the startup freshness check nudges you). Shipped after a two-reviewer ship-gate pass (max broad + codex security): core diff regression-free, `read_session` / mailbox serialization verified byte-identical, operator-message threat model sound.
 
+- **oxpit fleet cockpit (v0.21.0, hooks v14).** `oxtail status` / `oxtail oxpit` — a read-only VIEW that infers liveness, the wait-graph (+ live-deadlock and orphaned-wait detection), real-time tool/pane activity badges, a cross-fleet comms-log, jump-to-pane, and operator messaging/attachments, built on the canonical registry/ledger/mailbox modules rather than re-deriving their semantics. Stranded **work or mail** on a dead owner surfaces as fleet trouble (`--check`). Core touches are additive (a passive non-reaping registry reader, read-only ledger listers, an `origin:"operator"` message provenance, an optional wake-text param); operator messages are unforgeable over MCP and framed untrusted/one-way. Two-reviewer pre-public ship gate (max + codex) with an empirical degradation pass (no-tmux / no-git / non-TTY / narrow / no-color).
 - **Hook-path obligation surfacing (v0.20.0, hooks v13).** Durable delegation (v0.19) recorded the obligation on the receiver's ledger at delivery, but the *hook* delivery path — a hooked Claude's primary one — rendered only `message_id` / `from_session_id` / `request_id` and steered to `reply_to_message`, the path that does **not** close an obligation. So a hooked receiver could answer and leave the obligation OPEN forever (polluting `my_open_work` / `open_work_count`), while the hookless Codex was paradoxically better served. Fix (`hook-drain.ts`): render a per-message `| action_required` tag (the flag already rides the mailbox line) and, when a batch carries an obligation, a one-line steer — *close each with `complete_work` / `block_work`, not `reply_to_message`; `my_open_work` lists what you owe* — inserted before the (≤24KB) message bodies and gated so ordinary traffic pays zero bytes. A budget-truncated obligation body adds a *read it via `my_open_work` first* note. No `open_work_count` is computed on the hook path (it would undercount cross-turn obligations; the accurate count stays on `read_my_messages` / `my_open_work`, which read the ledger). Protocol unchanged (`HOOK_DRAIN_PROTOCOL` stays 1); a stale pre-v13 helper renders the prior envelope — degraded, never wrong. Surfaced by a 3-lens adversarial plan review (scope trimmed to the value core).
 - **Subagent hook-swallow fixed (v0.19.1, hooks v12).** A Task subagent's tool call fires the PreToolUse hook with the SAME `session_id` as the main loop (verified empirically: the subagent payload carries a top-level `agent_id`/`agent_type`, the main loop's doesn't). The session-keyed mailbox drain therefore ran *inside the subagent's* throwaway context, injecting peer messages it ignores and discards — silently lost from the main loop (received-ledger-only recovery). Fix: `pretooluse.sh` skips the drain on a non-empty `agent_id` (keeps the busy marker — the session IS busy); the mail waits for the main loop's next PreToolUse / Stop. Fail-safe (a wrong read only delays delivery, never loses); `agent_id`-alone keys against the false-negative that is the actual bug. Re-run `install-hook` after upgrading. Codex-reviewed APPROVE; 391 tests.
 - **Durable delegation — wake as accelerator, not source of truth (v0.19.0).** `send_message({ action_required: true })` makes the (claimed, obligations-capable) receiver's ledger line an OPEN OBLIGATION that survives a missed / mistimed / crossed wake: the owner rediscovers it via **`my_open_work`** + the **`open_work_count`** surfaced on `read_my_messages` (the one turn-boundary call even a hookless Codex makes), and closes it with **`complete_work`** / **`block_work`** — which deliver the outcome to the original requester (correlated when the delegation was an `ask_peer`), wake them, and stamp the obligation terminal. Correctness lives on the receiver's disk (record-before-append), entirely off the wake path — so Codex is first-class with **no new hook**. The close is crash-safe (deliver → *then* mark; a deterministic completion id + a delivery-receipt guard give exactly-once in the common path, at-least-once under a narrow documented TOCTOU), capability-gated (`capabilities.mailbox.obligations`; a pre-v0.19 peer degrades to ordinary mail rather than a phantom obligation), and the received-ledger prune **exempts** open obligations (never evicts owned work). `ask_peer` is unchanged (its pending-ask already covers long efforts); lease/reclaim of a wedged peer's work is deferred to a future slice. The hook envelope's reply instruction now also leads with `reply_to_message(message_id)` and drops the redundant rendered `reply_to`. Designed and reviewed entirely by oxtail's own autonomous multi-agent loop (a workflow judge-panel + the live Codex peer across BLOCK→AMEND→APPROVE rounds + a 3-lens compile-sim), with zero human relay — the framework dogfooding itself to build its own coordination primitive.

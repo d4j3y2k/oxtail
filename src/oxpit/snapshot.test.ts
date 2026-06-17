@@ -1,0 +1,654 @@
+import { strict as assert } from "node:assert";
+import { appendFileSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+import type { ClientType } from "../clients.js";
+import * as mailbox from "../mailbox.js";
+import { recordReceived } from "../received.js";
+import { defaultPendingAskDir, recordPendingAsk } from "../pending-ask.js";
+import type { RegistryEntry } from "../registry.js";
+import {
+  buildSnapshot,
+  detectWaitCycles,
+  resolveWaitTargets,
+  type FleetAgent,
+} from "./snapshot.js";
+
+// homedir() defers to $HOME on POSIX; all oxtail stores resolve their dirs lazily,
+// so swapping HOME isolates the on-disk reads (mirrors received.test.ts).
+function withHome<T>(fn: (home: string) => T): T {
+  const home = mkdtempSync(join(tmpdir(), "oxtail-oxpit-"));
+  const prev = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    return fn(home);
+  } finally {
+    process.env.HOME = prev;
+    try {
+      rmSync(home, { recursive: true, force: true });
+    } catch {
+      // best effort
+    }
+  }
+}
+
+const NOW_MS = 1_700_000_000_000;
+const NOW_S = Math.floor(NOW_MS / 1000);
+
+let pidCounter = 90000;
+
+function makeEntry(over: Partial<RegistryEntry> & { type?: ClientType } = {}): RegistryEntry {
+  const n = pidCounter++;
+  const sid =
+    over.client?.session_id ?? `00000000-0000-0000-0000-${String(n).padStart(12, "0")}`;
+  return {
+    // Default to the live test-runner pid so the agent reads as alive (isAlive);
+    // override with a not-alive pid to exercise the "exited" liveness path.
+    server_pid: over.server_pid ?? process.pid,
+    started_at: NOW_S - 1000,
+    client: {
+      type: over.type ?? "claude-code",
+      session_id: sid,
+      transcript_path: over.client?.transcript_path ?? null,
+      session_id_source: "env",
+      cwd: "/proj",
+    },
+    tmux_pane: "%1",
+    tmux_session: "proj",
+    state: over.state ?? null,
+    ...over,
+    client: {
+      type: over.type ?? "claude-code",
+      session_id: sid,
+      transcript_path: over.client?.transcript_path ?? null,
+      session_id_source: "env",
+      cwd: over.client?.cwd ?? "/proj",
+    },
+  };
+}
+
+// Write a transcript file at a controlled mtime (seconds ago relative to NOW).
+function writeTranscript(home: string, name: string, ageS: number): string {
+  const path = join(home, name);
+  writeFileSync(path, "{}\n");
+  const mtime = NOW_S - ageS;
+  utimesSync(path, mtime, mtime);
+  return path;
+}
+
+function buildOne(entry: RegistryEntry): FleetAgent {
+  const snap = buildSnapshot({
+    readEntries: () => [entry],
+    allProjects: true,
+    nowMs: NOW_MS,
+    checkProcSig: false,
+    selfSessionId: null,
+    resolvePaneInfo: () => new Map(), // hermetic — don't hit the real tmux
+  });
+  assert.equal(snap.agents.length, 1, "expected exactly one agent");
+  return snap.agents[0];
+}
+
+test("liveness: fresh transcript ⇒ active", () => {
+  withHome((home) => {
+    const tx = writeTranscript(home, "tx-active.jsonl", 5);
+    const a = buildOne(makeEntry({ client: { transcript_path: tx } as never }));
+    assert.equal(a.liveness, "active");
+    assert.equal(a.liveness_reason, "transcript_fresh");
+    assert.equal(a.transcript_age_s, 5);
+    assert.equal(a.awaiting_human, false); // active = working, never on the worklist
+  });
+});
+
+test("liveness: old transcript ⇒ idle with raw age", () => {
+  withHome((home) => {
+    const tx = writeTranscript(home, "tx-idle.jsonl", 600);
+    const a = buildOne(makeEntry({ client: { transcript_path: tx } as never }));
+    assert.equal(a.liveness, "idle");
+    assert.equal(a.liveness_reason, "idle");
+    assert.equal(a.transcript_age_s, 600);
+    assert.equal(a.awaiting_human, true); // idle-at-prompt, not waiting/stalled = your move
+  });
+});
+
+test("liveness: missing transcript ⇒ idle/no_transcript", () => {
+  withHome(() => {
+    const a = buildOne(makeEntry({ client: { transcript_path: "/nope/missing.jsonl" } as never }));
+    assert.equal(a.liveness, "idle");
+    assert.equal(a.liveness_reason, "no_transcript");
+    assert.equal(a.transcript_age_s, null);
+    assert.equal(a.awaiting_human, false); // no transcript ⇒ phantom/just-spawned, off the worklist
+  });
+});
+
+// ── item-5: working-but-quiet-transcript agents must read ACTIVE ────────────────
+// David watched a clearly-thinking agent read idle because transcript mtime lags
+// during a long turn. A fresh pane repaint OR an in-flight tool now promotes it.
+
+test("liveness: stale transcript but a fresh pane ⇒ active/pane_fresh (item-5)", () => {
+  withHome((home) => {
+    const tx = writeTranscript(home, "tx-quiet.jsonl", 600); // transcript cold 10m
+    const snap = buildSnapshot({
+      readEntries: () => [makeEntry({ tmux_pane: "%1", client: { transcript_path: tx } as never })],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      // pane repainted 2s ago ⇒ the agent is producing output / spinning right now.
+      resolvePaneInfo: () =>
+        new Map([["%1", { name: "main", activity_at: NOW_S - 2, window_index: 0 }]]),
+    });
+    const a = snap.agents[0];
+    assert.equal(a.liveness, "active");
+    assert.equal(a.liveness_reason, "pane_fresh");
+    assert.equal(a.pane_activity_age_s, 2);
+    assert.equal(a.transcript_age_s, 600); // raw transcript age still reported, unhidden
+  });
+});
+
+test("liveness: stale transcript AND a stale pane ⇒ stays idle (negative control)", () => {
+  withHome((home) => {
+    const tx = writeTranscript(home, "tx-quiet2.jsonl", 600);
+    const snap = buildSnapshot({
+      readEntries: () => [makeEntry({ tmux_pane: "%1", client: { transcript_path: tx } as never })],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      resolvePaneInfo: () =>
+        new Map([["%1", { name: "main", activity_at: NOW_S - 120, window_index: 0 }]]),
+    });
+    const a = snap.agents[0];
+    assert.equal(a.liveness, "idle");
+    assert.equal(a.liveness_reason, "idle");
+    assert.equal(a.pane_activity_age_s, 120);
+  });
+});
+
+test("liveness: stale transcript + stale pane but a tool in-flight ⇒ active/tool_running", () => {
+  withHome((home) => {
+    // A claude transcript whose last tool_use has no matching tool_result ⇒ running.
+    const path = join(home, "tx-tool.jsonl");
+    writeFileSync(
+      path,
+      JSON.stringify({ message: { content: [{ type: "tool_use", name: "Bash", id: "toolu_1" }] } }) +
+        "\n",
+    );
+    const mtime = NOW_S - 300; // cold 5m (a silent long bash: no transcript/pane motion)
+    utimesSync(path, mtime, mtime);
+    const snap = buildSnapshot({
+      readEntries: () => [makeEntry({ tmux_pane: "%1", client: { transcript_path: path } as never })],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      readActivity: true, // tool sub-state is gated on this
+      resolvePaneInfo: () =>
+        new Map([["%1", { name: "main", activity_at: NOW_S - 300, window_index: 0 }]]), // pane also stale
+    });
+    const a = snap.agents[0];
+    assert.equal(a.activity?.tool_running, true);
+    assert.equal(a.liveness, "active");
+    assert.equal(a.liveness_reason, "tool_running");
+  });
+});
+
+test("liveness: Codex shape — newer running call wins over an interleaved completed one ⇒ active", () => {
+  withHome((home) => {
+    // Out-of-order: an OLDER shell call completed, a NEWER update_plan is in-flight.
+    // scanLatestTool is call_id-based (not adjacency), so the reverse scan stops at
+    // the latest function_call (B) and reports it running — the completed A is moot.
+    const path = join(home, "tx-codex-run.jsonl");
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ type: "response_item", payload: { type: "function_call", name: "shell", call_id: "A" } }),
+        JSON.stringify({ type: "response_item", payload: { type: "function_call_output", call_id: "A" } }),
+        JSON.stringify({ type: "response_item", payload: { type: "function_call", name: "update_plan", call_id: "B" } }),
+      ].join("\n") + "\n",
+    );
+    const mtime = NOW_S - 300;
+    utimesSync(path, mtime, mtime);
+    const snap = buildSnapshot({
+      readEntries: () => [
+        makeEntry({ type: "codex", tmux_pane: "%1", client: { transcript_path: path } as never }),
+      ],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      readActivity: true,
+      resolvePaneInfo: () =>
+        new Map([["%1", { name: "max", activity_at: NOW_S - 300, window_index: 0 }]]),
+    });
+    const a = snap.agents[0];
+    assert.equal(a.activity?.tool_running, true);
+    assert.equal(a.liveness, "active");
+    assert.equal(a.liveness_reason, "tool_running");
+  });
+});
+
+test("liveness: Codex shape — a COMPLETED latest call does NOT false-active ⇒ stays idle", () => {
+  withHome((home) => {
+    const path = join(home, "tx-codex-done.jsonl");
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ type: "response_item", payload: { type: "function_call", name: "shell", call_id: "A" } }),
+        JSON.stringify({ type: "response_item", payload: { type: "function_call_output", call_id: "A" } }),
+      ].join("\n") + "\n",
+    );
+    const mtime = NOW_S - 300;
+    utimesSync(path, mtime, mtime);
+    const snap = buildSnapshot({
+      readEntries: () => [
+        makeEntry({ type: "codex", tmux_pane: "%1", client: { transcript_path: path } as never }),
+      ],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      readActivity: true,
+      resolvePaneInfo: () =>
+        new Map([["%1", { name: "max", activity_at: NOW_S - 300, window_index: 0 }]]),
+    });
+    const a = snap.agents[0];
+    assert.equal(a.activity?.tool_running, false); // call A has its output ⇒ not running
+    assert.equal(a.liveness, "idle"); // stale tx + stale pane + no running tool
+  });
+});
+
+test("liveness: a tool_running past STALL_WINDOW_S reads HUNG ⇒ idle + possibly_stalled (max gate)", () => {
+  withHome((home) => {
+    // The tool is still in-flight, but tx AND pane have been cold past the stall
+    // window — an unbounded tool_running would pin this active forever and suppress
+    // possibly_stalled. The age-bound hands off: active(tool_running) → idle → stalled.
+    const path = join(home, "tx-hung-tool.jsonl");
+    writeFileSync(
+      path,
+      JSON.stringify({ message: { content: [{ type: "tool_use", name: "Bash", id: "toolu_h" }] } }) +
+        "\n",
+    );
+    const mtime = NOW_S - 700; // cold 700s > STALL_WINDOW_S (600)
+    utimesSync(path, mtime, mtime);
+    const snap = buildSnapshot({
+      readEntries: () => [
+        makeEntry({
+          tmux_pane: "%1",
+          client: { transcript_path: path } as never,
+          state: { purpose: "running the build", updated_at: NOW_S - 695 },
+        }),
+      ],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      readActivity: true,
+      resolvePaneInfo: () =>
+        new Map([["%1", { name: "main", activity_at: NOW_S - 700, window_index: 0 }]]),
+    });
+    const a = snap.agents[0];
+    assert.equal(a.activity?.tool_running, true); // the tool IS still in-flight…
+    assert.equal(a.liveness, "idle"); // …but past the window it reads hung, not active
+    assert.equal(a.possibly_stalled, true); // and the idle-gated stall hint is freed
+  });
+});
+
+test("awaiting_human: a hung tool with NO purpose stays OFF the worklist (max F1 — no badge contradiction)", () => {
+  withHome((home) => {
+    // Same hung-tool shape, but NO declared purpose: possibly_stalled needs a purpose so
+    // it stays false and the row drops to idle/idle. Without the !tool_running guard it
+    // would read awaiting_human=true and show the in-flight tool badge `…` AND 🙋 at once.
+    const path = join(home, "tx-hung-nopurpose.jsonl");
+    writeFileSync(
+      path,
+      JSON.stringify({ message: { content: [{ type: "tool_use", name: "Bash", id: "toolu_x" }] } }) +
+        "\n",
+    );
+    const mtime = NOW_S - 700; // cold past STALL_WINDOW_S (600)
+    utimesSync(path, mtime, mtime);
+    const snap = buildSnapshot({
+      readEntries: () => [
+        makeEntry({ tmux_pane: "%1", client: { transcript_path: path } as never }), // no state/purpose
+      ],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      readActivity: true,
+      resolvePaneInfo: () =>
+        new Map([["%1", { name: "main", activity_at: NOW_S - 700, window_index: 0 }]]),
+    });
+    const a = snap.agents[0];
+    assert.equal(a.activity?.tool_running, true); // tool still in-flight
+    assert.equal(a.liveness, "idle");
+    assert.equal(a.possibly_stalled, false); // no purpose ⇒ the stall hint can't fire…
+    assert.equal(a.awaiting_human, false); // …so the F1 guard is what keeps it off the worklist
+  });
+});
+
+test("liveness: a dead pid never reads activity, even with a fresh pane + in-flight tool", () => {
+  withHome((home) => {
+    const path = join(home, "tx-dead-tool.jsonl");
+    writeFileSync(
+      path,
+      JSON.stringify({ message: { content: [{ type: "tool_use", name: "Bash", id: "x" }] } }) + "\n",
+    );
+    const snap = buildSnapshot({
+      readEntries: () => [
+        makeEntry({
+          server_pid: 2_000_000_000, // never alive ⇒ dead/exited short-circuits first
+          tmux_pane: "%1",
+          client: { transcript_path: path } as never,
+        }),
+      ],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      readActivity: true,
+      resolvePaneInfo: () =>
+        new Map([["%1", { name: "main", activity_at: NOW_S - 1, window_index: 0 }]]),
+    });
+    const a = snap.agents[0];
+    assert.equal(a.liveness, "dead");
+    assert.equal(a.activity, null); // activity tail is NOT read for dead agents
+  });
+});
+
+test("purpose: stale caption when set well before last activity", () => {
+  withHome((home) => {
+    const tx = writeTranscript(home, "tx.jsonl", 5); // active 5s ago
+    const a = buildOne(
+      makeEntry({
+        client: { transcript_path: tx } as never,
+        state: { purpose: "old plan", updated_at: NOW_S - 1000 }, // declared 1000s ago
+      }),
+    );
+    assert.equal(a.purpose, "old plan");
+    assert.equal(a.purpose_stale, true, "purpose older than recent activity ⇒ stale");
+  });
+});
+
+test("purpose: possibly_stalled when declared work but transcript cold past the window", () => {
+  withHome((home) => {
+    const tx = writeTranscript(home, "tx.jsonl", 700); // cold ~12m, past STALL_WINDOW_S (600)
+    const a = buildOne(
+      makeEntry({
+        client: { transcript_path: tx } as never,
+        state: { purpose: "running tests", updated_at: NOW_S - 690 }, // declared ~when it went cold
+      }),
+    );
+    assert.equal(a.liveness, "idle");
+    assert.equal(a.possibly_stalled, true);
+    assert.equal(a.awaiting_human, false); // maybe-hung is its OWN ⚠ class, not the worklist
+  });
+});
+
+test("purpose: a healthy idle agent (cold < window) is NOT flagged stalled", () => {
+  withHome((home) => {
+    const tx = writeTranscript(home, "tx.jsonl", 200); // idle 3m, well under the window
+    const a = buildOne(
+      makeEntry({
+        client: { transcript_path: tx } as never,
+        state: { purpose: "waiting for the human", updated_at: NOW_S - 190 },
+      }),
+    );
+    assert.equal(a.liveness, "idle");
+    assert.equal(a.possibly_stalled, false); // max M1: don't slander a normal idle agent
+    assert.equal(a.awaiting_human, true); // healthy idle (even WITH a purpose) = awaiting you
+  });
+});
+
+test("unread: counts session-box messages, tolerates a torn line", () => {
+  withHome(() => {
+    const sid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    const box = mailbox.mailboxSessionKey(sid);
+    mailbox.enqueue(box, "msg one", "sender");
+    mailbox.enqueue(box, "msg two", "sender");
+    // Corrupt the file with a torn trailing line — must be skipped, not counted.
+    appendFileSync(mailbox.mailboxFilePath(box), '{"schema_version":1,"id":"deadbeef');
+    const a = buildOne(makeEntry({ client: { session_id: sid, transcript_path: null } as never }));
+    assert.equal(a.unread, 2);
+    // A torn line was skipped → the count may undercount → honest "low".
+    assert.equal(a.unread_confidence, "low");
+  });
+});
+
+test("liveness: a not-alive server_pid ⇒ dead/exited", () => {
+  withHome(() => {
+    // A pid that is essentially never a live process on a dev box.
+    const a = buildOne(
+      makeEntry({ server_pid: 2_000_000_000, client: { transcript_path: null } as never }),
+    );
+    assert.equal(a.liveness, "dead");
+    assert.equal(a.liveness_reason, "exited");
+  });
+});
+
+test("window_name: resolved from the agent's pane via the injected resolver", () => {
+  withHome(() => {
+    const snap = buildSnapshot({
+      readEntries: () => [makeEntry({ tmux_pane: "%9", client: { transcript_path: null } as never })],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      resolvePaneInfo: () => new Map([["%9", { name: "max", activity_at: null }]]),
+    });
+    assert.equal(snap.agents.length, 1);
+    assert.equal(snap.agents[0].window_name, "max");
+  });
+});
+
+test("open_work: counts open obligations from the received ledger", () => {
+  withHome(() => {
+    const sid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    recordReceived(sid, mailbox.buildMessage("do X", "boss", { action_required: true }));
+    recordReceived(sid, mailbox.buildMessage("fyi", "peer")); // not an obligation
+    const a = buildOne(makeEntry({ client: { session_id: sid, transcript_path: null } as never }));
+    assert.equal(a.open_work, 1);
+  });
+});
+
+// ── wait graph ──────────────────────────────────────────────────────────────
+
+function fleetAgent(over: Partial<FleetAgent>): FleetAgent {
+  return {
+    session_id: over.session_id ?? null,
+    short_id: over.short_id ?? "xxxxxxxx",
+    window_name: null,
+    client_type: "claude-code",
+    server_pid: 1,
+    cwd: "/proj",
+    is_self: false,
+    liveness: over.liveness ?? "idle",
+    liveness_reason: "idle",
+    transcript_age_s: 10,
+    proc_sig: "ok",
+    purpose: null,
+    purpose_age_s: null,
+    purpose_stale: false,
+    possibly_stalled: false,
+    awaiting_human: over.awaiting_human ?? false,
+    unread: 0,
+    unread_confidence: "high",
+    open_work: 0,
+    waiting: over.waiting ?? null,
+    tmux_pane: "%1",
+    tmux_session: "proj",
+    ...over,
+  };
+}
+
+function waitEdge() {
+  return {
+    target_session_id: null,
+    target_short_id: null,
+    age_s: 5,
+    orphaned: false,
+    in_cycle: false,
+    cycle_all_live: false,
+  };
+}
+
+test("resolveWaitTargets: correlates request_id to the receiving peer", () => {
+  withHome(() => {
+    const A = "aaaaaaaa-0000-0000-0000-000000000001";
+    const B = "bbbbbbbb-0000-0000-0000-000000000002";
+    // The ask A sent landed in B's received ledger keyed by request_id + A.
+    recordReceived(B, mailbox.buildMessage("please do", A, { request_id: "req-1" }));
+    const agents = [
+      fleetAgent({ session_id: A, short_id: "aaaa", waiting: waitEdge() }),
+      fleetAgent({ session_id: B, short_id: "bbbb", liveness: "idle" }),
+    ];
+    resolveWaitTargets(agents, new Map([[A, { requestId: "req-1", ageS: 5 }]]));
+    assert.equal(agents[0].waiting!.target_session_id, B);
+    assert.equal(agents[0].waiting!.target_short_id, "bbbb");
+    assert.equal(agents[0].waiting!.orphaned, false);
+  });
+});
+
+test("resolveWaitTargets: marks orphaned when target is dead", () => {
+  withHome(() => {
+    const A = "aaaaaaaa-0000-0000-0000-000000000011";
+    const B = "bbbbbbbb-0000-0000-0000-000000000012";
+    recordReceived(B, mailbox.buildMessage("please do", A, { request_id: "req-2" }));
+    const agents = [
+      fleetAgent({ session_id: A, short_id: "aaaa", waiting: waitEdge() }),
+      fleetAgent({ session_id: B, short_id: "bbbb", liveness: "dead" }),
+    ];
+    resolveWaitTargets(agents, new Map([[A, { requestId: "req-2", ageS: 5 }]]));
+    assert.equal(agents[0].waiting!.target_session_id, B);
+    assert.equal(agents[0].waiting!.orphaned, true);
+  });
+});
+
+test("detectWaitCycles: finds a 2-node deadlock and marks members", () => {
+  const A = fleetAgent({
+    session_id: "m",
+    short_id: "main",
+    waiting: { ...waitEdge(), target_session_id: "c", target_short_id: "codex" },
+  });
+  const B = fleetAgent({
+    session_id: "c",
+    short_id: "codex",
+    waiting: { ...waitEdge(), target_session_id: "m", target_short_id: "main" },
+  });
+  const cycles = detectWaitCycles([A, B]);
+  assert.equal(cycles.length, 1);
+  assert.deepEqual(new Set(cycles[0].members), new Set(["main", "codex"]));
+  assert.equal(A.waiting!.in_cycle, true);
+  assert.equal(B.waiting!.in_cycle, true);
+});
+
+test("detectWaitCycles: a dead member makes the cycle not-all-live (stale)", () => {
+  const A = fleetAgent({
+    session_id: "m",
+    short_id: "main",
+    liveness: "dead",
+    waiting: { ...waitEdge(), target_session_id: "c", target_short_id: "codex" },
+  });
+  const B = fleetAgent({
+    session_id: "c",
+    short_id: "codex",
+    waiting: { ...waitEdge(), target_session_id: "m", target_short_id: "main" },
+  });
+  const cycles = detectWaitCycles([A, B]);
+  assert.equal(cycles.length, 1);
+  assert.equal(cycles[0].all_live, false);
+  assert.equal(B.waiting!.cycle_all_live, false);
+});
+
+test("detectWaitCycles: no cycle for a linear chain", () => {
+  const A = fleetAgent({
+    session_id: "a",
+    short_id: "a",
+    waiting: { ...waitEdge(), target_session_id: "b", target_short_id: "b" },
+  });
+  const B = fleetAgent({
+    session_id: "b",
+    short_id: "b",
+    waiting: { ...waitEdge(), target_session_id: "c", target_short_id: "c" },
+  });
+  const C = fleetAgent({ session_id: "c", short_id: "c" });
+  const cycles = detectWaitCycles([A, B, C]);
+  assert.equal(cycles.length, 0);
+  assert.equal(A.waiting!.in_cycle, false);
+});
+
+test("wait-graph: an ask with an observed reply is NOT a wait (H1 killer)", () => {
+  withHome(() => {
+    const W = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+    recordPendingAsk(defaultPendingAskDir(), W, "askreq1", NOW_MS); // file says "waiting"
+    // ...but the reply is observable in the requester's own ledger.
+    recordReceived(W, mailbox.buildMessage("answer", "peer", { reply_to: "askreq1" }));
+    const snap = buildSnapshot({
+      readEntries: () => [makeEntry({ client: { session_id: W, transcript_path: null } as never })],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      resolvePaneInfo: () => new Map(),
+    });
+    assert.equal(snap.agents.length, 1);
+    assert.equal(snap.agents[0].waiting, null, "an answered ask must not render as waiting");
+  });
+});
+
+test("wait-graph: an ask with no observed reply still shows as waiting", () => {
+  withHome(() => {
+    const W = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+    recordPendingAsk(defaultPendingAskDir(), W, "askreq2", NOW_MS);
+    const snap = buildSnapshot({
+      readEntries: () => [makeEntry({ client: { session_id: W, transcript_path: null } as never })],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      resolvePaneInfo: () => new Map(),
+    });
+    assert.equal(snap.agents.length, 1);
+    assert.ok(snap.agents[0].waiting, "an unanswered ask shows as waiting");
+  });
+});
+
+test("sort: fleet follows tmux WINDOW ORDER (fixed), not state/trouble/work", () => {
+  withHome(() => {
+    const A = "aaaaaaaa-0000-0000-0000-000000000001"; // window 1, MORE raw work
+    const B = "bbbbbbbb-0000-0000-0000-000000000002"; // window 5, waiting (trouble)
+    recordReceived(A, mailbox.buildMessage("do1", "boss", { action_required: true }));
+    recordReceived(A, mailbox.buildMessage("do2", "boss", { action_required: true }));
+    recordPendingAsk(defaultPendingAskDir(), B, "req-sort", NOW_MS);
+    const snap = buildSnapshot({
+      readEntries: () => [
+        makeEntry({ tmux_pane: "%2", client: { session_id: A, transcript_path: null } as never }),
+        makeEntry({ tmux_pane: "%5", client: { session_id: B, transcript_path: null } as never }),
+      ],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      // A is tmux window 1, B is window 5 — row order follows the window index, NOT
+      // B's trouble nor A's higher work-count (David: keep the list fixed).
+      resolvePaneInfo: () =>
+        new Map([
+          ["%2", { name: null, activity_at: null, window_index: 1 }],
+          ["%5", { name: null, activity_at: null, window_index: 5 }],
+        ]),
+    });
+    assert.equal(snap.agents.length, 2);
+    assert.equal(snap.agents[0].session_id, A, "lower window index first (state-independent)");
+    assert.equal(snap.agents[1].session_id, B, "higher window index second, despite its trouble");
+    assert.equal(snap.agents[0].window_index, 1);
+  });
+});
+
+test("buildSnapshot: empty registry ⇒ no agents, no throw", () => {
+  withHome(() => {
+    const snap = buildSnapshot({ readEntries: () => [], allProjects: true, nowMs: NOW_MS });
+    assert.equal(snap.agents.length, 0);
+    assert.equal(snap.cycles.length, 0);
+  });
+});

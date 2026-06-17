@@ -26,7 +26,14 @@ export type Mailbox = {
   body: string;
   enqueued_at: number;
   body_bytes?: number;
-  origin?: "peer";
+  // "peer" = an agent-to-agent message (default). "operator" = a human-authorized
+  // message sent FROM the oxpit cockpit; it carries NO from_session_id (oxpit is an
+  // operator UI, not an agent — see deliverOperatorMessage). origin is provenance
+  // for rendering/audit, NOT authentication.
+  origin?: "peer" | "operator";
+  // Diagnostic provenance for operator-origin messages (e.g. "oxpit"). Additive;
+  // absent on peer messages. Never an identity/auth field.
+  operator_source?: string;
   from_session_id?: string;
   request_id?: string;
   reply_to?: string;
@@ -45,6 +52,9 @@ export type EnqueueOptions = {
   reply_to?: string;
   source_message_id?: string;
   action_required?: boolean;
+  // Operator-origin send (oxpit cockpit). origin defaults to "peer".
+  origin?: "peer" | "operator";
+  operator_source?: string;
   // Optional explicit message id (must be 16 lowercase hex — the serializer's
   // FIELD_ORDER_PREFIX enforces it). Default is a fresh random nonce. Used by
   // complete_work to mint a DETERMINISTIC completion id so a crash-retry or a
@@ -164,6 +174,7 @@ export function serializeMailboxLine(msg: Mailbox): string {
   if (msg.request_id) obj.request_id = msg.request_id;
   if (msg.reply_to) obj.reply_to = msg.reply_to;
   if (msg.source_message_id) obj.source_message_id = msg.source_message_id;
+  if (msg.operator_source) obj.operator_source = msg.operator_source;
   // Appended LAST so the FIELD_ORDER_PREFIX invariant (schema_version,id,body)
   // is untouched and a pre-v0.19 awk-parsing hook on a legacy pid box ignores it.
   if (msg.action_required) obj.action_required = true;
@@ -260,11 +271,12 @@ export function buildMessage(
     body,
     enqueued_at: Math.floor(Date.now() / 1000),
     body_bytes: Buffer.byteLength(body, "utf8"),
-    origin: "peer",
+    origin: options.origin ?? "peer",
     ...(from_session_id ? { from_session_id } : {}),
     ...(options.request_id ? { request_id: options.request_id } : {}),
     ...(options.reply_to ? { reply_to: options.reply_to } : {}),
     ...(options.source_message_id ? { source_message_id: options.source_message_id } : {}),
+    ...(options.operator_source ? { operator_source: options.operator_source } : {}),
     ...(options.action_required ? { action_required: true } : {}),
   };
 }

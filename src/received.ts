@@ -384,3 +384,82 @@ export function claimObligation(
 export function receivedFilePath(sessionId: string): string {
   return ledgerPath(sessionId);
 }
+
+// Canonical extraction of (request_id, from_session_id) pairs from a session's
+// ledger — every inbound ask_peer is recorded here keyed by request_id. The oxpit
+// cockpit consumes this to resolve which peer an ask_peer waiter is blocked on,
+// instead of re-implementing ledger parsing (don't-fork-truth: parseLedgerRecord
+// stays the one parser). Read-only, lock-free (atomicWrite renames a whole file
+// into place, so a reader never sees a torn ledger), tolerates torn lines.
+export function listLedgerRequestPairs(
+  sessionId: string,
+): Array<{ request_id: string; from_session_id: string }> {
+  if (!sessionId) return [];
+  const out: Array<{ request_id: string; from_session_id: string }> = [];
+  for (const line of readLines(sessionId)) {
+    const rec = parseLedgerRecord(line);
+    if (rec?.request_id && rec.from_session_id) {
+      out.push({ request_id: rec.request_id, from_session_id: rec.from_session_id });
+    }
+  }
+  return out;
+}
+
+// Every reply_to value in a session's ledger — i.e. the request_ids this session
+// has RECEIVED a reply for. (An ask_peer reply is delivered to the requester, so it
+// lands in the requester's OWN ledger correlated by reply_to == request_id.) The
+// oxpit wait-graph uses this to confirm an ask was answered from observed message
+// evidence and suppress a stale pending-ask "wait" (kills the 1h-lingering H1
+// phantom). Read-only, lock-free, torn-tolerant; reuses parseLedgerRecord.
+export function listLedgerReplyTargets(sessionId: string): string[] {
+  if (!sessionId) return [];
+  const out: string[] = [];
+  for (const line of readLines(sessionId)) {
+    const rec = parseLedgerRecord(line);
+    if (rec?.reply_to) out.push(rec.reply_to);
+  }
+  return out;
+}
+
+// A flattened, render-friendly view of one inbound ledger record (the obligation
+// outcome collapsed to its terminal state). Used by the oxpit comms-log.
+export type LedgerEntry = {
+  id: string;
+  from_session_id: string | null;
+  body: string;
+  enqueued_at: number;
+  origin?: "peer" | "operator"; // provenance; "operator" = sent from the oxpit cockpit
+  operator_source?: string;
+  request_id?: string;
+  reply_to?: string;
+  action_required?: boolean;
+  closed?: ObligationState["state"]; // "done" | "blocked" if the obligation was closed
+};
+
+// Canonical reader of a session's most-recent inbound messages (newest-first,
+// capped at `limit`). The oxpit comms-log merges these across the fleet into a
+// cross-agent message feed. Read-only, lock-free, tolerates torn lines — reuses
+// parseLedgerRecord (don't-fork-truth). A session's ledger is its RECEIVED inbox,
+// so each record's receiver is `sessionId` and its sender is `from_session_id`.
+export function listRecentLedgerRecords(sessionId: string, limit = 50): LedgerEntry[] {
+  if (!sessionId || limit <= 0) return [];
+  const out: LedgerEntry[] = [];
+  const lines = readLines(sessionId);
+  for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
+    const rec = parseLedgerRecord(lines[i]);
+    if (!rec) continue;
+    out.push({
+      id: rec.id,
+      from_session_id: rec.from_session_id ?? null,
+      body: rec.body,
+      enqueued_at: rec.enqueued_at,
+      origin: rec.origin,
+      operator_source: rec.operator_source,
+      request_id: rec.request_id,
+      reply_to: rec.reply_to,
+      action_required: rec.action_required,
+      closed: rec.obligation?.state,
+    });
+  }
+  return out;
+}

@@ -106,9 +106,12 @@ const ASK_PEER_WAKE_STRATEGY: "auto" | "legacy" | "off" = (() => {
 async function defaultFireWakeKeystrokes(
   target: string,
   clientType: ClientType,
+  text: string = ASK_PEER_WAKE_TEXT,
 ): Promise<void> {
-  execFileSync("tmux", ["send-keys", "-t", target, "-l", ASK_PEER_WAKE_TEXT], {
+  // timeout: a hung tmux server must not block the MCP request thread indefinitely.
+  execFileSync("tmux", ["send-keys", "-t", target, "-l", text], {
     stdio: ["ignore", "pipe", "pipe"],
+    timeout: 2000,
   });
   if (clientType === "codex") {
     await new Promise<void>((resolve) => {
@@ -118,6 +121,7 @@ async function defaultFireWakeKeystrokes(
   }
   execFileSync("tmux", ["send-keys", "-t", target, "Enter"], {
     stdio: ["ignore", "pipe", "pipe"],
+    timeout: 2000,
   });
 }
 
@@ -160,7 +164,10 @@ const wakeDebounce = newWakeDebounceStore();
 // peer's client_type. Returns the wake_status that should surface in the
 // response so callers can distinguish "we tried, no answer" from "we didn't
 // try because the client can't be woken."
-export async function wakePeer(peer: RegistryEntry): Promise<WakeStatus> {
+export async function wakePeer(
+  peer: RegistryEntry,
+  wakeText: string = ASK_PEER_WAKE_TEXT,
+): Promise<WakeStatus> {
   if (ASK_PEER_WAKE_STRATEGY === "off") {
     trace("ask_peer_wake_skipped", { reason: "strategy-off" });
     return "disabled";
@@ -203,7 +210,7 @@ export async function wakePeer(peer: RegistryEntry): Promise<WakeStatus> {
   // (no inter-keystroke delay). Cast to "unknown" so defaultFireWakeKeystrokes
   // skips the Codex delay branch.
   const fireType: ClientType = ASK_PEER_WAKE_STRATEGY === "legacy" ? "unknown" : clientType;
-  const fire = (target: string) => defaultFireWakeKeystrokes(target, fireType);
+  const fire = (target: string) => defaultFireWakeKeystrokes(target, fireType, wakeText);
   // #5: stamp the debounce BEFORE the (possibly async, paste-burst-delayed) fire
   // so a concurrent second wakePeer for this peer — which runs while we're
   // awaiting send-keys — sees the stamp and coalesces instead of double-firing.
@@ -275,12 +282,15 @@ function shouldWakeForSend(act: { status: string; ageMs: number } | null): boole
   return !(act && act.status === "busy" && act.ageMs < ACTIVITY_BUSY_TTL_MS);
 }
 
-export async function wakeForSend(peer: RegistryEntry): Promise<WakeStatus> {
+export async function wakeForSend(
+  peer: RegistryEntry,
+  wakeText?: string,
+): Promise<WakeStatus> {
   if (!shouldWakeForSend(readActivity(peer.client.session_id))) {
     trace("send_wake_skipped_busy", { target_session_id: peer.client.session_id });
     return "skipped_busy";
   }
-  return wakePeer(peer);
+  return wakePeer(peer, wakeText);
 }
 
 // --- Slice 1: wake-on-reply (reply_to default) -------------------------------

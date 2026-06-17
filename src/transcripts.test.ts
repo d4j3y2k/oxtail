@@ -463,3 +463,38 @@ test("phase-e: tail_scan on empty and missing files returns empty + exact", () =
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("phase-e: tail_scan reads EXACTLY `limit` msgs (oldest = first physical line) as EXACT (byte-identity)", () => {
+  // Regression: the oldest message arrives via the BOF leftover. The fetch-(limit+1)
+  // logic must NOT mislabel this complete read as truncated (max review).
+  const { path, cleanup } = writeRawLines([
+    JSON.stringify(claudeLine("A")),
+    JSON.stringify(claudeLine("B")),
+  ]);
+  try {
+    const r = readClaudeTranscript(path, { tailScan: true, limit: 2 });
+    assert.deepEqual(r.messages.map((m) => m.text), ["A", "B"]);
+    assert.equal(r.count_truncated, false, "a complete read is not truncated");
+    assert.equal(r.truncated, false);
+    assert.equal(r.total_messages, 2);
+    assert.equal(r.total_messages_exact, true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("phase-e: tail_scan with MORE than `limit` msgs is inexact and tail-windowed", () => {
+  const { path, cleanup } = writeRawLines([
+    JSON.stringify(claudeLine("A")),
+    JSON.stringify(claudeLine("B")),
+    JSON.stringify(claudeLine("C")),
+  ]);
+  try {
+    const r = readClaudeTranscript(path, { tailScan: true, limit: 2 });
+    assert.deepEqual(r.messages.map((m) => m.text), ["B", "C"]); // newest 2, chronological
+    assert.equal(r.count_truncated, true);
+    assert.equal(r.total_messages_exact, false);
+  } finally {
+    cleanup();
+  }
+});

@@ -892,13 +892,15 @@ type ReadMyMessagesResponse = {
   ok: true;
   drained: true;
   count: number;
+  operator_message_hint?: string;
   messages: Array<{
     schema_version: 1;
     id: string;
     body: string;
     enqueued_at: number;
     body_bytes?: number;
-    origin?: "peer";
+    origin?: "peer" | "operator";
+    operator_source?: string;
     from_session_id?: string;
     request_id?: string;
     reply_to?: string;
@@ -1639,6 +1641,57 @@ test("messaging: read_my_messages on empty mailbox returns count 0", async () =>
     assert.equal(r.drained, true);
     assert.equal(r.count, 0);
     assert.deepEqual(r.messages, []);
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("messaging: an operator-origin message drains with the operator_message_hint", async () => {
+  // codex MED#2: a hookless peer (Codex) drains via read_my_messages, so the
+  // operator-untrusted/one-way framing the hook path adds must also ride this PULL
+  // path. Seed an origin:"operator" message into the server's OWN mailbox and assert
+  // the drain surfaces operator_message_hint + the per-message origin.
+  const server = await spawnServer();
+  try {
+    const me = await callTool<GetMySessionResponse>(server.client, "get_my_session");
+    const myPid = me.entry.server_pid;
+    const prev = process.env.HOME;
+    process.env.HOME = server.home;
+    try {
+      enqueue(myPid, "operator ping", undefined, { origin: "operator", operator_source: "oxpit" });
+    } finally {
+      process.env.HOME = prev;
+    }
+    const r = await callTool<ReadMyMessagesResponse>(server.client, "read_my_messages", {});
+    assert.equal(r.ok, true);
+    assert.ok(r.count >= 1, "drained the operator message");
+    assert.ok(
+      r.messages.some((m) => m.origin === "operator"),
+      "the drained message carries origin:operator",
+    );
+    assert.ok(r.operator_message_hint, "operator_message_hint present when an operator msg drains");
+    assert.match(r.operator_message_hint!, /operator|untrusted|reply target/i);
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("messaging: a plain peer message drains WITHOUT the operator hint", async () => {
+  // Negative control: the hint must NOT appear for ordinary peer traffic.
+  const server = await spawnServer();
+  try {
+    const me = await callTool<GetMySessionResponse>(server.client, "get_my_session");
+    const myPid = me.entry.server_pid;
+    const prev = process.env.HOME;
+    process.env.HOME = server.home;
+    try {
+      enqueue(myPid, "peer ping", "feed0000-0000-0000-0000-000000000001");
+    } finally {
+      process.env.HOME = prev;
+    }
+    const r = await callTool<ReadMyMessagesResponse>(server.client, "read_my_messages", {});
+    assert.ok(r.count >= 1);
+    assert.equal(r.operator_message_hint, undefined, "no operator hint for peer-only traffic");
   } finally {
     await server.cleanup();
   }
