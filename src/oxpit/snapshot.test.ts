@@ -97,6 +97,7 @@ test("liveness: fresh transcript ⇒ active", () => {
     assert.equal(a.liveness, "active");
     assert.equal(a.liveness_reason, "transcript_fresh");
     assert.equal(a.transcript_age_s, 5);
+    assert.equal(a.awaiting_human, false); // active = working, never on the worklist
   });
 });
 
@@ -107,6 +108,7 @@ test("liveness: old transcript ⇒ idle with raw age", () => {
     assert.equal(a.liveness, "idle");
     assert.equal(a.liveness_reason, "idle");
     assert.equal(a.transcript_age_s, 600);
+    assert.equal(a.awaiting_human, true); // idle-at-prompt, not waiting/stalled = your move
   });
 });
 
@@ -116,6 +118,7 @@ test("liveness: missing transcript ⇒ idle/no_transcript", () => {
     assert.equal(a.liveness, "idle");
     assert.equal(a.liveness_reason, "no_transcript");
     assert.equal(a.transcript_age_s, null);
+    assert.equal(a.awaiting_human, false); // no transcript ⇒ phantom/just-spawned, off the worklist
   });
 });
 
@@ -346,6 +349,7 @@ test("purpose: possibly_stalled when declared work but transcript cold past the 
     );
     assert.equal(a.liveness, "idle");
     assert.equal(a.possibly_stalled, true);
+    assert.equal(a.awaiting_human, false); // maybe-hung is its OWN ⚠ class, not the worklist
   });
 });
 
@@ -360,6 +364,7 @@ test("purpose: a healthy idle agent (cold < window) is NOT flagged stalled", () 
     );
     assert.equal(a.liveness, "idle");
     assert.equal(a.possibly_stalled, false); // max M1: don't slander a normal idle agent
+    assert.equal(a.awaiting_human, true); // healthy idle (even WITH a purpose) = awaiting you
   });
 });
 
@@ -433,6 +438,7 @@ function fleetAgent(over: Partial<FleetAgent>): FleetAgent {
     purpose_age_s: null,
     purpose_stale: false,
     possibly_stalled: false,
+    awaiting_human: over.awaiting_human ?? false,
     unread: 0,
     unread_confidence: "high",
     open_work: 0,

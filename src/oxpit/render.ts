@@ -140,10 +140,16 @@ function statusText(a: FleetAgent): string {
     return a.liveness_reason === "pid_reused" ? "dead·reused" : "dead·gone";
   }
   if (a.liveness === "active") {
-    // Show the freshest signal behind the active glyph (always an honest raw age).
-    // pane_fresh reports the pane-repaint age — the transcript can be minutes stale
-    // mid-turn — so a working agent reads "active ✽0s", not "active 2m".
+    // Each of the 3 active reasons is legible from the status cell ALONE (not only via
+    // the badge cluster): pane_fresh → ✽pane-age (the transcript can be minutes stale
+    // mid-turn, so show the live pane-repaint age, not "active 2m"); tool_running →
+    // ⧖tx-age (a tool is in flight while tx+pane are both quiet — the transcript mtime
+    // is the unclosed tool_use write, i.e. the practical tool-call age, bounded by
+    // STALL_WINDOW_S); else transcript_fresh → plain tx-age. ⧖ U+29D6 is verified
+    // EAW-Neutral (range 2999..29D7 in EastAsianWidth-17), so displayWidth's 1-col
+    // count is correct on every locale — and it doesn't collide with the ⚙bash badge.
     if (a.liveness_reason === "pane_fresh") return `active ✽${fmtAge(a.pane_activity_age_s)}`;
+    if (a.liveness_reason === "tool_running") return `active ⧖${fmtAge(a.transcript_age_s)}`;
     return `active ${fmtAge(a.transcript_age_s)}`;
   }
   if (a.liveness_reason === "no_transcript") return "idle·no-tx";
@@ -220,6 +226,7 @@ export type FleetTrouble = {
   stranded: number; // open obligations whose OWNER is dead — will never be done
   strandedOwners: number; // how many dead agents hold that stranded work
   stalled: number; // possibly-stalled agents (soft hint, never an alarm)
+  awaiting: number; // idle agents sitting at their prompt = "awaiting you" (worklist)
   active: number;
 };
 
@@ -232,6 +239,7 @@ export function fleetTrouble(s: FleetSnapshot): FleetTrouble {
     stranded: strandedAgents.reduce((n, a) => n + a.open_work, 0),
     strandedOwners: strandedAgents.length,
     stalled: s.agents.filter((a) => a.possibly_stalled).length,
+    awaiting: s.agents.filter((a) => a.awaiting_human).length,
     active: s.agents.filter((a) => a.liveness === "active").length,
   };
 }
@@ -262,6 +270,20 @@ export function attentionLine(s: FleetSnapshot, paint: Paint): string | null {
   if (t.staleCycles)
     segs.push(paint(`⚠ ${t.staleCycles} possible ${plural(t.staleCycles, "cycle")}`, C.yellow));
   if (t.stalled) segs.push(paint(`⚠ ${t.stalled} possibly stalled`, C.dim));
+  // The WORKLIST segment: who is idle at their prompt waiting for YOU. Appended AFTER
+  // the trouble segs (it's not an alarm), NAMED rather than counted (for a small fleet a
+  // name is strictly more actionable than a number), capped like the wait-graph. Painted
+  // cyan — the operator/"you" accent (ties to the › cursor + column headers): not red
+  // (not trouble), not dim (it IS actionable, unlike nominal/stalled). When there's no
+  // trouble it REPLACES "✓ nominal" — you're not "nothing to see" if someone needs you.
+  const awaiting = s.agents.filter((a) => a.awaiting_human);
+  if (awaiting.length > 0) {
+    const { byShortId } = computeAgentLabels(s.agents);
+    const names = awaiting.map((a) => byShortId.get(a.short_id) ?? a.short_id);
+    const shown = names.slice(0, 3).join(", ");
+    const more = names.length > 3 ? ` +${names.length - 3}` : "";
+    segs.push(paint(`🙋 awaiting you: ${shown}${more}`, C.cyan));
+  }
   if (segs.length === 0) {
     return paint(`  ✓ fleet nominal · ${t.active} active`, C.dim);
   }

@@ -12,7 +12,7 @@ import type { FleetAgent, FleetSnapshot } from "./snapshot.js";
 import type { CommsMessage } from "./comms.js";
 
 function agent(partial: Partial<FleetAgent>): FleetAgent {
-  return {
+  const a: FleetAgent = {
     session_id: "11111111-1111-1111-1111-111111111111",
     short_id: "11111111",
     window_name: null,
@@ -30,6 +30,7 @@ function agent(partial: Partial<FleetAgent>): FleetAgent {
     purpose_age_s: null,
     purpose_stale: false,
     possibly_stalled: false,
+    awaiting_human: false,
     transcript_path: null,
     activity: null,
     unread: 0,
@@ -41,6 +42,17 @@ function agent(partial: Partial<FleetAgent>): FleetAgent {
     window_index: 0,
     ...partial,
   };
+  // Mirror buildAgent's derivation so render fixtures match real snapshots (an idle,
+  // not-peer-waiting, not-stalled agent with a transcript IS awaiting-you) — unless a
+  // test pins awaiting_human explicitly.
+  if (partial.awaiting_human === undefined) {
+    a.awaiting_human =
+      a.liveness === "idle" &&
+      a.liveness_reason !== "no_transcript" &&
+      a.waiting === null &&
+      !a.possibly_stalled;
+  }
+  return a;
 }
 
 function snap(agents: FleetAgent[], extra: Partial<FleetSnapshot> = {}): FleetSnapshot {
@@ -342,9 +354,54 @@ test("render: empty fleet", () => {
 
 const ID = (s: string) => s; // identity paint for plain-text assertions
 
-test("attentionLine: healthy fleet renders a dim '✓ nominal' (not null/absent)", () => {
-  const out = attentionLine(snap([agent({ liveness: "active" }), agent({ liveness: "idle" })]), ID);
-  assert.ok(out && /✓ fleet nominal · 1 active/.test(out), "absence of alarms reads as 'checked & fine'");
+test("attentionLine: healthy fleet (active + a peer-waiter) renders a dim '✓ nominal'", () => {
+  // Truly-nominal now means: no trouble AND nobody awaiting YOU. A peer-waiter is the
+  // wait-graph's job, not the worklist (awaiting_human=false), so this still reads fine.
+  const out = attentionLine(
+    snap([
+      agent({ liveness: "active" }),
+      agent({
+        liveness: "idle",
+        waiting: { target_session_id: "x", target_short_id: "x", age_s: 5, orphaned: false, in_cycle: false, cycle_all_live: false },
+      }),
+    ]),
+    ID,
+  );
+  assert.ok(out && /✓ fleet nominal · 1 active/.test(out), "absence of alarms + nobody awaiting reads as 'checked & fine'");
+});
+
+test("attentionLine: idle-at-prompt agents are the 🙋 worklist — NAMED, replacing nominal", () => {
+  // The product step: an idle agent sitting at its prompt is "awaiting you". The line
+  // names them (more actionable than a count for a small fleet) and replaces nominal —
+  // you are not "nothing to see" when someone is blocked on your input.
+  const out = attentionLine(
+    snap([
+      agent({ short_id: "aaaa1111", liveness: "active" }),
+      agent({ short_id: "cccc2222", window_name: "codex", liveness: "idle" }),
+      agent({ short_id: "mmmm3333", window_name: "max", liveness: "idle" }),
+    ]),
+    ID,
+  )!;
+  assert.match(out, /🙋 awaiting you: /);
+  assert.ok(out.includes("codex") && out.includes("max"), `expected names, got: ${out}`);
+  assert.ok(!/✓ fleet nominal/.test(out), "someone needs you ⇒ the worklist replaces nominal");
+});
+
+test("attentionLine: a peer-waiter is NOT on the worklist (complement of the wait-graph)", () => {
+  // The disambiguation: parked-on-a-peer belongs to the wait-graph, never the 🙋 line.
+  const out = attentionLine(
+    snap([
+      agent({ short_id: "aaaa1111", liveness: "active" }),
+      agent({
+        short_id: "wwww2222",
+        window_name: "waiter",
+        liveness: "idle",
+        waiting: { target_session_id: "t", target_short_id: "t", age_s: 9, orphaned: false, in_cycle: false, cycle_all_live: false },
+      }),
+    ]),
+    ID,
+  )!;
+  assert.ok(!/🙋/.test(out), "peer-waiters must not appear on the awaiting-you worklist");
 });
 
 test("attentionLine: empty fleet returns null (the 'no agents' line covers it)", () => {
@@ -528,6 +585,27 @@ test("pane_fresh: working-but-quiet-transcript agent reads active ✽age (item-5
   assert.ok(out.includes("active ✽2s"), `expected pane-fresh status, got:\n${out}`);
   assert.match(out, /🟢/); // promoted to the active glyph
   assert.ok(!out.includes("2m"), "must show the fresh pane age, not the stale 200s transcript");
+});
+
+// ── tool_running: a silent in-flight tool reads ACTIVE, ⧖tx-age behind the glyph ──
+test("tool_running: a silent-tool agent reads active ⧖tx-age, distinct from transcript_fresh", () => {
+  // A tool is in flight while transcript + pane are both quiet (a long bash / fetch).
+  // snapshot.ts keeps it active/tool_running; render must mark it ⧖ so it's legible
+  // from the status cell alone (not only via the badge cluster) and shows the tx age.
+  const out = renderSnapshot(
+    snap([
+      agent({
+        liveness: "active",
+        liveness_reason: "tool_running",
+        transcript_age_s: 45,
+        pane_activity_age_s: 90,
+      }),
+    ]),
+    { color: false, width: 120 },
+  );
+  assert.ok(out.includes("active ⧖45s"), `expected tool-running status, got:\n${out}`);
+  assert.match(out, /🟢/); // still the active glyph
+  assert.ok(!out.includes("active 45s"), "tool_running must carry the ⧖ marker, not read bare");
 });
 
 test("pane_fresh: a long-quiet idle agent shows no ✽ and stays idle", () => {

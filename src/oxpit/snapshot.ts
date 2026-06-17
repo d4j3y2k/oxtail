@@ -142,6 +142,16 @@ export type FleetAgent = {
   purpose_age_s: number | null;
   purpose_stale: boolean; // caption older than last activity ⇒ probably outdated
   possibly_stalled: boolean; // declared work but transcript cold ⇒ likely hung
+  // Worklist signal (max's v1 cut): an idle agent that is NOT parked on a peer, NOT
+  // maybe-hung, and HAS a transcript (a real session sitting at its prompt) is
+  // "awaiting you" — your move. The COMPLEMENT of the wait-graph within idle-space, so
+  // the cockpit answers "who needs me right now", not just "who's alive". Crucially a
+  // PURE snapshot derivation: "working" is already excluded by the active enum
+  // (transcript_fresh ∨ pane_fresh ∨ tool_running ⇒ active), so by the time a row reads
+  // idle the pane needn't be re-captured — the signal is fleet-complete in BOTH `oxtail
+  // status` AND the selected-row-only TUI, no exec cost. capture-pane only ENRICHES it
+  // later (the permission-gate upgrade + false-"awaiting" suppression), never sources it.
+  awaiting_human: boolean;
 
   // Transcript path (display/activity only; jump RE-RESOLVES identity separately).
   transcript_path: string | null;
@@ -541,6 +551,15 @@ function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
       }
     : null;
 
+  // "Awaiting you" — computed OUTSIDE the purpose block ON PURPOSE: unlike
+  // possibly_stalled it must NOT require a declared purpose (a no-purpose idle agent is
+  // MORE awaiting-you, not less). reason !== "no_transcript" keeps a phantom/just-spawned
+  // entry off the worklist; waiting === null excludes peer-waiters (the wait-graph's job,
+  // surfacing them here would be a false positive that trains you to ignore the badge);
+  // !possiblyStalled keeps the maybe-hung agents in their own ⚠ class (a different action).
+  const awaitingHuman =
+    liveness === "idle" && reason !== "no_transcript" && waiting === null && !possiblyStalled;
+
   return {
     session_id: sid,
     short_id: shortId(sid, e.server_pid),
@@ -559,6 +578,7 @@ function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
     purpose_age_s: purposeAgeS,
     purpose_stale: purposeStale,
     possibly_stalled: possiblyStalled,
+    awaiting_human: awaitingHuman,
     transcript_path: transcriptPath,
     activity,
     unread,

@@ -35,7 +35,7 @@ export function cell(s: string, width: number): string {
 // estimate lets a line exceed the terminal and WRAP — which desyncs the TUI's
 // cursor-home repaint and corrupts the screen (max M3). This is not a full wcwidth;
 // it just has to cover the glyphs we render.
-const WIDE_GLYPHS = new Set(["🟢", "🟡", "⚫", "⏳", "⛔", "⚠", "✉", "⚑"]);
+const WIDE_GLYPHS = new Set(["🟢", "🟡", "⚫", "⏳", "⛔", "⚠", "✉", "⚑", "🙋"]);
 
 // Matches a CSI escape sequence (e.g. the SGR color codes "\x1b[..m"). Such
 // sequences occupy ZERO display columns.
