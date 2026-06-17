@@ -50,7 +50,8 @@ function agent(partial: Partial<FleetAgent>): FleetAgent {
       a.liveness === "idle" &&
       a.liveness_reason !== "no_transcript" &&
       a.waiting === null &&
-      !a.possibly_stalled;
+      !a.possibly_stalled &&
+      !a.activity?.tool_running;
   }
   return a;
 }
@@ -404,6 +405,35 @@ test("attentionLine: a peer-waiter is NOT on the worklist (complement of the wai
   assert.ok(!/🙋/.test(out), "peer-waiters must not appear on the awaiting-you worklist");
 });
 
+test("attentionLine: worklist caps at 3 names with '+N more' (wait-graph idiom)", () => {
+  const idle = (sid: string, name: string) => agent({ short_id: sid, window_name: name, liveness: "idle" });
+  const out = attentionLine(
+    snap([
+      idle("aaaa0001", "a"),
+      idle("bbbb0002", "b"),
+      idle("cccc0003", "c"),
+      idle("dddd0004", "d"),
+      idle("eeee0005", "e"),
+    ]),
+    ID,
+  )!;
+  assert.match(out, /🙋 awaiting you: a, b, c \+2 more/);
+});
+
+test("computeAgentLabels: scrubs the ESC/C0/newline/bidi injection vector from window names (codex)", () => {
+  // A tmux window name is arbitrary bytes — the label feeds the rows, wait-graph, comms,
+  // and the prominent new 🙋 worklist, so it must never carry a terminal-control injection.
+  const { byShortId } = computeAgentLabels([
+    agent({ short_id: "scrub111", window_name: "a\x1b[31mb\nc\u202ed" }),
+  ]);
+  const label = byShortId.get("scrub111")!;
+  // No ESC byte (⇒ the "[31m" remnant is inert text, not an active SGR), no C0, no bidi
+  // override — the label cannot corrupt the operator's terminal. (\u escapes, never
+  // literal invisibles — the project's NUL-separator lesson.)
+  assert.ok(!/[\x00-\x1f\u202a-\u202e]/.test(label), `unsafe bytes survived: ${JSON.stringify(label)}`);
+  assert.ok(label.includes("a") && label.includes("d"), "readable text is preserved");
+});
+
 test("attentionLine: empty fleet returns null (the 'no agents' line covers it)", () => {
   assert.equal(attentionLine(snap([]), ID), null);
 });
@@ -567,8 +597,8 @@ test("activity badge: absent when no activity", () => {
   }
 });
 
-// ── pane_fresh: a fresh pane reads ACTIVE, ✽age behind the glyph ────────────────
-test("pane_fresh: working-but-quiet-transcript agent reads active ✽age (item-5 fix)", () => {
+// ── pane_fresh: a fresh pane reads ACTIVE, ✻age behind the glyph ────────────────
+test("pane_fresh: working-but-quiet-transcript agent reads active ✻age (item-5 fix)", () => {
   // David's case: transcript minutes stale mid-turn but the pane repainted just now.
   // snapshot.ts promotes it to active/pane_fresh; render shows the fresh PANE age.
   const out = renderSnapshot(
@@ -582,7 +612,7 @@ test("pane_fresh: working-but-quiet-transcript agent reads active ✽age (item-5
     ]),
     { color: false, width: 120 },
   );
-  assert.ok(out.includes("active ✽2s"), `expected pane-fresh status, got:\n${out}`);
+  assert.ok(out.includes("active ✻2s"), `expected pane-fresh status, got:\n${out}`);
   assert.match(out, /🟢/); // promoted to the active glyph
   assert.ok(!out.includes("2m"), "must show the fresh pane age, not the stale 200s transcript");
 });
@@ -608,12 +638,12 @@ test("tool_running: a silent-tool agent reads active ⧖tx-age, distinct from tr
   assert.ok(!out.includes("active 45s"), "tool_running must carry the ⧖ marker, not read bare");
 });
 
-test("pane_fresh: a long-quiet idle agent shows no ✽ and stays idle", () => {
+test("pane_fresh: a long-quiet idle agent shows no ✻ and stays idle", () => {
   const out = renderSnapshot(
     snap([agent({ liveness: "idle", transcript_age_s: 600, pane_activity_age_s: 120 })]),
     { color: false, width: 120 },
   );
-  assert.ok(!out.includes("✽"), "a long-quiet pane must not show the hint");
+  assert.ok(!out.includes("✻"), "a long-quiet pane must not show the hint");
   assert.match(out, /🟡/);
 });
 
@@ -630,7 +660,7 @@ test("pane_fresh: a transcript_fresh active agent shows the transcript age, no �
     { color: false, width: 120 },
   );
   assert.ok(out.includes("active 3s"), `expected transcript-fresh status, got:\n${out}`);
-  assert.ok(!out.includes("✽"), "transcript-fresh rows read live directly; no ✽ suffix");
+  assert.ok(!out.includes("✻"), "transcript-fresh rows read live directly; no ✻ suffix");
 });
 
 // ── live pane-tail detail (beats purpose) ───────────────────────────────────────

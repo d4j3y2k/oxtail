@@ -128,7 +128,7 @@ export type FleetAgent = {
   // Seconds since the agent's tmux pane last produced OUTPUT (pty activity). FOLDS
   // INTO liveness: a fresh repaint within the active window ⇒ active/pane_fresh (a
   // long thinking turn keeps the pane spinning while the transcript mtime lags). The
-  // raw age is always shown behind the glyph ("active ✽Ns") so it's never a binary-
+  // raw age is always shown behind the glyph ("active ✻Ns") so it's never a binary-
   // 🟢 overpromise. null = no pane / no tmux.
   pane_activity_age_s: number | null;
   // The raw ABSOLUTE pty-activity epoch (unix seconds) behind that age. Carried so
@@ -557,8 +557,18 @@ function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
   // entry off the worklist; waiting === null excludes peer-waiters (the wait-graph's job,
   // surfacing them here would be a false positive that trains you to ignore the badge);
   // !possiblyStalled keeps the maybe-hung agents in their own ⚠ class (a different action).
+  // !activity?.tool_running closes max's F1: a hung/unclosed tool with NO declared purpose
+  // drops to idle past STALL_WINDOW_S with possibly_stalled=false (it needs a purpose), so
+  // the row would otherwise show the in-flight tool badge `…` AND 🙋 at once — a visible
+  // contradiction. This term fires ONLY there (idle + in-flight tool ⟹ tx>STALL_WINDOW_S,
+  // since tool_running with a fresh tx is the ACTIVE branch). It's a no-op when readActivity
+  // is off (activity null); both real surfaces — `status` + the TUI slow tick — run it on.
   const awaitingHuman =
-    liveness === "idle" && reason !== "no_transcript" && waiting === null && !possiblyStalled;
+    liveness === "idle" &&
+    reason !== "no_transcript" &&
+    waiting === null &&
+    !possiblyStalled &&
+    !activity?.tool_running;
 
   return {
     session_id: sid,

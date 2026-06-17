@@ -141,14 +141,16 @@ function statusText(a: FleetAgent): string {
   }
   if (a.liveness === "active") {
     // Each of the 3 active reasons is legible from the status cell ALONE (not only via
-    // the badge cluster): pane_fresh → ✽pane-age (the transcript can be minutes stale
+    // the badge cluster): pane_fresh → ✻pane-age (the transcript can be minutes stale
     // mid-turn, so show the live pane-repaint age, not "active 2m"); tool_running →
     // ⧖tx-age (a tool is in flight while tx+pane are both quiet — the transcript mtime
     // is the unclosed tool_use write, i.e. the practical tool-call age, bounded by
-    // STALL_WINDOW_S); else transcript_fresh → plain tx-age. ⧖ U+29D6 is verified
-    // EAW-Neutral (range 2999..29D7 in EastAsianWidth-17), so displayWidth's 1-col
-    // count is correct on every locale — and it doesn't collide with the ⚙bash badge.
-    if (a.liveness_reason === "pane_fresh") return `active ✽${fmtAge(a.pane_activity_age_s)}`;
+    // STALL_WINDOW_S); else transcript_fresh → plain tx-age. Both markers are VERIFIED
+    // EAW-Neutral against EastAsianWidth-17 so displayWidth's 1-col count is correct on
+    // every locale: ⧖ U+29D6 (range 2999..29D7) — and it doesn't collide with the ⚙bash
+    // badge; ✻ U+273B (range 2729..273C) — swapped from ✽ U+273D, which is Ambiguous and
+    // could mis-measure in this fixed STATUS_W=13 cell (codex review).
+    if (a.liveness_reason === "pane_fresh") return `active ✻${fmtAge(a.pane_activity_age_s)}`;
     if (a.liveness_reason === "tool_running") return `active ⧖${fmtAge(a.transcript_age_s)}`;
     return `active ${fmtAge(a.transcript_age_s)}`;
   }
@@ -281,7 +283,7 @@ export function attentionLine(s: FleetSnapshot, paint: Paint): string | null {
     const { byShortId } = computeAgentLabels(s.agents);
     const names = awaiting.map((a) => byShortId.get(a.short_id) ?? a.short_id);
     const shown = names.slice(0, 3).join(", ");
-    const more = names.length > 3 ? ` +${names.length - 3}` : "";
+    const more = names.length > 3 ? ` +${names.length - 3} more` : "";
     segs.push(paint(`🙋 awaiting you: ${shown}${more}`, C.cyan));
   }
   if (segs.length === 0) {
@@ -430,18 +432,29 @@ export function computeAgentLabels(agents: ReadonlyArray<FleetAgent>): {
   byShortId: Map<string, string>;
   bySession: Map<string, string>;
 } {
+  // window_name is UNTRUSTED — a tmux window name is arbitrary bytes (ESC/C0/newline/
+  // bidi/zero-width). Scrub it ONCE here at the label boundary so EVERY consumer — table
+  // rows, the wait-graph, comms from/to, AND the new 🙋 worklist — renders the same
+  // terminal-safe label and the collision count keys on the scrubbed form (codex MEDIUM:
+  // ddbbafa added a prominent new top-line path for these labels). A name that scrubs to
+  // empty falls back to the short_id. clip/cell/clipToWidth downstream remain the width
+  // backstop; full 1-col sanitizeCaptured would over-strip legitimate non-ASCII names.
+  const safeName = (a: FleetAgent): string | null =>
+    a.window_name ? scrubBufferText(a.window_name, false).trim() || null : null;
   const nameCount = new Map<string, number>();
   for (const a of agents) {
-    if (a.window_name) nameCount.set(a.window_name, (nameCount.get(a.window_name) ?? 0) + 1);
+    const wn = safeName(a);
+    if (wn) nameCount.set(wn, (nameCount.get(wn) ?? 0) + 1);
   }
   const byShortId = new Map<string, string>();
   const bySession = new Map<string, string>();
   for (const a of agents) {
+    const wn = safeName(a);
     const l =
-      a.window_name && nameCount.get(a.window_name) === 1
-        ? a.window_name
-        : a.window_name
-          ? `${a.window_name}·${a.short_id.slice(0, 4)}`
+      wn && nameCount.get(wn) === 1
+        ? wn
+        : wn
+          ? `${wn}·${a.short_id.slice(0, 4)}`
           : a.short_id;
     byShortId.set(a.short_id, l);
     if (a.session_id) bySession.set(a.session_id, l);

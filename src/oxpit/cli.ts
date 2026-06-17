@@ -3,7 +3,7 @@
 
 import { buildSnapshot } from "./snapshot.js";
 import { captureFleetPanes, type PaneActivity } from "./activity.js";
-import { computeAgentLabels, fleetTrouble, renderCommsLog, renderSnapshot } from "./render.js";
+import { computeAgentLabels, fleetTrouble, renderCommsLog, renderSnapshot, type FleetTrouble } from "./render.js";
 import { buildCommsLog } from "./comms.js";
 import {
   NUDGE_TEXT,
@@ -127,6 +127,16 @@ function autoColor(): boolean {
 
 // `oxtail status` — print the fleet snapshot once and exit. Scriptable
 // (`watch -n1 oxtail status`), CI-friendly (`--json`), no TTY required.
+// The `status --check` exit code, derived from fleet trouble. ONLY hard, will-not-self-
+// resolve problems (live deadlock / orphaned wait / dead-owner stranded work) trip it.
+// Soft signals (possibly-stalled, stale cycles) AND the 🙋 awaiting-you worklist
+// deliberately do NOT: awaiting is the NORMAL state of an idle fleet, so folding it into
+// this sum would make the probe red whenever anyone is idle and kill its use as a health
+// gate. Pure + exported so this invariant is locked by a test (max review).
+export function checkExitCode(t: FleetTrouble): number {
+  return t.deadlocks + t.orphaned + t.stranded > 0 ? CHECK_TROUBLE_CODE : 0;
+}
+
 export function runStatus(
   argv: string[],
   out: (line: string) => void = (s) => process.stdout.write(s + "\n"),
@@ -142,13 +152,9 @@ export function runStatus(
     readActivity: !a.noActivity, // real-time tool sub-state badges (on by default)
   });
   const limit = a.limit && Number.isFinite(a.limit) && a.limit > 0 ? a.limit : DEFAULT_LOG_LIMIT;
-  // --check: a HARD fleet problem (live deadlock / orphaned wait / dead-owner
-  // stranded work) makes the one-shot a scriptable health probe. Soft signals
-  // (possibly-stalled, stale cycles) deliberately do NOT trip it (no false alarms).
-  const checkCode = (): number => {
-    const t = fleetTrouble(snap);
-    return t.deadlocks + t.orphaned + t.stranded > 0 ? CHECK_TROUBLE_CODE : 0;
-  };
+  // --check: a HARD fleet problem makes the one-shot a scriptable health probe (see
+  // checkExitCode for what does/doesn't count).
+  const checkCode = (): number => checkExitCode(fleetTrouble(snap));
   if (a.json) {
     // --log adds a `comms` array (full bodies) alongside the snapshot, so the
     // machine-readable form is a superset, not a separate shape.

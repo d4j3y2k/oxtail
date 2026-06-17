@@ -196,7 +196,7 @@ test("extractPaneActivity — hostile wide-Unicode/bidi line can't survive to wr
 test("sanitizeCaptured — drops wide/bidi, keeps ASCII + allowlisted glyphs", () => {
   assert.equal(sanitizeCaptured("abc你好def"), "abcdef");
   assert.equal(sanitizeCaptured("x‮y"), "xy");
-  assert.equal(sanitizeCaptured("✽ ok · done…"), "✽ ok done"); // narrow ✽ survives; ambiguous ·… dropped
+  assert.equal(sanitizeCaptured("ok ✽ · done…"), "ok done"); // ✽ U+273D (now removed, Ambiguous) + · + … all dropped
   const wide = sanitizeCaptured("ＦＵＬＬ width");
   assert.equal(displayWidth(wide), [...wide].length); // 1-col guarantee
 });

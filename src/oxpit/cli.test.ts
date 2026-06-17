@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { parseMessageArgs, parseStatusArgs, runMessage, runStatus } from "./cli.js";
+import { CHECK_TROUBLE_CODE, checkExitCode, parseMessageArgs, parseStatusArgs, runMessage, runStatus } from "./cli.js";
+import type { FleetTrouble } from "./render.js";
 
 async function withHome<T>(fn: () => Promise<T> | T): Promise<T> {
   const home = mkdtempSync(join(tmpdir(), "oxtail-climsg-"));
@@ -86,6 +87,22 @@ test("runStatus --check on a healthy/empty fleet exits 0 (probe-friendly default
     const code = runStatus(["--check", "--no-color"], (l) => lines.push(l));
     assert.equal(code, 0, "no trouble ⇒ exit 0 so scripts can branch on it");
   });
+});
+
+test("checkExitCode: the 🙋 awaiting worklist (and soft signals) NEVER trip --check (max)", () => {
+  // Locks the deliberate invariant: an all-idle fleet (everyone awaiting you) is NORMAL,
+  // not trouble — only hard, will-not-self-resolve problems make the probe exit non-zero.
+  // Guards against a future refactor silently folding awaiting into the checkExitCode sum.
+  const base: FleetTrouble = {
+    deadlocks: 0, staleCycles: 0, orphaned: 0, stranded: 0,
+    strandedOwners: 0, stalled: 0, awaiting: 0, active: 0,
+  };
+  assert.equal(checkExitCode({ ...base, awaiting: 5 }), 0, "all-idle (awaiting>0) stays exit 0");
+  assert.equal(checkExitCode({ ...base, stalled: 3 }), 0, "possibly-stalled is a soft hint, not a gate");
+  assert.equal(checkExitCode({ ...base, staleCycles: 2 }), 0, "stale cycles are soft, not a gate");
+  assert.equal(checkExitCode({ ...base, deadlocks: 1 }), CHECK_TROUBLE_CODE, "live deadlock IS hard trouble");
+  assert.equal(checkExitCode({ ...base, orphaned: 1 }), CHECK_TROUBLE_CODE, "orphaned wait IS hard trouble");
+  assert.equal(checkExitCode({ ...base, stranded: 1 }), CHECK_TROUBLE_CODE, "dead-owner stranded work IS hard trouble");
 });
 
 test("parseMessageArgs: positionals + flags", () => {

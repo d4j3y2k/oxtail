@@ -295,6 +295,39 @@ test("liveness: a tool_running past STALL_WINDOW_S reads HUNG ⇒ idle + possibl
   });
 });
 
+test("awaiting_human: a hung tool with NO purpose stays OFF the worklist (max F1 — no badge contradiction)", () => {
+  withHome((home) => {
+    // Same hung-tool shape, but NO declared purpose: possibly_stalled needs a purpose so
+    // it stays false and the row drops to idle/idle. Without the !tool_running guard it
+    // would read awaiting_human=true and show the in-flight tool badge `…` AND 🙋 at once.
+    const path = join(home, "tx-hung-nopurpose.jsonl");
+    writeFileSync(
+      path,
+      JSON.stringify({ message: { content: [{ type: "tool_use", name: "Bash", id: "toolu_x" }] } }) +
+        "\n",
+    );
+    const mtime = NOW_S - 700; // cold past STALL_WINDOW_S (600)
+    utimesSync(path, mtime, mtime);
+    const snap = buildSnapshot({
+      readEntries: () => [
+        makeEntry({ tmux_pane: "%1", client: { transcript_path: path } as never }), // no state/purpose
+      ],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      readActivity: true,
+      resolvePaneInfo: () =>
+        new Map([["%1", { name: "main", activity_at: NOW_S - 700, window_index: 0 }]]),
+    });
+    const a = snap.agents[0];
+    assert.equal(a.activity?.tool_running, true); // tool still in-flight
+    assert.equal(a.liveness, "idle");
+    assert.equal(a.possibly_stalled, false); // no purpose ⇒ the stall hint can't fire…
+    assert.equal(a.awaiting_human, false); // …so the F1 guard is what keeps it off the worklist
+  });
+});
+
 test("liveness: a dead pid never reads activity, even with a fresh pane + in-flight tool", () => {
   withHome((home) => {
     const path = join(home, "tx-dead-tool.jsonl");

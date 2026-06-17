@@ -93,10 +93,16 @@ export function scrubBufferText(s: string, keepNewline: boolean): string {
 // the cursor-home repaint (compile-sim HIGH). Dropping them from UNTRUSTED capture
 // keeps the words/digits that carry the meaning and makes the 1-column guarantee real
 // (a broad displayWidth change is unsafe — the composer's "─".repeat(width) rule
-// relies on box-drawing staying 1-col).
+// relies on box-drawing staying 1-col). Verified against EastAsianWidth-17: every
+// member below is EAW-Neutral. (✽ U+273D was REMOVED — it is the lone EAW-Ambiguous
+// dingbat in this visual family, so it could render 2-col on a CJK/ambiguous-wide
+// terminal and re-open the exact wrap-desync this allowlist exists to prevent; the
+// "provably 1-col" test passed it only because displayWidth itself undercounts
+// Ambiguous glyphs. Its sanitized-capture loss is nil — a spinner glyph is never part
+// of the extracted tail. codex review.)
 const CAPTURE_ALLOW = new Set([
   "✓", "✗", "❯", "∗", "✦", "✧",
-  "✶", "✷", "✸", "✹", "✺", "✻", "✼", "✽", "✾", "✿", "❀", "✱", "✲", "✳", "✴",
+  "✶", "✷", "✸", "✹", "✺", "✻", "✼", "✾", "✿", "❀", "✱", "✲", "✳", "✴",
 ]);
 
 // Sanitize UNTRUSTED captured terminal text (a tmux capture-pane line) for display.
