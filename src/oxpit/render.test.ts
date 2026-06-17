@@ -107,13 +107,20 @@ test("renderCommsLog: null sender is 'operator' ONLY when origin says so, else '
     color: false,
     nowSec: 1000,
   });
-  assert.match(op, /operator → codex/);
+  assert.match(op, /operator ⇒ codex/); // operator = one-way ⇒ directive arrow
   const anon = renderCommsLog([msg({ from_session_id: null })], COMMS_LABELS, {
     color: false,
     nowSec: 1000,
   });
-  assert.match(anon, /unknown → codex/);
-  assert.ok(!/operator → codex/.test(anon), "null-from non-operator must NOT be labeled operator");
+  assert.match(anon, /unknown → codex/); // a normal (two-way) message keeps →
+  assert.ok(!/operator/.test(anon), "null-from non-operator must NOT be labeled operator");
+});
+
+test("commsBodyLines: operator directives use ⇒, agent messages use →", () => {
+  const op = commsBodyLines([msg({ from_session_id: null, origin: "operator" })], COMMS_LABELS, { color: false });
+  const peer = commsBodyLines([msg({})], COMMS_LABELS, { color: false });
+  assert.ok(op[0].includes("⇒") && !op[0].includes("→"), "operator → one-way ⇒");
+  assert.ok(peer[0].includes("→") && !peer[0].includes("⇒"), "agent↔agent → two-way →");
 });
 
 test("commsBodyLines: full mode word-wraps the whole body across lines", () => {

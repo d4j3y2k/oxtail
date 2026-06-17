@@ -471,11 +471,17 @@ export function commsBodyLines(
     else if (m.reply_to) mark = "↩";
     else if (m.request_id) mark = "❓";
     const markStr = mark ? ` ${mark}` : "";
+    // Operator messages are ONE-WAY directives from the human cockpit (no agent
+    // identity, can't be replied to) — render them with a ⇒ arrow so they read as a
+    // directive-in, not a missing half of a two-way exchange (the recipient never
+    // sends back an "agent→operator").
+    const isOperator = m.from_session_id == null && m.origin === "operator";
+    const arrow = isOperator ? "⇒" : "→";
     // The cursor'd message (TUI nav) gets a › marker in place of the leading space +
     // a brightened (non-dim) head so the eye lands on the selected message.
     const isCursor = opts.cursorId != null && m.message_id === opts.cursorId;
-    const head = `${isCursor ? "›" : " "} ${cell(age, 4)} ${fromLabel(m)} → ${name(m.to_session_id)}${markStr}: `;
-    const headCodes: string[] = isCursor ? [C.cyan, C.bold] : [C.dim];
+    const head = `${isCursor ? "›" : " "} ${cell(age, 4)} ${fromLabel(m)} ${arrow} ${name(m.to_session_id)}${markStr}: `;
+    const headCodes: string[] = isCursor ? [C.cyan, C.bold] : isOperator ? [C.magenta] : [C.dim];
     // Message bodies are UNTRUSTED peer text — scrub the ESC/C0/C1/bidi injection
     // vector before render (clip/clipToWidth only handle whitespace + width).
     const safeBody = scrubBufferText(m.body, false);
