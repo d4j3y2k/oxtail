@@ -214,6 +214,13 @@ export type JumpDeps = {
   verifyPane?: (entry: RegistryEntry) => string | null;
 };
 
+// Single-quote a value for a PASTE-able shell command (the manual fallback strings).
+// Embedded single quotes are escaped the POSIX way ('\'' ) so an exotic session name
+// can't break out (codex — runtime tmux calls are argv-safe; this is paste safety).
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
 export function jumpToAgent(agent: FleetAgent, deps: JumpDeps = {}): JumpResult {
   const run = deps.run ?? realTmux;
   const inTmux = deps.inTmux ?? Boolean(process.env.TMUX);
@@ -250,7 +257,7 @@ export function jumpToAgent(agent: FleetAgent, deps: JumpDeps = {}): JumpResult 
   // OWN client (don't move the cockpit); in a bare terminal there is no own client.
   const clients = listClients(run);
   const self = inTmux ? selfClientName(run) : null;
-  const manual = `tmux attach -t '${loc.session}' \\; select-pane -t ${pane}`;
+  const manual = `tmux attach -t ${shellQuote(loc.session)} \\; select-pane -t ${pane}`;
   // No tmux client attached anywhere → nothing to move; hand over the attach command.
   if (clients.length === 0) {
     return {
@@ -258,6 +265,13 @@ export function jumpToAgent(agent: FleetAgent, deps: JumpDeps = {}): JumpResult 
       reason: "no tmux client attached to move (open the agents' session in a terminal first)",
       manual,
     };
+  }
+  // An explicit --client must actually be ATTACHED — validate BEFORE any mutation so a
+  // typo can't run select-pane/select-window before switch-client -c fails (codex).
+  // (An off-target but attached client is allowed — a deliberate "move that one" act.)
+  if (deps.client && !clients.some((c) => c.name === deps.client)) {
+    const names = clients.map((c) => c.name).join(", ");
+    return { ok: false, reason: `--client '${deps.client}' is not attached (attached: ${names || "none"})` };
   }
   // With ≥2 candidate clients the choice is a guess, so refuse rather than silently
   // switch an arbitrary human's terminal — disambiguate with --client.
@@ -294,7 +308,7 @@ export function jumpToAgent(agent: FleetAgent, deps: JumpDeps = {}): JumpResult 
     return {
       ok: false,
       reason: `tmux jump failed: ${e instanceof Error ? e.message : e}`,
-      manual: `tmux switch-client -t '${loc.session}' \\; select-pane -t ${pane}`,
+      manual: `tmux switch-client -t ${shellQuote(loc.session)} \\; select-pane -t ${pane}`,
     };
   }
   return { ok: true, pane, session: loc.session, window: loc.window, client: choice.client };

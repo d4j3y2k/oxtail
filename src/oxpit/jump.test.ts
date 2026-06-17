@@ -220,6 +220,36 @@ test("jumpToAgent: bare terminal with NO attached client yields a manual command
   }
 });
 
+test("jumpToAgent: an explicit --client that isn't attached refuses WITHOUT mutating (codex)", () => {
+  const { run, calls } = fakeRunner({
+    "list-panes": "%7\tproj\t@2\n",
+    "list-clients": "work\t/t1\tproj\n",
+    "display-message": "self",
+  });
+  const r = jumpToAgent(agent(), {
+    run,
+    inTmux: true,
+    client: "typo", // not in list-clients
+    resolveEntry: () => entry(),
+    verifyPane: () => "%7",
+  });
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.match(r.reason, /not attached/);
+  assert.ok(!calls.some((c) => c[0] === "select-pane" || c[0] === "switch-client"), "no mutation on typo");
+});
+
+test("jumpToAgent: manual fallback shell-escapes a session name with a quote (codex)", () => {
+  const { run } = fakeRunner({ "list-panes": "%7\tpr'oj\t@2\n" }); // session has a single quote
+  const r = jumpToAgent(agent(), {
+    run,
+    inTmux: false,
+    resolveEntry: () => entry(),
+    verifyPane: () => "%7",
+  });
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.match(r.manual!, /tmux attach -t 'pr'\\''oj'/); // POSIX-escaped
+});
+
 test("jumpToAgent: bare terminal (oxpit in a plain tab) drives the client on the target session", () => {
   const { run, calls } = fakeRunner({
     "list-panes": "%7\tproj\t@2\n",
