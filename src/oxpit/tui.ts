@@ -15,7 +15,7 @@ import { existsSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildSnapshot, type FleetAgent, type FleetSnapshot } from "./snapshot.js";
-import { attentionLine, commsBodyLines, computeAgentLabels, renderSnapshot } from "./render.js";
+import { ANIM_FRAMES, attentionLine, commsBodyLines, computeAgentLabels, renderSnapshot } from "./render.js";
 import { buildCommsLog, type CommsMessage } from "./comms.js";
 import { agentKey, capturePaneActivity, type AgentActivity, type PaneActivity } from "./activity.js";
 import { clipToWidth, scrubBufferText } from "./format.js";
@@ -125,13 +125,15 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     let composeNote = ""; // transient composer feedback (attach result)
     let pasting = false; // inside a bracketed-paste sequence
     let pasteBuf = ""; // accumulates paste content across data chunks
-    // SPIKE (item 1): focus-gated selected-name animation. Animate only while the
-    // cockpit is the FOCUSED terminal window (paused on blur) so a free-running
-    // repaint can't burn CPU when David's looking at another pane — the enabler that
-    // makes animation compatible with oxpit's idle-cheap ethos. Env kill-switch.
+    // SPIKE (item 1): per-agent BURST animation (David) — a row plays a short one-shot
+    // dot/glyph burst when you MOVE to it or when its STATUS (liveness) changes, NOT a
+    // continuous loop. The ~6fps timer runs ONLY while a burst is in flight AND the
+    // cockpit is focused, so it's idle-cheap (zero repaint at rest / on blur). Env
+    // kill-switch. bursts: agentKey → current frame; prevLiveness: change detector.
     const animEnabled = process.env.OXTAIL_OXPIT_ANIM !== "off";
     let focused = true; // assume focused until the terminal says otherwise
-    let animFrame = 0;
+    let bursts = new Map<string, number>();
+    let prevLiveness = new Map<string, FleetAgent["liveness"]>();
     let animTick: NodeJS.Timeout | null = null;
 
     const stdin = process.stdin;
@@ -214,19 +216,30 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         maxWaitRows: MAX_WAIT_ROWS,
         paneActivity,
         toolActivity: activityCache, // sticky overlay — never mutates the snapshot
-        animFrame: animEnabled ? animFrame : undefined, // animated selected-name frame
+        burstFrames: animEnabled ? bursts : undefined, // per-agent one-shot bursts
       });
     }
 
-    // SPIKE animation timer — runs ONLY while focused; advances the frame + repaints
-    // when the fleet (with a selection) is the visible view. Stopped on blur so it's
-    // genuinely zero-cost when the cockpit isn't being looked at.
-    function startAnim(): void {
-      if (!animEnabled || animTick || torndown) return;
+    // Start a one-shot burst on agent `key` (you moved to it, or its status changed).
+    // Resets to frame 0 if already bursting, then ensures the burst timer is running.
+    function startBurst(key: string): void {
+      if (!animEnabled) return;
+      bursts.set(key, 0);
+      ensureAnim();
+    }
+    // The burst timer runs ONLY while there's a burst in flight AND the cockpit is
+    // focused — at rest (no bursts) or on blur it's stopped, so the cockpit is
+    // genuinely zero-repaint when nothing's happening (idle-cheap).
+    function ensureAnim(): void {
+      if (!animEnabled || animTick || torndown || !focused || bursts.size === 0) return;
       animTick = setInterval(() => {
         if (torndown || !focused) return;
-        if (composing || helpOpen || mode === "log" || selectedIndex() < 0) return;
-        animFrame = (animFrame + 1) % 1_000_000;
+        for (const [key, frame] of [...bursts]) {
+          const next = frame + 1;
+          if (next >= ANIM_FRAMES) bursts.delete(key); // burst finished — back to static
+          else bursts.set(key, next);
+        }
+        if (bursts.size === 0) stopAnim();
         paint();
       }, ANIM_TICK_MS);
     }
@@ -239,7 +252,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     function setFocus(f: boolean): void {
       if (f === focused) return;
       focused = f;
-      if (f) startAnim();
+      if (f) ensureAnim();
       else stopAnim();
     }
 
@@ -519,6 +532,14 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (full) {
         activityCache = new Map(snapshot.agents.map((a) => [agentKey(a), a.activity]));
       }
+      // Burst any agent whose liveness CHANGED since the last build ("becomes awake",
+      // goes idle, dies). prevLiveness starts empty so the first build never bursts.
+      for (const a of snapshot.agents) {
+        const key = agentKey(a);
+        const prev = prevLiveness.get(key);
+        if (prev !== undefined && prev !== a.liveness) startBurst(key);
+      }
+      prevLiveness = new Map(snapshot.agents.map((a) => [agentKey(a), a.liveness]));
       reconcileSelection();
       paint();
     }
@@ -548,6 +569,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       logCursorFromEnd = 0;
       logExpanded = false;
       logBodyOffset = 0;
+      startBurst(selectedKey); // one burst on the agent you moved to (David)
       paint();
       maybeCaptureSelected(true); // capture the newly-selected pane immediately
     }
@@ -999,9 +1021,9 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     }, SLOW_TICK_MS);
 
     // First paint is read-only (instant startup, C7); the first slow tick ~1.5s
-    // later does the first selected-pane capture.
+    // later does the first selected-pane capture. Bursts start on events (move /
+    // status change), so there's no continuous animation timer running at rest.
     refresh(true);
-    startAnim(); // begin the focus-gated selected-name animation (no-op if disabled)
   });
 }
 

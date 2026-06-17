@@ -43,10 +43,10 @@ export type RenderOptions = {
   // supply a sticky last-known badge on fast ticks WITHOUT mutating the snapshot
   // (don't fork buildSnapshot's truth; max review).
   toolActivity?: Map<string, AgentActivity | null>;
-  // Animation frame counter (TUI only; undefined = static). When set, the SELECTED
-  // row's name is wrapped in an animated frame whose phase = animFrame: a gentle
-  // twinkle when idle, an energetic pulse when active. (backlog item 1 — a SPIKE.)
-  animFrame?: number;
+  // Per-agent BURST animation (TUI only), keyed by agentKey → the current frame index
+  // (0..ANIM_FRAMES-1) of a one-shot burst. A row plays a short burst when you move to
+  // it OR when its status changes (backlog item 1 — event-driven, not a loop).
+  burstFrames?: Map<string, number>;
 };
 
 type Paint = (s: string, ...codes: string[]) => string;
@@ -74,8 +74,11 @@ const FRAME_SEQ: [string, string][] = [
   ["⚙", "⚙"],
   ["◌", "◌"],
 ];
-function nameFrame(animFrame: number): [string, string] {
-  const i = ((animFrame % FRAME_SEQ.length) + FRAME_SEQ.length) % FRAME_SEQ.length;
+// Number of frames in one burst (the whole sequence plays once). Exported so the TUI
+// knows how long a burst lasts before it ends the agent's animation.
+export const ANIM_FRAMES = FRAME_SEQ.length;
+function nameFrame(frame: number): [string, string] {
+  const i = ((frame % FRAME_SEQ.length) + FRAME_SEQ.length) % FRAME_SEQ.length;
   return FRAME_SEQ[i];
 }
 
@@ -291,7 +294,7 @@ function renderAgentRow(
   labels: Map<string, string>,
   paneAct: PaneActivity | undefined,
   act: AgentActivity | null, // resolved tool sub-state (overlay-aware)
-  animFrame: number | undefined, // animated name frame for the selected row (TUI)
+  burstFrame: number | undefined, // this row's one-shot burst frame (TUI), else static
 ): string {
   const marker = i === selected ? paint("›", C.cyan, C.bold) : " ";
   const glyph = GLYPH[a.liveness];
@@ -301,13 +304,17 @@ function renderAgentRow(
   // of the row renders exactly as an unselected one. paint() drops the codes in
   // no-color mode, so the › marker alone carries the cue there.
   let id: string;
-  if (i === selected && animFrame !== undefined) {
-    // Animated frame around the name (replaces the static underline in the TUI).
-    const [lb, rb] = nameFrame(animFrame);
+  if (burstFrame !== undefined) {
+    // A one-shot BURST is playing on this row (you moved to it, or its status changed)
+    // — frame the name with the current burst glyph. On the selected row it keeps the
+    // chip; an un-selected burst is just a brief cyan flourish.
+    const [lb, rb] = nameFrame(burstFrame);
     const inner = clip(idText, ID_W - 2); // leave 2 cols for the bracket pair
     const framed = `${lb}${inner}${rb}`;
     const pad = " ".repeat(Math.max(0, ID_W - displayWidth(framed)));
-    id = paint(framed + pad, SELECT_BG, ...(a.is_self ? [C.bold] : []));
+    const codes =
+      i === selected ? [SELECT_BG, ...(a.is_self ? [C.bold] : [])] : [C.cyan, ...(a.is_self ? [C.bold] : [])];
+    id = paint(framed + pad, ...codes);
   } else if (i === selected) {
     const clipped = clip(idText, ID_W); // name only (no trailing pad) — underline this
     const pad = " ".repeat(Math.max(0, ID_W - clipped.length));
@@ -600,7 +607,7 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
     if (total <= cap) {
       for (let i = 0; i < total; i++) {
         const a = s.agents[i];
-        lines.push(renderAgentRow(a, i, paint, width, selected, rowLabel(a), labels, paneAct(a), resolveAct(a), opts.animFrame));
+        lines.push(renderAgentRow(a, i, paint, width, selected, rowLabel(a), labels, paneAct(a), resolveAct(a), opts.burstFrames?.get(agentKey(a))));
       }
     } else {
       // Window that always keeps the selected row visible (centered when possible).
@@ -610,7 +617,7 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
       if (start > 0) lines.push(paint(`  ⋯ ${start} more above`, C.dim));
       for (let i = start; i < end; i++) {
         const a = s.agents[i];
-        lines.push(renderAgentRow(a, i, paint, width, selected, rowLabel(a), labels, paneAct(a), resolveAct(a), opts.animFrame));
+        lines.push(renderAgentRow(a, i, paint, width, selected, rowLabel(a), labels, paneAct(a), resolveAct(a), opts.burstFrames?.get(agentKey(a))));
       }
       if (end < total) lines.push(paint(`  ⋯ ${total - end} more below`, C.dim));
     }
