@@ -221,9 +221,11 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     }
 
     // Start a one-shot burst on agent `key` (you moved to it, or its status changed).
-    // Resets to frame 0 if already bursting, then ensures the burst timer is running.
+    // EXCLUSIVE — only one row animates at a time: the new burst clears any other, so
+    // you never see two at once and the row you just left never lingers (David).
     function startBurst(key: string): void {
       if (!animEnabled) return;
+      bursts.clear();
       bursts.set(key, 0);
       ensureAnim();
     }
