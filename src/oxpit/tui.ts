@@ -36,6 +36,10 @@ const PASTE_ON = "\x1b[?2004h"; // enable bracketed paste (terminal wraps pastes
 const PASTE_OFF = "\x1b[?2004l";
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
+// Cap an in-flight bracketed paste: a terminal that emits PASTE_START but never
+// PASTE_END (mis-implemented / aborted paste) would otherwise grow pasteBuf without
+// bound AND swallow every key. Past this, we flush what we have and leave paste mode.
+const MAX_PASTE_BYTES = 1_000_000;
 const FOCUS_ON = "\x1b[?1004h"; // enable focus reporting (terminal sends \x1b[I / \x1b[O)
 const FOCUS_OFF = "\x1b[?1004l";
 const FOCUS_IN = "\x1b[I";
@@ -54,6 +58,66 @@ function clientFlag(argv: string[]): string | undefined {
     if (argv[i].startsWith("--client=")) return argv[i].slice("--client=".length);
   }
   return undefined;
+}
+
+export type PasteState = { pasting: boolean; pasteBuf: string };
+export type InputAction =
+  | { t: "key"; data: string } // dispatch to handleKey
+  | { t: "paste"; data: string } // dispatch to onPaste (literal compose insert)
+  | { t: "quit" }; // ⌃C while pasting → tear down
+
+// PURE bracketed-paste input FSM, extracted from onData so it is unit-testable (the
+// rest of the TUI is bound to process streams). Given the carry-over paste state and
+// one input chunk, returns the next state and the ordered actions to dispatch. A paste
+// may span chunks (state carries across calls); PASTE_START/PASTE_END toggle paste
+// mode; a ⌃C mid-paste yields a single quit (and stops — the only quit must stay live
+// even when a terminal never closes a paste); an over-cap unterminated paste flushes as
+// a paste and leaves paste mode rather than buffering without bound. handleKey/onPaste
+// have no effect on this state, so collecting actions then dispatching ≡ the old inline
+// loop.
+export function stepInput(
+  state: PasteState,
+  chunk: string,
+  maxPasteBytes: number = MAX_PASTE_BYTES,
+): { state: PasteState; actions: InputAction[] } {
+  let pasting = state.pasting;
+  let pasteBuf = state.pasteBuf;
+  const actions: InputAction[] = [];
+  let s = chunk;
+  while (s.length > 0) {
+    if (pasting) {
+      if (s.indexOf("\x03") !== -1) {
+        return { state: { pasting: false, pasteBuf: "" }, actions: [...actions, { t: "quit" }] };
+      }
+      const end = s.indexOf(PASTE_END);
+      if (end === -1) {
+        pasteBuf += s;
+        s = "";
+        if (pasteBuf.length > maxPasteBytes) {
+          actions.push({ t: "paste", data: pasteBuf });
+          pasting = false;
+          pasteBuf = "";
+        }
+      } else {
+        pasteBuf += s.slice(0, end);
+        s = s.slice(end + PASTE_END.length);
+        actions.push({ t: "paste", data: pasteBuf });
+        pasting = false;
+        pasteBuf = "";
+      }
+    } else {
+      const start = s.indexOf(PASTE_START);
+      if (start === -1) {
+        actions.push({ t: "key", data: s });
+        s = "";
+      } else {
+        if (start > 0) actions.push({ t: "key", data: s.slice(0, start) });
+        s = s.slice(start + PASTE_START.length);
+        pasting = true;
+      }
+    }
+  }
+  return { state: { pasting, pasteBuf }, actions };
 }
 
 export async function runOxpit(argv: string[]): Promise<number> {
@@ -163,7 +227,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       return "\n" + dim("  " + keys, opts.color) + msg;
     }
 
-    function helpFrame(width: number): string {
+    function helpFrame(width: number, rows: number): string {
       const b = (s: string) => (opts.color ? `\x1b[1m\x1b[36m${s}\x1b[0m` : s);
       const d = (s: string) => dim(s, opts.color);
       const L = [
@@ -187,7 +251,11 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "",
         d("  press ? to return"),
       ];
-      return L.map((l) => clipToWidth(l, width) + CLEAR_EOL).join("\n");
+      // Bound to terminal height: every other paint path windows to `rows`, and a
+      // short / split-pane terminal would otherwise overflow and scroll the
+      // alt-screen. Keep the cursor a spare row (rows-1); the tail is recoverable (?/r).
+      const fit = L.length > rows ? L.slice(0, Math.max(1, rows - 1)) : L;
+      return fit.map((l) => clipToWidth(l, width) + CLEAR_EOL).join("\n");
     }
 
     // Lines of fixed chrome around the agent table, so the table can be windowed to
@@ -443,11 +511,11 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     function paint(): void {
       if (torndown) return;
       const width = stdout.columns || 100;
+      const rows = stdout.rows || 24;
       if (helpOpen) {
-        stdout.write(HOME + helpFrame(width) + CLEAR_BELOW);
+        stdout.write(HOME + helpFrame(width, rows) + CLEAR_BELOW);
         return;
       }
-      const rows = stdout.rows || 24;
       if (composing) {
         // Compose field at the BOTTOM; fleet/log stays visible above. Size the top
         // region to the remaining rows and pad so the field is pinned to the foot.
@@ -815,6 +883,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       stdin.removeListener("data", onData);
       process.removeListener("SIGINT", onSignal);
       process.removeListener("SIGTERM", onSignal);
+      process.removeListener("SIGHUP", onSignal);
       process.removeListener("SIGWINCH", onResize);
       process.removeListener("uncaughtException", onFatal);
       process.removeListener("unhandledRejection", onFatal);
@@ -952,31 +1021,13 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     // content to onPaste (literal insert) and the rest to the key dispatch. A paste
     // may span multiple data chunks — pasting/pasteBuf carry the state across them.
     function onData(buf: Buffer | string): void {
-      let s = buf.toString();
-      while (s.length > 0) {
-        if (pasting) {
-          const end = s.indexOf(PASTE_END);
-          if (end === -1) {
-            pasteBuf += s;
-            s = "";
-          } else {
-            pasteBuf += s.slice(0, end);
-            s = s.slice(end + PASTE_END.length);
-            pasting = false;
-            onPaste(pasteBuf);
-            pasteBuf = "";
-          }
-        } else {
-          const start = s.indexOf(PASTE_START);
-          if (start === -1) {
-            handleKey(s);
-            s = "";
-          } else {
-            if (start > 0) handleKey(s.slice(0, start));
-            s = s.slice(start + PASTE_START.length);
-            pasting = true;
-          }
-        }
+      const { state, actions } = stepInput({ pasting, pasteBuf }, buf.toString());
+      pasting = state.pasting;
+      pasteBuf = state.pasteBuf;
+      for (const a of actions) {
+        if (a.t === "quit") return handleKey("\x03"); // teardown; abandon the rest
+        if (a.t === "key") handleKey(a.data);
+        else onPaste(a.data);
       }
     }
 
@@ -988,45 +1039,57 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       paint();
     }
 
-    // ── enter raw mode + alt screen + bracketed paste + focus reporting ───────
-    stdout.write(ALT_ON + CURSOR_HIDE + PASTE_ON + (animEnabled ? FOCUS_ON : ""));
+    // Everything from raw-mode entry through the FIRST paint runs inside this guard.
+    // A synchronous throw here (e.g. buildSnapshot hitting a deleted cwd, or a render
+    // edge in the first paint) would otherwise escape the Promise executor and REJECT
+    // the promise — which server.ts "handles" via .catch, so unhandledRejection (and
+    // thus onFatal) never fires and the terminal is left WEDGED in raw mode. Routing
+    // it through onFatal runs the full teardown (raw-mode off, paste/focus/cursor/alt
+    // restored) before the error propagates. teardown is idempotent (torndown guard).
     try {
-      stdin.setRawMode(true);
-    } catch {
-      // some environments can't; input just won't work, view still renders
-    }
-    stdin.resume();
-    stdin.on("data", onData);
-    process.on("SIGINT", onSignal);
-    process.on("SIGTERM", onSignal);
-    process.on("SIGWINCH", onResize);
-    process.on("uncaughtException", onFatal);
-    process.on("unhandledRejection", onFatal);
-
-    // ── watch ~/.oxtail subdirs (debounced) ──────────────────────────────────
-    const base = join(homedir(), ".oxtail");
-    for (const sub of WATCH_DIRS) {
-      const dir = join(base, sub);
-      if (!existsSync(dir)) continue;
+      // ── enter raw mode + alt screen + bracketed paste + focus reporting ─────
+      stdout.write(ALT_ON + CURSOR_HIDE + PASTE_ON + (animEnabled ? FOCUS_ON : ""));
       try {
-        watchers.push(watch(dir, { persistent: true }, () => scheduleRefresh()));
+        stdin.setRawMode(true);
       } catch {
-        // watch unsupported for this dir — slow tick still refreshes
+        // some environments can't; input just won't work, view still renders
       }
-    }
+      stdin.resume();
+      stdin.on("data", onData);
+      process.on("SIGINT", onSignal);
+      process.on("SIGTERM", onSignal);
+      process.on("SIGHUP", onSignal);
+      process.on("SIGWINCH", onResize);
+      process.on("uncaughtException", onFatal);
+      process.on("unhandledRejection", onFatal);
 
-    // ── slow fallback tick (ages mtime liveness; full proc_sig check; refreshes
-    // tool badges; change-detected selected-pane capture) ─────────────────────
-    slowTick = setInterval(() => {
-      if (torndown) return;
+      // ── watch ~/.oxtail subdirs (debounced) ────────────────────────────────
+      const base = join(homedir(), ".oxtail");
+      for (const sub of WATCH_DIRS) {
+        const dir = join(base, sub);
+        if (!existsSync(dir)) continue;
+        try {
+          watchers.push(watch(dir, { persistent: true }, () => scheduleRefresh()));
+        } catch {
+          // watch unsupported for this dir — slow tick still refreshes
+        }
+      }
+
+      // ── slow fallback tick (ages mtime liveness; full proc_sig check; refreshes
+      // tool badges; change-detected selected-pane capture) ───────────────────
+      slowTick = setInterval(() => {
+        if (torndown) return;
+        refresh(true);
+        maybeCaptureSelected(false);
+      }, SLOW_TICK_MS);
+
+      // First paint is read-only (instant startup, C7); the first slow tick ~1.5s
+      // later does the first selected-pane capture. Bursts start on events (move /
+      // status change), so there's no continuous animation timer running at rest.
       refresh(true);
-      maybeCaptureSelected(false);
-    }, SLOW_TICK_MS);
-
-    // First paint is read-only (instant startup, C7); the first slow tick ~1.5s
-    // later does the first selected-pane capture. Bursts start on events (move /
-    // status change), so there's no continuous animation timer running at rest.
-    refresh(true);
+    } catch (e) {
+      onFatal(e);
+    }
   });
 }
 

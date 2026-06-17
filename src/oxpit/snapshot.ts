@@ -19,6 +19,7 @@
 //     open-work(2) AND waiting→codex. One liveness value + N independent badges.
 
 import { readdirSync, readFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ClientType } from "../clients.js";
 import {
@@ -56,6 +57,22 @@ function envPosInt(name: string, def: number, env: NodeJS.ProcessEnv = process.e
 // that a finished agent reads idle within ~one window. Tunable; raw age is always
 // shown alongside so the glyph is never the only signal (no binary-🟢 overpromise).
 export const ACTIVE_WINDOW_S = envPosInt("OXTAIL_OXPIT_ACTIVE_S", 20);
+
+// Clock-skew tolerance. A transcript mtime or pane time slightly in the future
+// (sub-second jitter) is normal; beyond this it's real skew (NFS / container clock /
+// NTP step-back). See ageOrSkew — a future timestamp must read as UNKNOWN, not age 0,
+// or a long-stale agent would paint a false "active 🟢" (and suppress its ⚠stalled?).
+const SKEW_TOLERANCE_S = 2;
+
+// Seconds since `thenSec`, or null when `thenSec` is in the future beyond the skew
+// tolerance. null = "freshness unknown": liveness then falls through to the other
+// signals (it won't be classed active off a skewed timestamp), and the possibly-
+// stalled check (which requires a non-null age) is skipped.
+function ageOrSkew(nowSec: number, thenSec: number): number | null {
+  const deltaS = nowSec - thenSec;
+  if (deltaS < -SKEW_TOLERANCE_S) return null;
+  return Math.max(0, deltaS);
+}
 
 // Caption-staleness gap: if the purpose was set this many seconds BEFORE the last
 // transcript activity, the agent has done work since declaring it — gray the
@@ -424,13 +441,14 @@ function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
     if (live) procSig = live === e.proc_sig ? "ok" : "reused";
   }
 
-  // Transcript mtime = liveness authority #2 (live vs idle).
+  // Transcript mtime = liveness authority #2 (live vs idle). ageOrSkew returns null
+  // for a future-dated mtime (clock skew) so it can't masquerade as fresh ⇒ active.
   let transcriptAgeS: number | null = null;
   if (e.client.transcript_path) {
     try {
-      transcriptAgeS = Math.max(
-        0,
-        Math.floor((ctx.nowMs - statSync(e.client.transcript_path).mtimeMs) / 1000),
+      transcriptAgeS = ageOrSkew(
+        ctx.nowSec,
+        Math.floor(statSync(e.client.transcript_path).mtimeMs / 1000),
       );
     } catch {
       transcriptAgeS = null;
@@ -443,7 +461,7 @@ function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
   const paneInfo = e.tmux_pane ? ctx.paneInfo.get(e.tmux_pane) : undefined;
   const paneActAt = paneInfo?.activity_at ?? null;
   const paneActivityAgeS =
-    paneActAt != null && Number.isFinite(paneActAt) ? Math.max(0, ctx.nowSec - paneActAt) : null;
+    paneActAt != null && Number.isFinite(paneActAt) ? ageOrSkew(ctx.nowSec, paneActAt) : null;
 
   // Liveness + the real-time tool sub-state are decided together: transcript mtime
   // alone LAGS during a long thinking/tool turn (David watched a clearly-working
@@ -625,7 +643,21 @@ function compareByWindow(a: FleetAgent, b: FleetAgent): number {
 export function buildSnapshot(opts: BuildSnapshotOptions = {}): FleetSnapshot {
   const nowMs = opts.nowMs ?? Date.now();
   const nowSec = Math.floor(nowMs / 1000);
-  const cwd = opts.cwd ?? process.cwd();
+  // process.cwd() THROWS (ENOENT) when the working directory has been deleted out
+  // from under a long-lived cockpit — and this runs BEFORE the entries try/catch
+  // below, so an unguarded throw here used to crash the first paint and wedge the
+  // raw-mode terminal. Fall back to $HOME so the snapshot still builds (it'll just
+  // find no project-scoped agents).
+  let cwd: string;
+  if (opts.cwd != null) {
+    cwd = opts.cwd;
+  } else {
+    try {
+      cwd = process.cwd();
+    } catch {
+      cwd = homedir();
+    }
+  }
   const projectRoot = safeRealpath(opts.projectRoot ?? inferProjectRoot(cwd));
   // Self-identity: mirror claim_session's env preference order so an oxpit launched
   // inside a Claude OR Codex pane marks its own row. (In a standalone terminal —

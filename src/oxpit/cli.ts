@@ -31,7 +31,7 @@ export type StatusArgs = {
 const DEFAULT_LOG_LIMIT = 20;
 
 // `status --check` exit code when a hard fleet problem (live deadlock / orphaned
-// wait / work stranded on a dead owner) is present. status exits 0 when healthy and
+// wait / work or mail stranded on a dead owner) is present. status exits 0 when healthy and
 // 2 on trouble (it has no usage-error path — unknown flags are ignored); 2 is
 // distinct from a generic 1 so `watch`/CI can branch specifically on fleet trouble.
 export const CHECK_TROUBLE_CODE = 2;
@@ -43,7 +43,7 @@ status flags:
   --json [--pretty]   machine-readable snapshot (CI / scripting)
   --log [-n N]        append the cross-fleet comms-log (recent message tail)
   --check             exit ${CHECK_TROUBLE_CODE} on fleet trouble (live deadlock /
-                      orphaned wait / work stranded on a dead owner); else 0
+                      orphaned wait / work or mail stranded on a dead owner); else 0
   --no-activity       skip the real-time tool sub-state reads (cheaper)
   --color | --no-color
   --all               include agents from every project, not just this one
@@ -51,7 +51,7 @@ status flags:
   --project PATH      scope to a specific project root
   -h, --help          this help
 
-oxpit keys:  ↑/k ↓/j move · ⏎ jump · n nudge · m message · l comms-log · r refresh · ? help · ⌃C quit
+oxpit keys:  ↑/k ↓/j move · ⏎ jump · n nudge · m message · l comms-log · w thread · r refresh · ? help · ⌃C quit
 oxpit flags: --no-color, --all, --project PATH, --client NAME (which tmux
              client the jump drives when several are attached)`;
 
@@ -128,13 +128,13 @@ function autoColor(): boolean {
 // `oxtail status` — print the fleet snapshot once and exit. Scriptable
 // (`watch -n1 oxtail status`), CI-friendly (`--json`), no TTY required.
 // The `status --check` exit code, derived from fleet trouble. ONLY hard, will-not-self-
-// resolve problems (live deadlock / orphaned wait / dead-owner stranded work) trip it.
-// Soft signals (possibly-stalled, stale cycles) AND the 🙋 awaiting-you worklist
-// deliberately do NOT: awaiting is the NORMAL state of an idle fleet, so folding it into
-// this sum would make the probe red whenever anyone is idle and kill its use as a health
-// gate. Pure + exported so this invariant is locked by a test (max review).
+// resolve problems (live deadlock / orphaned wait / dead-owner stranded work / dead-owner
+// stranded mail) trip it. Soft signals (possibly-stalled, stale cycles) AND the 🙋
+// awaiting-you worklist deliberately do NOT: awaiting is the NORMAL state of an idle fleet,
+// so folding it into this sum would make the probe red whenever anyone is idle and kill its
+// use as a health gate. Pure + exported so this invariant is locked by a test (max review).
 export function checkExitCode(t: FleetTrouble): number {
-  return t.deadlocks + t.orphaned + t.stranded > 0 ? CHECK_TROUBLE_CODE : 0;
+  return t.deadlocks + t.orphaned + t.stranded + t.strandedMail > 0 ? CHECK_TROUBLE_CODE : 0;
 }
 
 export function runStatus(

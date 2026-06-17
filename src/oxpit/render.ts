@@ -230,6 +230,8 @@ export type FleetTrouble = {
   orphaned: number; // agents awaiting a reply from a target that is itself dead
   stranded: number; // open obligations whose OWNER is dead — will never be done
   strandedOwners: number; // how many dead agents hold that stranded work
+  strandedMail: number; // unread messages whose RECIPIENT is dead — may never be read
+  strandedMailOwners: number; // how many dead agents hold that undrained mail
   stalled: number; // possibly-stalled agents (soft hint, never an alarm)
   awaiting: number; // idle agents sitting at their prompt = "awaiting you" (worklist)
   active: number;
@@ -237,12 +239,20 @@ export type FleetTrouble = {
 
 export function fleetTrouble(s: FleetSnapshot): FleetTrouble {
   const strandedAgents = s.agents.filter((a) => a.liveness === "dead" && a.open_work > 0);
+  // A message undrained in a DEAD recipient's mailbox: the owner won't read it again,
+  // and (unless a live same-session sibling drains it) nothing will. Softer than a
+  // stranded obligation — session-keyed mail is recoverable if the session resumes —
+  // so it renders yellow, but it IS the "silent message loss" the cockpit exists to
+  // surface, so it still trips --check.
+  const strandedMailAgents = s.agents.filter((a) => a.liveness === "dead" && a.unread > 0);
   return {
     deadlocks: s.cycles.filter((c) => c.all_live).length,
     staleCycles: s.cycles.filter((c) => !c.all_live).length,
     orphaned: s.agents.filter((a) => a.waiting?.orphaned).length,
     stranded: strandedAgents.reduce((n, a) => n + a.open_work, 0),
     strandedOwners: strandedAgents.length,
+    strandedMail: strandedMailAgents.reduce((n, a) => n + a.unread, 0),
+    strandedMailOwners: strandedMailAgents.length,
     stalled: s.agents.filter((a) => a.possibly_stalled).length,
     awaiting: s.agents.filter((a) => a.awaiting_human).length,
     active: s.agents.filter((a) => a.liveness === "active").length,
@@ -271,6 +281,13 @@ export function attentionLine(s: FleetSnapshot, paint: Paint): string | null {
   if (t.stranded)
     segs.push(
       paint(`⚑ ${t.stranded} stranded (dead ${plural(t.strandedOwners, "owner")})`, C.red),
+    );
+  if (t.strandedMail)
+    segs.push(
+      paint(
+        `✉ ${t.strandedMail} stranded mail (dead ${plural(t.strandedMailOwners, "owner")})`,
+        C.yellow,
+      ),
     );
   if (t.staleCycles)
     segs.push(paint(`⚠ ${t.staleCycles} possible ${plural(t.staleCycles, "cycle")}`, C.yellow));

@@ -108,8 +108,10 @@ async function defaultFireWakeKeystrokes(
   clientType: ClientType,
   text: string = ASK_PEER_WAKE_TEXT,
 ): Promise<void> {
+  // timeout: a hung tmux server must not block the MCP request thread indefinitely.
   execFileSync("tmux", ["send-keys", "-t", target, "-l", text], {
     stdio: ["ignore", "pipe", "pipe"],
+    timeout: 2000,
   });
   if (clientType === "codex") {
     await new Promise<void>((resolve) => {
@@ -119,6 +121,7 @@ async function defaultFireWakeKeystrokes(
   }
   execFileSync("tmux", ["send-keys", "-t", target, "Enter"], {
     stdio: ["ignore", "pipe", "pipe"],
+    timeout: 2000,
   });
 }
 

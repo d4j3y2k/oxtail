@@ -95,7 +95,7 @@ test("checkExitCode: the 🙋 awaiting worklist (and soft signals) NEVER trip --
   // Guards against a future refactor silently folding awaiting into the checkExitCode sum.
   const base: FleetTrouble = {
     deadlocks: 0, staleCycles: 0, orphaned: 0, stranded: 0,
-    strandedOwners: 0, stalled: 0, awaiting: 0, active: 0,
+    strandedOwners: 0, strandedMail: 0, strandedMailOwners: 0, stalled: 0, awaiting: 0, active: 0,
   };
   assert.equal(checkExitCode({ ...base, awaiting: 5 }), 0, "all-idle (awaiting>0) stays exit 0");
   assert.equal(checkExitCode({ ...base, stalled: 3 }), 0, "possibly-stalled is a soft hint, not a gate");
@@ -103,6 +103,7 @@ test("checkExitCode: the 🙋 awaiting worklist (and soft signals) NEVER trip --
   assert.equal(checkExitCode({ ...base, deadlocks: 1 }), CHECK_TROUBLE_CODE, "live deadlock IS hard trouble");
   assert.equal(checkExitCode({ ...base, orphaned: 1 }), CHECK_TROUBLE_CODE, "orphaned wait IS hard trouble");
   assert.equal(checkExitCode({ ...base, stranded: 1 }), CHECK_TROUBLE_CODE, "dead-owner stranded work IS hard trouble");
+  assert.equal(checkExitCode({ ...base, strandedMail: 1 }), CHECK_TROUBLE_CODE, "dead-owner stranded mail IS hard trouble");
 });
 
 test("parseMessageArgs: positionals + flags", () => {

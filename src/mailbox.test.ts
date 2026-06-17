@@ -329,6 +329,26 @@ test("mailbox: operator-origin serialization — origin/operator_source, no from
   });
 });
 
+test("mailbox: a legacy 'body-is-3rd-field' extractor still recovers an operator body", () => {
+  // Empirical guard for the FIELD_ORDER_PREFIX promise: a pre-v0.19 installed hook
+  // pulls the body by anchoring on the fixed prefix `{"schema_version":1,"id":"…",
+  // "body":"`. The new origin/operator_source fields are appended AFTER body, so such
+  // an extractor must keep working on an operator line — if operator_source ever
+  // displaced body, a legacy hook would surface the wrong field. (mirrors mailbox.ts
+  // FIELD_ORDER_PREFIX; no quotes in the body so the simple legacy read suffices.)
+  withHome(() => {
+    const pid = 88890;
+    mailbox.enqueue(pid, "operator says hello", undefined, {
+      origin: "operator",
+      operator_source: "oxpit",
+    });
+    const line = readFileSync(mailbox.mailboxFilePath(pid), "utf8").split("\n")[0];
+    const m = line.match(/^\{"schema_version":1,"id":"[0-9a-f]{16}","body":"([^"]*)"/);
+    assert.ok(m, "legacy prefix-anchored body extraction matched the operator line");
+    assert.equal(m![1], "operator says hello", "the recovered field is the body, not operator_source");
+  });
+});
+
 // ────────────────────────────────────────────────────────────────────────────
 // drainMatchingSession (v0.6 — ask_peer reply pickup)
 // ────────────────────────────────────────────────────────────────────────────

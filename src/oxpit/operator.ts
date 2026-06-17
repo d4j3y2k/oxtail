@@ -29,7 +29,15 @@ export const NUDGE_TEXT =
 // to the mailbox and remains in the comms-log.
 const WAKE_PREVIEW_MAX = 240;
 export function operatorWakeText(body: string): string {
-  const oneLine = body.replace(/\s+/g, " ").trim();
+  // Strip C0 control bytes + DEL (ESC, BEL, BS, …) BEFORE collapsing whitespace: this
+  // text is typed verbatim into the target pane via tmux send-keys, so a raw ESC
+  // sequence in an operator's body would otherwise reach the terminal. \t\n\r are left
+  // for the \s collapse below (they become a single space — a word break, not a
+  // control). operator == human, so this is defense-in-depth, not a privilege boundary.
+  const oneLine = body
+    .replace(/[\x00-\x08\x0e-\x1f\x7f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
   const preview = oneLine.length > WAKE_PREVIEW_MAX ? oneLine.slice(0, WAKE_PREVIEW_MAX) + "…" : oneLine;
   return `oxpit msg: ${preview}`;
 }

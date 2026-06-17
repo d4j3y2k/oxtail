@@ -491,6 +491,28 @@ test("fleetTrouble: counts deadlocks/orphaned/stranded, ignores live open_work",
   assert.equal(t.stalled, 1);
 });
 
+test("fleetTrouble: counts dead-owner unread as strandedMail, ignores live unread", () => {
+  const t = fleetTrouble(
+    snap([
+      // live unread is NORMAL (the agent will drain it) — must NOT count as stranded.
+      agent({ short_id: "a", session_id: "a", liveness: "active", unread: 5 }),
+      // two dead agents holding undrained mail = the silent-loss case the cockpit surfaces.
+      agent({ short_id: "d", session_id: "d", liveness: "dead", unread: 1 }),
+      agent({ short_id: "e", session_id: "e", liveness: "dead", unread: 3 }),
+    ]),
+  );
+  assert.equal(t.strandedMail, 4, "sums unread across dead owners only");
+  assert.equal(t.strandedMailOwners, 2);
+});
+
+test("attentionLine: dead-owner unread mail surfaces as a (yellow) stranded-mail segment", () => {
+  const line = attentionLine(
+    snap([agent({ short_id: "d", session_id: "d", liveness: "dead", unread: 2 })]),
+    ID,
+  );
+  assert.ok(line && /✉ 2 stranded mail \(dead owner\)/.test(line), `got: ${line}`);
+});
+
 test("render: selection highlights only the agent column (soft bg), color on", () => {
   const out = renderSnapshot(
     snap([agent({ short_id: "aaaa", session_id: "a" }), agent({ short_id: "bbbb", session_id: "b" })]),

@@ -18,7 +18,7 @@ import { execFileSync } from "node:child_process";
 import {
   chooseVerifiedWakePane,
   isValidTmuxPane,
-  readAll,
+  readAllPassive,
   type RegistryEntry,
 } from "../registry.js";
 import type { FleetAgent } from "./snapshot.js";
@@ -41,6 +41,10 @@ export function realTmux(args: string[]): string {
   return execFileSync("tmux", args, {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
+    // Bound the call: a hung/zombied tmux server must not stall the single-threaded
+    // TUI loop indefinitely. 2s is generous for local pane queries; on timeout
+    // execFileSync throws and the caller degrades to its error/manual path.
+    timeout: 2000,
   });
 }
 
@@ -189,7 +193,11 @@ export function chooseClient(
 // the SAME fresh entry jump does (a recycled pane id must never be captured blind).
 export function freshEntry(
   agent: { session_id: string | null; server_pid: number },
-  read: () => RegistryEntry[] = readAll,
+  // Default to the PASSIVE (non-reaping) reader: freshEntry runs on the jump path,
+  // and a VIEW jumping to an agent must never reap dead registry entries as a side
+  // effect — doing so would make ⚫dead rows and orphaned-wait alarms vanish from the
+  // cockpit right after you jump. Mutation stays in the writer paths (register/readAll).
+  read: () => RegistryEntry[] = readAllPassive,
 ): RegistryEntry | null {
   let entries: RegistryEntry[];
   try {
