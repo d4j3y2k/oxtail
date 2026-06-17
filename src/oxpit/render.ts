@@ -481,7 +481,11 @@ export function commsBodyLines(
     // a brightened (non-dim) head so the eye lands on the selected message.
     const isCursor = opts.cursorId != null && m.message_id === opts.cursorId;
     const head = `${isCursor ? "›" : " "} ${cell(age, 4)} ${fromLabel(m)} ${arrow} ${name(m.to_session_id)}${markStr}: `;
-    const headCodes: string[] = isCursor ? [C.cyan, C.bold] : isOperator ? [C.magenta] : [C.dim];
+    // The agent↔agent traffic is the interesting part, so operator directives are
+    // SHADED (grey head + grey preview) to recede — the peer messages stay full
+    // brightness and stand out. The cursor'd message always brightens (you're reading
+    // it). (head dim / body full = the default peer look.)
+    const headCodes: string[] = isCursor ? [C.cyan, C.bold] : isOperator ? [C.gray] : [C.dim];
     // Message bodies are UNTRUSTED peer text — scrub the ESC/C0/C1/bidi injection
     // vector before render (clip/clipToWidth only handle whitespace + width).
     const safeBody = scrubBufferText(m.body, false);
@@ -492,7 +496,10 @@ export function commsBodyLines(
     } else {
       const remaining = width - head.length - 1;
       const snippet = remaining >= 8 ? clip(safeBody, remaining) : "";
-      out.push(clipToWidth(paint(head, ...headCodes) + snippet, width));
+      // Shade the operator preview too (so the whole directive line recedes); a peer
+      // body stays default-bright; the cursor'd row reads as selected.
+      const snip = isOperator && !isCursor ? paint(snippet, C.gray) : snippet;
+      out.push(clipToWidth(paint(head, ...headCodes) + snip, width));
     }
   }
   return out;
