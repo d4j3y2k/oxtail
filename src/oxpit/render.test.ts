@@ -38,6 +38,7 @@ function agent(partial: Partial<FleetAgent>): FleetAgent {
     waiting: null,
     tmux_pane: "%1",
     tmux_session: "proj",
+    window_index: 0,
     ...partial,
   };
 }

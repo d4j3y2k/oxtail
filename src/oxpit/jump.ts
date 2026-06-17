@@ -70,6 +70,9 @@ export type PaneInfo = {
   // into the liveness enum. Prefers pane_activity (pane-scoped); falls back to
   // window_activity (window-scoped) on tmux builds that don't populate the former.
   activity_at: number | null;
+  // tmux window index — the fleet list is ordered by it so the rows stay put (match
+  // the agent's window order in tmux) instead of re-sorting as states change.
+  window_index: number | null;
 };
 
 function toEpochSeconds(s: string | undefined): number | null {
@@ -90,7 +93,7 @@ export function panePresence(run: TmuxRunner = realTmux): Map<string, PaneInfo> 
       "list-panes",
       "-a",
       "-F",
-      "#{pane_id}\t#{window_name}\t#{pane_activity}\t#{window_activity}",
+      "#{pane_id}\t#{window_name}\t#{pane_activity}\t#{window_activity}\t#{window_index}",
     ]);
   } catch {
     return new Map();
@@ -98,11 +101,13 @@ export function panePresence(run: TmuxRunner = realTmux): Map<string, PaneInfo> 
   const m = new Map<string, PaneInfo>();
   for (const line of out.split("\n")) {
     if (!line) continue;
-    const [pane, name, paneAct, winAct] = line.split("\t");
+    const [pane, name, paneAct, winAct, winIdx] = line.split("\t");
     if (!pane) continue;
+    const wi = winIdx != null && winIdx !== "" ? Number(winIdx) : NaN;
     m.set(pane, {
       name: name || null,
       activity_at: toEpochSeconds(paneAct) ?? toEpochSeconds(winAct),
+      window_index: Number.isFinite(wi) ? wi : null,
     });
   }
   return m;

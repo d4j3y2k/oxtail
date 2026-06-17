@@ -373,31 +373,34 @@ test("wait-graph: an ask with no observed reply still shows as waiting", () => {
   });
 });
 
-test("sort: a troubled (waiting) agent floats above a higher-work healthy one in-band", () => {
+test("sort: fleet follows tmux WINDOW ORDER (fixed), not state/trouble/work", () => {
   withHome(() => {
-    const A = "aaaaaaaa-0000-0000-0000-000000000001"; // healthy, MORE raw work
-    const B = "bbbbbbbb-0000-0000-0000-000000000002"; // waiting (trouble), LESS work
+    const A = "aaaaaaaa-0000-0000-0000-000000000001"; // window 1, MORE raw work
+    const B = "bbbbbbbb-0000-0000-0000-000000000002"; // window 5, waiting (trouble)
     recordReceived(A, mailbox.buildMessage("do1", "boss", { action_required: true }));
     recordReceived(A, mailbox.buildMessage("do2", "boss", { action_required: true }));
     recordPendingAsk(defaultPendingAskDir(), B, "req-sort", NOW_MS);
     const snap = buildSnapshot({
       readEntries: () => [
-        makeEntry({ client: { session_id: A, transcript_path: null } as never }),
-        makeEntry({ client: { session_id: B, transcript_path: null } as never }),
+        makeEntry({ tmux_pane: "%2", client: { session_id: A, transcript_path: null } as never }),
+        makeEntry({ tmux_pane: "%5", client: { session_id: B, transcript_path: null } as never }),
       ],
       allProjects: true,
       nowMs: NOW_MS,
       checkProcSig: false,
       selfSessionId: null,
-      resolvePaneInfo: () => new Map(),
+      // A is tmux window 1, B is window 5 — row order follows the window index, NOT
+      // B's trouble nor A's higher work-count (David: keep the list fixed).
+      resolvePaneInfo: () =>
+        new Map([
+          ["%2", { name: null, activity_at: null, window_index: 1 }],
+          ["%5", { name: null, activity_at: null, window_index: 5 }],
+        ]),
     });
     assert.equal(snap.agents.length, 2);
-    // Both idle. A has 2 open obligations (more raw work); B is merely waiting. The
-    // trouble weight must still float B to the top of the band — trouble outranks
-    // raw work-count (max's pin-troubled-to-top).
-    assert.equal(snap.agents[0].session_id, B, "troubled agent pinned to top of its band");
-    assert.ok(snap.agents[0].waiting);
-    assert.equal(snap.agents[1].open_work, 2);
+    assert.equal(snap.agents[0].session_id, A, "lower window index first (state-independent)");
+    assert.equal(snap.agents[1].session_id, B, "higher window index second, despite its trouble");
+    assert.equal(snap.agents[0].window_index, 1);
   });
 });
 

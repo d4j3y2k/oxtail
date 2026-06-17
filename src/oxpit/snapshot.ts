@@ -157,6 +157,9 @@ export type FleetAgent = {
   // these alone — pane ids are recycled when a pane dies).
   tmux_pane: string | null;
   tmux_session: string | null;
+  // tmux window index — the fleet is ordered by (session, window_index) so the rows
+  // stay fixed in the agent's tmux window order instead of re-sorting on state.
+  window_index: number | null;
 };
 
 export type WaitCycle = {
@@ -536,38 +539,25 @@ function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
     waiting,
     tmux_pane: e.tmux_pane,
     tmux_session: e.tmux_session,
+    window_index: paneInfo?.window_index ?? null,
   };
 }
 
-const LIVENESS_ORDER: Record<Liveness, number> = { active: 0, idle: 1, dead: 2 };
-
-// Trouble weight so the operator's eye lands on agents that need attention (max's
-// pin-troubled-to-top). Floats trouble to the TOP OF ITS LIVENESS BAND — liveness
-// stays primary (active before idle before dead), so this never hoists a dead row
-// above the living; it just orders within a band. Mirrors the attention-line
-// severity: live deadlock / orphaned wait highest, then dead-owner stranded work,
-// then a plain wait, then a soft stall hint.
-function troubleScore(a: FleetAgent): number {
-  let s = 0;
-  if (a.waiting?.in_cycle && a.waiting.cycle_all_live) s += 4; // live deadlock
-  if (a.waiting?.orphaned) s += 4; // wait on a dead target
-  if (a.liveness === "dead" && a.open_work > 0) s += 3; // stranded obligations
-  else if (a.waiting) s += 1; // plain awaiting-reply
-  if (a.possibly_stalled) s += 1; // soft hint
-  return s;
-}
-
-// Sort: liveness (active first), then trouble (so attention-needing agents top their
-// band), then more outstanding work first (open+unread+waiting), then short_id for
-// stability. Self is NOT special-cased in ordering — the renderer marks it.
-function compareAgents(a: FleetAgent, b: FleetAgent): number {
-  const lv = LIVENESS_ORDER[a.liveness] - LIVENESS_ORDER[b.liveness];
-  if (lv !== 0) return lv;
-  const tr = troubleScore(b) - troubleScore(a);
-  if (tr !== 0) return tr;
-  const workA = a.open_work + a.unread + (a.waiting ? 1 : 0);
-  const workB = b.open_work + b.unread + (b.waiting ? 1 : 0);
-  if (workA !== workB) return workB - workA;
+// Sort by tmux WINDOW ORDER so the fleet list stays FIXED — the rows match the
+// agent's window order in tmux (e.g. main, codex, max) and don't re-shuffle as
+// liveness/work change (David). Agents with a tmux window come first, ordered by
+// (session, window_index); pane-less agents fall to the end. short_id is the final
+// tiebreak (two agents sharing a window, or no window info). Trouble is still
+// surfaced — by the attention line, glyphs, and badges — just not by reordering.
+function compareByWindow(a: FleetAgent, b: FleetAgent): number {
+  const aHas = a.window_index != null;
+  const bHas = b.window_index != null;
+  if (aHas !== bHas) return aHas ? -1 : 1; // windowed agents before pane-less ones
+  if (aHas && bHas) {
+    const s = (a.tmux_session ?? "").localeCompare(b.tmux_session ?? "");
+    if (s !== 0) return s;
+    if (a.window_index !== b.window_index) return a.window_index! - b.window_index!;
+  }
   return a.short_id.localeCompare(b.short_id);
 }
 
@@ -671,7 +661,7 @@ export function buildSnapshot(opts: BuildSnapshotOptions = {}): FleetSnapshot {
   }
   const cycles = detectWaitCycles(agents);
 
-  agents.sort(compareAgents);
+  agents.sort(compareByWindow);
 
   return {
     schema_version: 1,
