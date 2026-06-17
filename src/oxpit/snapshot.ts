@@ -125,10 +125,11 @@ export type FleetAgent = {
   liveness_reason: LivenessReason;
   transcript_age_s: number | null; // null = no transcript file resolved/found
   proc_sig: "ok" | "reused" | "unknown";
-  // Seconds since the agent's tmux pane last produced OUTPUT (pty activity). An
-  // ORTHOGONAL signal to liveness — never folded into the enum (a status overlay /
-  // spinner repaint bumps it) — surfaced as a "·✽Ns" hint so a cold transcript that
-  // is still repainting reads as thinking-before-output. null = no pane / no tmux.
+  // Seconds since the agent's tmux pane last produced OUTPUT (pty activity). FOLDS
+  // INTO liveness: a fresh repaint within the active window ⇒ active/pane_fresh (a
+  // long thinking turn keeps the pane spinning while the transcript mtime lags). The
+  // raw age is always shown behind the glyph ("active ✽Ns") so it's never a binary-
+  // 🟢 overpromise. null = no pane / no tmux.
   pane_activity_age_s: number | null;
   // The raw ABSOLUTE pty-activity epoch (unix seconds) behind that age. Carried so
   // the TUI's capture change-detector compares stable epochs instead of round-tripping
@@ -470,9 +471,18 @@ function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
       // separates them cleanly. Pane output ≠ proof, so the raw age stays visible.)
       liveness = "active";
       reason = "pane_fresh";
-    } else if (activity?.tool_running) {
+    } else if (
+      activity?.tool_running &&
+      transcriptAgeS !== null &&
+      transcriptAgeS <= STALL_WINDOW_S
+    ) {
       // A tool is in-flight while transcript & pane are both quiet (a silent long
-      // call — sleeping bash, slow fetch) — still actively working, not idle.
+      // call — sleeping bash, slow fetch) — still actively working, not idle. BOUNDED
+      // by STALL_WINDOW_S (max review): an unbounded tool_running would read active
+      // FOREVER for a hung/wedged tool (tx + pane cold, pid alive) and suppress the
+      // idle-gated possibly_stalled signal indefinitely. The bound is deliberately
+      // the SAME threshold as possibly_stalled, so a tool that's been cold past the
+      // window hands off gaplessly: active(tool_running) → idle → possibly_stalled.
       liveness = "active";
       reason = "tool_running";
     } else if (transcriptAgeS === null) {

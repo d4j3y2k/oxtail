@@ -524,16 +524,15 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     }
 
     function refresh(full: boolean): void {
-      // readActivity rides the same `full` flag as checkProcSig: ON for the slow
-      // tick / forced refresh, OFF for the 200ms fast fs-debounce. On a full build we
-      // refresh the sticky tool-badge cache from the fresh reads. Fast builds do NOT
-      // recompute it and do NOT mutate the snapshot — the cache is handed to the
-      // renderer as an overlay (toolActivity) so badges persist between slow ticks
-      // without forking buildSnapshot's truth (max review).
-      snapshot = buildSnapshot({ ...opts.buildOpts, checkProcSig: full, readActivity: full });
-      if (full) {
-        activityCache = new Map(snapshot.agents.map((a) => [agentKey(a), a.activity]));
-      }
+      // checkProcSig rides the `full` flag (the `ps` spawn is the costly bit — slow
+      // tick / forced refresh only). readActivity is ALWAYS on: tool_running now FEEDS
+      // LIVENESS (active/tool_running), and gating it to slow ticks made a silent-tool
+      // row flap 🟢↔🟡 between ticks (max+codex review). scanLatestTool is 512KB-
+      // bounded and stops at the first tool_use, so a per-tick read is cheap. The
+      // sticky activityCache still backs the renderer's toolActivity overlay (a torn/
+      // degraded read blips the badge off for one tick instead of forking truth).
+      snapshot = buildSnapshot({ ...opts.buildOpts, checkProcSig: full, readActivity: true });
+      activityCache = new Map(snapshot.agents.map((a) => [agentKey(a), a.activity]));
       // Burst any agent whose liveness CHANGED since the last build ("becomes awake",
       // goes idle, dies). prevLiveness starts empty so the first build never bursts.
       for (const a of snapshot.agents) {

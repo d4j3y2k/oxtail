@@ -64,11 +64,14 @@ export function listPanes(run: TmuxRunner): PaneRow[] {
 
 export type PaneInfo = {
   name: string | null; // tmux window name (human label), null when unnamed
-  // Last pty-output time (epoch seconds). This is OUTPUT activity, NOT agent
-  // liveness — a status overlay / spinner repaint bumps it — so the cockpit
-  // surfaces it ONLY as an orthogonal "pane repainted Ns ago" hint, never folded
-  // into the liveness enum. Prefers pane_activity (pane-scoped); falls back to
-  // window_activity (window-scoped) on tmux builds that don't populate the former.
+  // Last pty-output time (epoch seconds). The cockpit FOLDS this into liveness as
+  // pane_fresh (a fresh repaint within the active window ⇒ active) — a spinner
+  // repaint during a long turn is exactly the "working" signal the transcript mtime
+  // misses; the raw age is always shown so it's not an overpromise. Prefers
+  // pane_activity (pane-scoped); falls back to window_activity (window-scoped) when
+  // the former is empty — which is the COMMON case (tmux 3.5a returns "" for
+  // #{pane_activity}), so in practice this is window-scoped. Fine for one-pane-per-
+  // window fleets; a multi-pane window would bump all its panes together.
   activity_at: number | null;
   // tmux window index — the fleet list is ordered by it so the rows stay put (match
   // the agent's window order in tmux) instead of re-sorting as states change.

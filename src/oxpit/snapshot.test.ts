@@ -191,6 +191,107 @@ test("liveness: stale transcript + stale pane but a tool in-flight ⇒ active/to
   });
 });
 
+test("liveness: Codex shape — newer running call wins over an interleaved completed one ⇒ active", () => {
+  withHome((home) => {
+    // Out-of-order: an OLDER shell call completed, a NEWER update_plan is in-flight.
+    // scanLatestTool is call_id-based (not adjacency), so the reverse scan stops at
+    // the latest function_call (B) and reports it running — the completed A is moot.
+    const path = join(home, "tx-codex-run.jsonl");
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ type: "response_item", payload: { type: "function_call", name: "shell", call_id: "A" } }),
+        JSON.stringify({ type: "response_item", payload: { type: "function_call_output", call_id: "A" } }),
+        JSON.stringify({ type: "response_item", payload: { type: "function_call", name: "update_plan", call_id: "B" } }),
+      ].join("\n") + "\n",
+    );
+    const mtime = NOW_S - 300;
+    utimesSync(path, mtime, mtime);
+    const snap = buildSnapshot({
+      readEntries: () => [
+        makeEntry({ type: "codex", tmux_pane: "%1", client: { transcript_path: path } as never }),
+      ],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      readActivity: true,
+      resolvePaneInfo: () =>
+        new Map([["%1", { name: "max", activity_at: NOW_S - 300, window_index: 0 }]]),
+    });
+    const a = snap.agents[0];
+    assert.equal(a.activity?.tool_running, true);
+    assert.equal(a.liveness, "active");
+    assert.equal(a.liveness_reason, "tool_running");
+  });
+});
+
+test("liveness: Codex shape — a COMPLETED latest call does NOT false-active ⇒ stays idle", () => {
+  withHome((home) => {
+    const path = join(home, "tx-codex-done.jsonl");
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ type: "response_item", payload: { type: "function_call", name: "shell", call_id: "A" } }),
+        JSON.stringify({ type: "response_item", payload: { type: "function_call_output", call_id: "A" } }),
+      ].join("\n") + "\n",
+    );
+    const mtime = NOW_S - 300;
+    utimesSync(path, mtime, mtime);
+    const snap = buildSnapshot({
+      readEntries: () => [
+        makeEntry({ type: "codex", tmux_pane: "%1", client: { transcript_path: path } as never }),
+      ],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      readActivity: true,
+      resolvePaneInfo: () =>
+        new Map([["%1", { name: "max", activity_at: NOW_S - 300, window_index: 0 }]]),
+    });
+    const a = snap.agents[0];
+    assert.equal(a.activity?.tool_running, false); // call A has its output ⇒ not running
+    assert.equal(a.liveness, "idle"); // stale tx + stale pane + no running tool
+  });
+});
+
+test("liveness: a tool_running past STALL_WINDOW_S reads HUNG ⇒ idle + possibly_stalled (max gate)", () => {
+  withHome((home) => {
+    // The tool is still in-flight, but tx AND pane have been cold past the stall
+    // window — an unbounded tool_running would pin this active forever and suppress
+    // possibly_stalled. The age-bound hands off: active(tool_running) → idle → stalled.
+    const path = join(home, "tx-hung-tool.jsonl");
+    writeFileSync(
+      path,
+      JSON.stringify({ message: { content: [{ type: "tool_use", name: "Bash", id: "toolu_h" }] } }) +
+        "\n",
+    );
+    const mtime = NOW_S - 700; // cold 700s > STALL_WINDOW_S (600)
+    utimesSync(path, mtime, mtime);
+    const snap = buildSnapshot({
+      readEntries: () => [
+        makeEntry({
+          tmux_pane: "%1",
+          client: { transcript_path: path } as never,
+          state: { purpose: "running the build", updated_at: NOW_S - 695 },
+        }),
+      ],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      readActivity: true,
+      resolvePaneInfo: () =>
+        new Map([["%1", { name: "main", activity_at: NOW_S - 700, window_index: 0 }]]),
+    });
+    const a = snap.agents[0];
+    assert.equal(a.activity?.tool_running, true); // the tool IS still in-flight…
+    assert.equal(a.liveness, "idle"); // …but past the window it reads hung, not active
+    assert.equal(a.possibly_stalled, true); // and the idle-gated stall hint is freed
+  });
+});
+
 test("liveness: a dead pid never reads activity, even with a fresh pane + in-flight tool", () => {
   withHome((home) => {
     const path = join(home, "tx-dead-tool.jsonl");
