@@ -412,7 +412,9 @@ test("render: selection highlights only the agent column (soft bg), color on", (
   const rows = out.split("\n").filter((l) => l.includes("\x1b[48;5;238m"));
   assert.equal(rows.length, 1, "exactly one row carries the agent-column bg chip");
   assert.match(rows[0], /›/, "selected row carries the › marker");
-  assert.ok(rows[0].includes("\x1b[4m"), "selected agent name is underlined");
+  assert.ok(!rows[0].includes("\x1b[4m"), "selected agent name is NOT underlined (David)");
+  // the name is indented one space inside the chip (space-width indent, no jitter)
+  assert.match(rows[0], /\x1b\[48;5;238m \w/, "name sits indented one space in the chip");
   // it must NOT be a full-row reverse bar — the harsh look we backed out of
   assert.ok(!out.includes("\x1b[7m"), "no full-row reverse-video");
 });

@@ -299,27 +299,24 @@ function renderAgentRow(
   const marker = i === selected ? paint("›", C.cyan, C.bold) : " ";
   const glyph = GLYPH[a.liveness];
   const idText = label + (a.is_self ? "*" : "");
-  // Selection emphasis is confined to the AGENT column (David): a soft gray bg chip
-  // across the padded name cell, with the NAME underlined for a touch more. The rest
-  // of the row renders exactly as an unselected one. paint() drops the codes in
-  // no-color mode, so the › marker alone carries the cue there.
+  // Selection emphasis is confined to the AGENT column (David): a soft gray bg chip +
+  // a one-space indent on each side of the name (no underline). The rest of the row
+  // renders exactly as an unselected one. paint() drops the codes in no-color mode, so
+  // the › marker alone carries the cue there.
   let id: string;
-  if (burstFrame !== undefined) {
-    // A one-shot BURST is playing on this row (you moved to it, or its status changed)
-    // — frame the name with the current burst glyph. On the selected row it keeps the
-    // chip; an un-selected burst is just a brief cyan flourish.
-    const [lb, rb] = nameFrame(burstFrame);
-    const inner = clip(idText, ID_W - 2); // leave 2 cols for the bracket pair
+  if (burstFrame !== undefined || i === selected) {
+    // Selected OR mid-burst: the name sits in a FRAMED cell. The frame glyph cycles
+    // while a burst is playing; otherwise it's a SPACE on each side — the "space-width
+    // indent" that holds the name in the SAME spot whether or not it's bursting (no
+    // jitter), and no underline (David). The selected row carries the soft bg chip; an
+    // un-selected burst is just a brief cyan flourish.
+    const [lb, rb] = burstFrame !== undefined ? nameFrame(burstFrame) : [" ", " "];
+    const inner = clip(idText, ID_W - 2); // 2 cols reserved for the frame pair
     const framed = `${lb}${inner}${rb}`;
     const pad = " ".repeat(Math.max(0, ID_W - displayWidth(framed)));
     const codes =
       i === selected ? [SELECT_BG, ...(a.is_self ? [C.bold] : [])] : [C.cyan, ...(a.is_self ? [C.bold] : [])];
     id = paint(framed + pad, ...codes);
-  } else if (i === selected) {
-    const clipped = clip(idText, ID_W); // name only (no trailing pad) — underline this
-    const pad = " ".repeat(Math.max(0, ID_W - clipped.length));
-    const name = paint(clipped, SELECT_BG, C.underline, ...(a.is_self ? [C.bold] : []));
-    id = name + (pad ? paint(pad, SELECT_BG) : ""); // bg continues under the pad, no underline
   } else {
     id = paint(cell(idText, ID_W), a.is_self ? C.bold : C.reset);
   }
