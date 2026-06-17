@@ -51,7 +51,7 @@ status flags:
   --project PATH      scope to a specific project root
   -h, --help          this help
 
-oxpit keys:  ↑/k ↓/j move · ⏎ jump · n nudge · m message · l comms-log · r refresh · ? help · q quit
+oxpit keys:  ↑/k ↓/j move · ⏎ jump · n nudge · m message · l comms-log · r refresh · ? help · ⌃C quit
 oxpit flags: --no-color, --all, --project PATH, --client NAME (which tmux
              client the jump drives when several are attached)`;
 

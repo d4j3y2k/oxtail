@@ -157,7 +157,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
 
     // Fleet-mode footer keys (log mode carries its own footer inside the panel).
     function footer(): string {
-      const keys = "↑↓ move  ⏎ jump  n nudge  m msg  l log  w thread  r refresh  ? help  q quit";
+      const keys = "↑↓ move  ⏎ jump  n nudge  m msg  l log  w thread  r refresh  ? help  ⌃C quit";
       const now = Date.now();
       const msg = now < statusUntil && status ? "  " + status : "";
       return "\n" + dim("  " + keys, opts.color) + msg;
@@ -177,7 +177,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "  l             toggle the comms-log bottom panel (fleet stays visible above)",
         "  w             open the selected agent's thread in the panel (per-agent)",
         "                in the panel: ↑↓ move the › cursor (or scroll an expanded msg) · w expand · j/k agents · f filter · ⏎ jump",
-        "  r             force refresh    ?  toggle help    q / Ctrl-C  quit",
+        "  r             force refresh    ?  toggle help    ⌃C (Ctrl-C)  quit",
         "",
         d("  🟢 active   🟡 idle   ⚫ dead (exited / pid-reused)"),
         d("  ✉N unread   ⚑N open obligations   ⏳ awaiting a peer reply"),
@@ -185,7 +185,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         d("  comms: ⚑ delegation  ⚑✓ done  ⚑✗ blocked  ❓ ask  ↩ reply"),
         d("  the selected row's name twinkles while the cockpit is focused · OXTAIL_OXPIT_ANIM=off"),
         "",
-        d("  press ? or q to return"),
+        d("  press ? to return"),
       ];
       return L.map((l) => clipToWidth(l, width) + CLEAR_EOL).join("\n");
     }
@@ -846,7 +846,9 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (s === FOCUS_IN) return setFocus(true);
       if (s === FOCUS_OUT) return setFocus(false);
       if (composing) return composeKey(s);
-      if (s === "\x03" || s === "q") return teardown(0); // Ctrl-C / q
+      if (s === "\x03") return teardown(0); // Ctrl-C only — `q` is intentionally NOT a
+      // quit (too easy to fat-finger next to the nav keys; David 2026-06-17). It falls
+      // through to a harmless no-op in every mode.
       if (s === "?") {
         helpOpen = !helpOpen;
         return paint();
