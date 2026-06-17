@@ -62,18 +62,17 @@ function makePaint(color: boolean): Paint {
 const SELECT_BG = "\x1b[48;5;238m";
 
 // SPIKE (backlog item 1): animated frame around the SELECTED agent's name, advanced
-// by the TUI's focus-gated animation timer (animFrame, ~6fps). A little DOT DANCE —
-// David's morphing sequence ∴ → ⋄ → ⋇ → ∵ → ⋄ — so the glyphs shuffle around the
-// name. One sequence for any liveness (the active/idle split is gone; David wanted a
+// by the TUI's focus-gated animation timer (animFrame, ~6fps). The frame morphs
+// through David's chosen sequence (currently the I-Ching trigrams ☰ → ☱ → ☲ → ☴, the
+// bars shuffling) around the name. One sequence for any liveness (David wanted a
 // single dance). Each entry is [left, right]; phase = animFrame % length. (These are
 // EAW-Ambiguous → 1-col here / maybe 2-col on a CJK terminal; it's only the selected
 // NAME cell, so a CJK mis-measure is cosmetic, never a wrap.) The cute knob — riff away.
 const FRAME_SEQ: [string, string][] = [
-  ["∴", "∴"],
-  ["⋄", "⋄"],
-  ["⋇", "⋇"],
-  ["∵", "∵"],
-  ["⋄", "⋄"],
+  ["☰", "☰"],
+  ["☱", "☱"],
+  ["☲", "☲"],
+  ["☴", "☴"],
 ];
 function nameFrame(animFrame: number): [string, string] {
   const i = ((animFrame % FRAME_SEQ.length) + FRAME_SEQ.length) % FRAME_SEQ.length;
