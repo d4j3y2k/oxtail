@@ -62,23 +62,22 @@ function makePaint(color: boolean): Paint {
 const SELECT_BG = "\x1b[48;5;238m";
 
 // SPIKE (backlog item 1): animated frame around the SELECTED agent's name, advanced
-// by the TUI's focus-gated animation timer (animFrame). Glyphs are 1-column dingbat
-// ornamental brackets (already in oxpit's vocabulary via ❯) so the name cell can't
-// mis-measure; TUNE the glyphs/cadence to taste. Active = an energetic pulse
-// (alternating heavy/light angle brackets); idle = a gentle twinkle (brackets fade
-// to spaces and back). Each entry is [left, right]; phase = animFrame % length.
-// ACTIVE = a lively, out-of-phase star shimmer (the two sides twinkle slightly out
-// of sync so it reads as alive). IDLE = a soft sparkle that blinks and then rests.
-// All EAW-Neutral dingbats (1-col). Tune freely — this is the cute knob.
+// by the TUI's focus-gated animation timer (animFrame). Each entry is [left, right];
+// phase = animFrame % length.
+// The frame is a little DOT DANCE — the math dot-relation glyphs morph (∴ → ∶ → ∵ →
+// ∷) so the dots seem to shuffle around the name (David's idea). ACTIVE runs the full
+// morph; IDLE does a gentle up→down→rest twinkle. (These are EAW-Ambiguous → 1-col
+// here / maybe 2-col on a CJK terminal; it's only the selected NAME cell, so a CJK
+// mis-measure is cosmetic, never a wrap.) Tune freely — this is the cute knob.
 const FRAME_ACTIVE: [string, string][] = [
-  ["✶", "✸"],
-  ["✷", "✹"],
-  ["✸", "✺"],
-  ["✹", "✶"],
+  ["∴", "∴"],
+  ["∶", "∶"],
+  ["∵", "∵"],
+  ["∷", "∷"],
 ];
 const FRAME_IDLE: [string, string][] = [
-  ["✦", "✦"],
-  ["✧", "✧"],
+  ["∴", "∴"],
+  ["∵", "∵"],
   [" ", " "],
   [" ", " "],
 ];
