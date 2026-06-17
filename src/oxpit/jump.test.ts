@@ -205,8 +205,8 @@ test("jumpToAgent: agent gone from registry", () => {
   if (!r.ok) assert.match(r.reason, /no longer in the registry/);
 });
 
-test("jumpToAgent: outside tmux yields a manual command", () => {
-  const { run } = fakeRunner({ "list-panes": "%7\tproj\t@2\n" });
+test("jumpToAgent: bare terminal with NO attached client yields a manual command", () => {
+  const { run } = fakeRunner({ "list-panes": "%7\tproj\t@2\n" }); // no list-clients ⇒ none attached
   const r = jumpToAgent(agent(), {
     run,
     inTmux: false,
@@ -215,8 +215,27 @@ test("jumpToAgent: outside tmux yields a manual command", () => {
   });
   assert.equal(r.ok, false);
   if (!r.ok) {
-    assert.match(r.reason, /not running inside tmux/);
+    assert.match(r.reason, /no tmux client attached/);
     assert.match(r.manual!, /tmux attach -t 'proj'/);
+  }
+});
+
+test("jumpToAgent: bare terminal (oxpit in a plain tab) drives the client on the target session", () => {
+  const { run, calls } = fakeRunner({
+    "list-panes": "%7\tproj\t@2\n",
+    // oxpit is NOT a tmux client here; one work terminal is attached to 'proj'.
+    "list-clients": "work\t/t1\tproj\n",
+  });
+  const r = jumpToAgent(agent(), {
+    run,
+    inTmux: false, // bare terminal
+    resolveEntry: () => entry(),
+    verifyPane: () => "%7",
+  });
+  assert.equal(r.ok, true);
+  if (r.ok) {
+    assert.equal(r.client, "work"); // drove the attached work terminal
+    assert.ok(calls.some((c) => c[0] === "switch-client" && c.includes("work")));
   }
 });
 

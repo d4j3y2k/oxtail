@@ -238,23 +238,24 @@ export function jumpToAgent(agent: FleetAgent, deps: JumpDeps = {}): JumpResult 
     return { ok: false, reason: `pane ${pane} not found in tmux` };
   }
 
-  // Outside tmux (cockpit in a bare terminal): we can't drive a client — and we
-  // must NOT mutate an attached tmux session from here, so return the manual
-  // command BEFORE any select-* call. Single-quote the session so an exotic name
-  // is safe to paste.
-  if (!inTmux) {
+  // Decide which attached tmux client to drive BEFORE mutating anything. This works
+  // from a BARE terminal too: `tmux switch-client` talks to the server regardless of
+  // whether oxpit itself is a tmux client, so the cockpit can run in a plain side tab
+  // and still move your tmux work-client to the agent. Inside tmux we exclude oxpit's
+  // OWN client (don't move the cockpit); in a bare terminal there is no own client.
+  const clients = listClients(run);
+  const self = inTmux ? selfClientName(run) : null;
+  const manual = `tmux attach -t '${loc.session}' \\; select-pane -t ${pane}`;
+  // No tmux client attached anywhere → nothing to move; hand over the attach command.
+  if (clients.length === 0) {
     return {
       ok: false,
-      reason: "not running inside tmux",
-      manual: `tmux attach -t '${loc.session}' \\; select-pane -t ${pane}`,
+      reason: "no tmux client attached to move (open the agents' session in a terminal first)",
+      manual,
     };
   }
-
-  // Decide which client to drive BEFORE mutating anything. With ≥2 OTHER attached
-  // clients the choice is a guess, so refuse rather than silently switch an
-  // arbitrary human's terminal — tell the operator to disambiguate with --client.
-  const clients = listClients(run);
-  const self = selfClientName(run);
+  // With ≥2 candidate clients the choice is a guess, so refuse rather than silently
+  // switch an arbitrary human's terminal — disambiguate with --client.
   const choice = chooseClient(clients, self, deps.client, loc.session);
   if (choice.ambiguous && !deps.client) {
     const cand = (choice.candidates ?? []).join(", ");
@@ -262,6 +263,11 @@ export function jumpToAgent(agent: FleetAgent, deps: JumpDeps = {}): JumpResult 
       ok: false,
       reason: `multiple terminals could be moved (${cand}); pass --client <name> to choose which one`,
     };
+  }
+  // A bare-terminal jump needs an EXPLICIT target client — there's no "current" client
+  // to default to (oxpit isn't one). If none resolved, hand over the manual command.
+  if (!inTmux && !choice.client) {
+    return { ok: false, reason: "couldn't resolve which terminal to move", manual };
   }
 
   // Dry run: the plan is fully resolved and validated — report it without touching
