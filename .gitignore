@@ -10,3 +10,6 @@ NOTES.md
 
 # local Codex MCP config (machine-local)
 .codex/
+
+# npm pack tarballs (build artifacts)
+*.tgz
