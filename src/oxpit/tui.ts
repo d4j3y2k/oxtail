@@ -144,6 +144,28 @@ export async function runOxpit(argv: string[]): Promise<number> {
   return runInteractive({ buildOpts, color, client });
 }
 
+// Run the cockpit as a CLI entry point: runOxpit plus a FULL terminal-restore
+// backstop for any throw that escapes its own teardown (runOxpit guards setup +
+// first paint, so this should be unreachable — but a terminal wedged in raw mode is
+// unforgiving, so it's belt-and-suspenders). Returns the process exit code. Shared by
+// the `oxtail oxpit` subcommand and the standalone `oxpit` bin so the backstop lives
+// in exactly one place.
+export async function runOxpitCli(argv: string[]): Promise<number> {
+  try {
+    return await runOxpit(argv);
+  } catch (e) {
+    try {
+      if (process.stdin.isTTY) process.stdin.setRawMode(false);
+    } catch {
+      // ignore
+    }
+    // Order mirrors teardown: focus-off, bracketed-paste-off, cursor-show, leave alt.
+    process.stdout.write("\x1b[?1004l\x1b[?2004l\x1b[?25h\x1b[?1049l");
+    console.error(e);
+    return 1;
+  }
+}
+
 type InteractiveOpts = {
   buildOpts: { allProjects: boolean; projectRoot: string | undefined };
   color: boolean;
