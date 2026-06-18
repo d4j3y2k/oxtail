@@ -90,24 +90,10 @@ import {
     process.exit(await runMessage(process.argv.slice(3)));
   }
   if (sub === "oxpit") {
-    const { runOxpit } = await import("./oxpit/tui.js");
-    try {
-      process.exit(await runOxpit(process.argv.slice(3)));
-    } catch (e) {
-      // Backstop: FULL terminal restore before dying, in case anything escaped the
-      // TUI's own teardown (runOxpit now guards setup/first-paint, so this should be
-      // unreachable — but a terminal wedged in raw mode is unforgiving, so keep the
-      // belt-and-suspenders). Order mirrors teardown: raw-mode off, then focus-off,
-      // bracketed-paste-off, cursor-show, leave alt-buffer.
-      try {
-        if (process.stdin.isTTY) process.stdin.setRawMode(false);
-      } catch {
-        // ignore
-      }
-      process.stdout.write("\x1b[?1004l\x1b[?2004l\x1b[?25h\x1b[?1049l");
-      console.error(e);
-      process.exit(1);
-    }
+    // Shared with the standalone `oxpit` bin (dist/oxpit-bin.js); the full
+    // terminal-restore backstop lives in runOxpitCli.
+    const { runOxpitCli } = await import("./oxpit/tui.js");
+    process.exit(await runOxpitCli(process.argv.slice(3)));
   }
 }
 import {

@@ -1,12 +1,13 @@
 {
   "name": "oxtail",
-  "version": "0.21.0",
+  "version": "0.22.0",
   "private": false,
   "type": "module",
   "description": "Coordination layer for parallel AI coding agent sessions, exposed over MCP.",
   "main": "dist/server.js",
   "bin": {
-    "oxtail": "dist/server.js"
+    "oxtail": "dist/server.js",
+    "oxpit": "dist/oxpit-bin.js"
   },
   "files": [
     "dist",
