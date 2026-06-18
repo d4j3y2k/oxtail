@@ -24,10 +24,14 @@ export const NUDGE_TEXT =
 
 // The wake line typed into the target's pane for an operator message. Unlike a peer
 // wake (the generic "read_my_messages" nudge), this shows the operator's CONTENT so
-// it reads like a direct message in the agent's session. Single-line (newlines
-// would submit early in the agent's prompt) + truncated; the FULL body is delivered
-// to the mailbox and remains in the comms-log.
-const WAKE_PREVIEW_MAX = 240;
+// it reads like a direct message in the agent's session — the agent acts on the pane
+// text directly, it is NOT a preview meant to be re-fetched. So the cap must be
+// generous enough that a normal human message (a paragraph or two) arrives WHOLE; a
+// 240-char cap silently chopped real messages mid-sentence. Single-line only
+// (newlines would submit early in the agent's prompt). The FULL body is also delivered
+// durably to the mailbox + comms-log, which is the overflow source for the rare case
+// below.
+const WAKE_PREVIEW_MAX = 1500;
 export function operatorWakeText(body: string): string {
   // Strip C0 control bytes + DEL (ESC, BEL, BS, …) BEFORE collapsing whitespace: this
   // text is typed verbatim into the target pane via tmux send-keys, so a raw ESC
@@ -38,8 +42,14 @@ export function operatorWakeText(body: string): string {
     .replace(/[\x00-\x08\x0e-\x1f\x7f]/g, "")
     .replace(/\s+/g, " ")
     .trim();
-  const preview = oneLine.length > WAKE_PREVIEW_MAX ? oneLine.slice(0, WAKE_PREVIEW_MAX) + "…" : oneLine;
-  return `oxpit msg: ${preview}`;
+  if (oneLine.length <= WAKE_PREVIEW_MAX) return `oxpit msg: ${oneLine}`;
+  // Over the cap (e.g. a huge paste). Do NOT trail off with a bare "…": that reads
+  // like the operator stopped mid-sentence and the recipient acts on a truncated
+  // message (an observed misread — the recipient replied "finish when you can"). Name
+  // oxpit as the truncator and point at the durable full copy so the agent fetches it.
+  const dropped = oneLine.length - WAKE_PREVIEW_MAX;
+  const preview = oneLine.slice(0, WAKE_PREVIEW_MAX).trimEnd();
+  return `oxpit msg: ${preview} […truncated by oxpit, +${dropped} chars — full message in your mailbox: call read_my_messages]`;
 }
 
 // Persistent per-target operator-wake throttle. oxpit may be a short-lived CLI, so
