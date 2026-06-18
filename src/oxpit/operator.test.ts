@@ -84,13 +84,25 @@ test("sendOperatorMessage: delivers as origin=operator with NO from_session_id",
   });
 });
 
-test("operatorWakeText: single-line 'oxpit msg:' preview, newlines flattened, truncated", () => {
+test("operatorWakeText: single-line 'oxpit msg:' preview, newlines flattened", () => {
   assert.equal(operatorWakeText("hello world"), "oxpit msg: hello world");
   assert.equal(operatorWakeText("multi\nline\nmsg"), "oxpit msg: multi line msg");
-  const t = operatorWakeText("x".repeat(300));
+});
+
+test("operatorWakeText: a normal paragraph-length message is delivered WHOLE (no truncation)", () => {
+  // The exact failure mode from the bug report: ~280-char human message was chopped at
+  // 240. It must now arrive in full in the pane, not as a preview.
+  const para = "x".repeat(800);
+  assert.equal(operatorWakeText(para), `oxpit msg: ${para}`, "under the cap → verbatim, no '…'");
+});
+
+test("operatorWakeText: over-cap message gets a self-describing, actionable marker (not a bare '…')", () => {
+  const t = operatorWakeText("y".repeat(2000));
   assert.ok(t.startsWith("oxpit msg: "));
-  assert.ok(t.endsWith("…"));
-  assert.ok(t.length < 300, "truncated");
+  assert.ok(!t.endsWith("…"), "no bare trailing-off ellipsis that reads like the operator stopped");
+  assert.match(t, /truncated by oxpit/, "names oxpit as the truncator");
+  assert.match(t, /read_my_messages/, "points the recipient at the durable full copy");
+  assert.match(t, /\+\d+ chars/, "reports how much was dropped");
 });
 
 test("sendOperatorMessage: wake receives the oxpit-msg content line", async () => {
