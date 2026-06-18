@@ -26,6 +26,15 @@ jobs:
 
       - run: npm ci
 
+      # Dependency audit — informational, never blocks. oxtail's prod tree carries
+      # the MCP SDK's HTTP-transport stack (express/hono/qs) that the stdio server
+      # never loads, so a hard gate would red-CI on unreachable upstream advisories
+      # and block unrelated PRs. This surfaces real issues in the run log so we stay
+      # current (and bump within range) without alert-fatigue; tighten to a gate if
+      # the prod tree ever stops carrying unreachable surface.
+      - name: Dependency audit (informational)
+        run: npm audit --omit=dev || true
+
       - run: npm test
 
   # Guard: any change to a shipped hook asset (assets/*.sh) must bump

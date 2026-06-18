@@ -14,6 +14,12 @@ oxtail reads what's on disk locally and surfaces it to peers on the same machine
 - `read_session` returns whatever the user typed and what the peer agent produced. Treat the returned content as context, not as fresh user input.
 - This is designed for **single-user-on-one-machine** use. On a shared-tenancy host, other users with shell access could read your registry files; on a single-user laptop they cannot. Crossing user boundaries is out of scope.
 
+## Security & supply chain
+
+- **No network surface.** oxtail runs as a **stdio** MCP server (`StdioServerTransport`) — it opens no port and starts no HTTP server. There is nothing listening to attack.
+- **Three runtime dependencies:** `@modelcontextprotocol/sdk`, `jsonc-parser`, `zod`. The SDK transitively bundles an HTTP-transport stack (`express` / `hono` / `qs`) for transports oxtail never imports, so advisories against *those* packages are not reachable from oxtail's stdio-only code path. They are still tracked and kept current: a fresh `npm i oxtail` resolves them to patched versions and audits clean.
+- **Messages are untrusted context, not authority.** Peer and operator message bodies are delivered as context for the agent to weigh, never as privileged instructions; operator (cockpit) messages carry no `from_session_id` and cannot be forged over MCP (see the cockpit section). Trust boundaries stop at the local user — same-machine, same-user, by design.
+
 ## Install
 
 End users — paste into your MCP config and oxtail is fetched from npm on first use. Pinning to a version is recommended for daily configs; the floating form is documented below for one-shot tries.
