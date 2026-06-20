@@ -28,6 +28,7 @@ import { loadFleetConfig, modelOptionsForAgent, validateFleetSpec, writeFleetSca
 import { renderSpawnPlan, spawnFleet, tmuxSessionExists, tmuxSessionName } from "./fleet/spawn.js";
 import { killManagedWindow, readPaneMarker } from "./fleet/ownership.js";
 import { buildResetPlan, discoverFleetId, renderResetPlan, resetFleet } from "./fleet/reset.js";
+import { computeSyncPlan, renderSyncPlan, syncFleet } from "./fleet/sync.js";
 import { listPanesWithMarkers } from "./fleet/ownership.js";
 import type { FleetSpec } from "./fleet/types.js";
 import { inferProjectRoot, safeRealpath } from "../scope.js";
@@ -219,6 +220,23 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       | { lines: string[]; canSpawn: boolean; spec: FleetSpec; sessionName: string }
       | null = null;
     let spawnBusy = false;
+    // SYNC overlay: the editor's `y` routes here when the target session already EXISTS
+    // (converge it) vs SPAWN for a new one. Read-only preview → deliberate confirm (a
+    // capital `Y` when it deletes, `y` when purely additive). syncBusy locks it in flight.
+    let syncOpen = false;
+    let syncView:
+      | {
+          lines: string[];
+          canSync: boolean;
+          hasDelete: boolean;
+          spec: FleetSpec;
+          sessionName: string;
+          fleetId: string;
+          confirmedRemove: string[];
+          confirmedAdd: string[];
+        }
+      | null = null;
+    let syncBusy = false;
     // Fleet config EDITOR (grid + hotkeys) — `S` opens this; edit windows in place,
     // then `y` → the plan/confirm overlay → spawn, or `w` → save .oxtail/fleet.json.
     type EditWin = {
@@ -345,7 +363,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "  l             toggle the comms-log bottom panel (fleet stays visible above)",
         "  w             open the selected agent's thread in the panel (per-agent)",
         "                in the panel: ↑↓ move the › cursor (or scroll an expanded msg) · w expand · j/k agents · f filter · ⏎ jump",
-        "  S             configure + spawn a fleet — grid editor (n/m/f/t/r edit a window · a/d add/delete · w save · y spawn)",
+        "  S             configure a fleet — grid editor (n/m/f/t/r edit a window · a/d add/delete · w save · y apply: SPAWN if new, SYNC if the session exists)",
         "  R             RESET the selected agent's fleet — teardown + relaunch (red plan; R again to confirm, NOT y)",
         "  K             KILL the selected agent's window — removes that one window (K again to confirm; only oxpit-managed)",
         "  r             force refresh    ?  toggle help    ⌃C (Ctrl-C)  quit",
@@ -442,7 +460,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     // overlay / log mode, and for dead·self·pane-less rows. capturePaneActivity
     // re-verifies the pane id (a recycled id never captures a stranger).
     function maybeCaptureSelected(force: boolean): void {
-      if (composing || helpOpen || spawnOpen || resetOpen || fleetEdit || mode === "log") return;
+      if (composing || helpOpen || spawnOpen || syncOpen || resetOpen || fleetEdit || mode === "log") return;
       const idx = selectedIndex();
       const a = idx >= 0 ? snapshot.agents[idx] : undefined;
       if (!a || a.liveness === "dead" || a.is_self || !a.tmux_pane) {
@@ -659,6 +677,10 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       }
       if (spawnOpen) {
         stdout.write(HOME + spawnFrame(width, rows) + CLEAR_BELOW);
+        return;
+      }
+      if (syncOpen) {
+        stdout.write(HOME + syncFrame(width, rows) + CLEAR_BELOW);
         return;
       }
       if (resetOpen) {
@@ -948,14 +970,20 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (!fleetEdit) return;
       const v = validateFleetSpec(specFromEdit(fleetEdit));
       if (!v.ok) {
-        fleetEdit.note = `✗ cannot spawn: ${v.error}`;
+        fleetEdit.note = `✗ cannot apply: ${v.error}`;
         return paint();
       }
       const spec = v.spec;
       const sessionName = tmuxSessionName(spec.name);
       fleetEdit = null;
       fleetEditInput = null;
-      openSpawnPlan(spec, sessionName, "configured in oxpit (w in the editor saves it to .oxtail/fleet.json)");
+      // Route by session existence: an EXISTING session → SYNC (converge — add/keep/delete
+      // to match the spec, without restarting healthy agents); a NEW one → SPAWN (create).
+      if (tmuxSessionExists(sessionName)) {
+        openSyncPlan(spec, sessionName);
+      } else {
+        openSpawnPlan(spec, sessionName, "configured in oxpit (w in the editor saves it to .oxtail/fleet.json)");
+      }
     }
 
     // The editor grid (full-screen). The cursor row is inverse-video; a text-input
@@ -1007,7 +1035,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       } else {
         lines.push(d("  ↑↓ select · a add window · d delete"));
         lines.push(d("  n name · m model · f effort · t type · r remote-control"));
-        lines.push(d("  F fleet-name · w save .oxtail/fleet.json · y SPAWN · esc cancel"));
+        lines.push(d("  F fleet-name · w save .oxtail/fleet.json · y APPLY (spawn new / sync existing) · esc cancel"));
       }
       return lines
         .slice(0, Math.max(1, rows))
@@ -1214,6 +1242,130 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
           ...wrapped.slice(0, budget - 1),
           d(`  … +${wrapped.length - (budget - 1)} more (full plan via the CLI --dry-run)`),
         ];
+      }
+      return [...shown, prompt].map((l) => clipToWidth(l, wrapW) + CLEAR_EOL).join("\n");
+    }
+
+    // ── SYNC: converge an EXISTING session to the spec (the editor's `y` routes here
+    // when the session already exists; SPAWN handles a new one). ADD windows the spec
+    // gained, KEEP healthy ones running, DELETE windows it lost. Read-only preview →
+    // doSync executes. A red DESTRUCTIVE confirm when anything is deleted; a light
+    // confirm when purely additive. Captures confirmedRemove/confirmedAdd so the live
+    // run can only touch what the operator SAW (confirm-fidelity).
+    function openSyncPlan(spec: FleetSpec, sessionName: string): void {
+      if (syncOpen || syncBusy || spawnOpen || resetOpen) return;
+      const b = (s: string) => (opts.color ? `\x1b[1m\x1b[36m${s}\x1b[0m` : s);
+      const red = (s: string) => (opts.color ? `\x1b[1m\x1b[31m${s}\x1b[0m` : s);
+      const d = (s: string) => dim(s, opts.color);
+      const disc = discoverFleetId(sessionName);
+      if (!disc.ok) {
+        // The session exists but isn't a single oxpit-managed fleet — not ours to converge.
+        syncView = {
+          lines: [
+            red("SYNC — can't converge this session"),
+            d(`  "${sessionName}" exists but isn't a single oxpit-managed fleet:`),
+            d(`    ${disc.reason}`),
+            d("  SYNC converges an oxpit-SPAWNed fleet; an unmanaged/foreign session isn't ours to touch."),
+          ],
+          canSync: false,
+          hasDelete: false,
+          spec,
+          sessionName,
+          fleetId: "",
+          confirmedRemove: [],
+          confirmedAdd: [],
+        };
+        syncOpen = true;
+        return paint();
+      }
+      const fleetId = disc.fleetId;
+      const panes = listPanesWithMarkers().filter((p) => p.session === sessionName);
+      const plan = computeSyncPlan(spec, fleetId, panes);
+      const hasDelete = plan.remove.length > 0;
+      const lines: string[] = [
+        hasDelete ? red("SYNC — converge (DESTRUCTIVE: removes window(s))") : b("SYNC — converge to spec"),
+        d(`  fleet "${spec.name}" → session "${sessionName}" [${fleetId}]`),
+        "",
+        d("  plan — nothing runs until you confirm:"),
+        ...renderSyncPlan(spec, fleetId, sessionName, plan).split("\n").map((l) => "  " + l),
+      ];
+      syncView = {
+        lines,
+        canSync: true,
+        hasDelete,
+        spec,
+        sessionName,
+        fleetId,
+        confirmedRemove: plan.remove.map((p) => p.pane),
+        confirmedAdd: plan.add.map((w) => w.name),
+      };
+      syncOpen = true;
+      paint();
+    }
+
+    // Execute the previewed SYNC. Passes confirmedRemove/confirmedAdd so the live
+    // (fresh-locked) run acts ONLY on what the operator saw; healthy windows are NOT
+    // restarted. Busy-locked while in flight; the fleet refreshes on completion.
+    function doSync(): void {
+      if (!syncView || syncBusy || !syncView.canSync) return;
+      const { spec, sessionName, fleetId, confirmedRemove, confirmedAdd } = syncView;
+      syncBusy = true;
+      syncView = {
+        ...syncView,
+        lines: [...syncView.lines, "", dim(`  syncing "${sessionName}"… adding, keeping, removing`, opts.color)],
+      };
+      paint();
+      syncFleet(spec, snapshot.project_root, sessionName, { dryRun: false, fleetId, confirmedRemove, confirmedAdd })
+        .then((r) => {
+          syncBusy = false;
+          syncOpen = false;
+          syncView = null;
+          if (torndown) return;
+          const added = r.added.filter((x) => x.ok).length;
+          const removed = r.removed.filter((x) => x.ok).length;
+          const drift = (r.unconfirmed?.remove.length ?? 0) + (r.unconfirmed?.add.length ?? 0);
+          const driftMsg = drift ? ` · ${drift} appeared-since, skipped (re-run)` : "";
+          if (r.ok) {
+            setStatus(ok(`✓ synced "${sessionName}" — +${added} added · ~${r.kept.length} kept · -${removed} removed${driftMsg}`, opts.color));
+          } else {
+            // codex: surface the degraded/skip reason, not just "failed".
+            const firstBad =
+              r.removed.find((x) => !x.ok)?.reason ?? r.added.find((x) => !x.ok)?.reason ?? r.error ?? "see results";
+            setStatus(warn(`sync incomplete: ${firstBad}${driftMsg}`, opts.color));
+          }
+          refresh(true); // surface the converged (or partial) fleet
+        })
+        .catch((e) => {
+          syncBusy = false;
+          syncOpen = false;
+          syncView = null;
+          if (torndown) return;
+          setStatus(warn(`sync error: ${e instanceof Error ? e.message : e}`, opts.color));
+        });
+    }
+
+    // The SYNC overlay frame. Mirrors spawnFrame; the confirm scales to RISK — a DELETE
+    // needs a deliberate capital `Y` (a reflexive `y` cancels), purely-additive takes `y`.
+    function syncFrame(width: number, rows: number): string {
+      if (!syncView) return "";
+      const d = (s: string) => dim(s, opts.color);
+      const red = (s: string) => (opts.color ? `\x1b[1m\x1b[31m${s}\x1b[0m` : s);
+      const prompt = syncBusy
+        ? d("  working… (Ctrl-C aborts the cockpit)")
+        : !syncView.canSync
+          ? warn("  press any key to go back", opts.color)
+          : syncView.hasDelete
+            ? red("  press Y to SYNC (REMOVES window(s) + converges) · any other key cancels")
+            : warn("  press y to SYNC (add / converge) · any other key to go back", opts.color);
+      const wrapW = Math.max(8, width);
+      const wrapped = syncView.lines.flatMap((l) => {
+        if (l.includes("\x1b") || l.length <= wrapW) return [l];
+        return wrapWords(l, Math.max(8, wrapW - 2)).map((seg, i) => (i ? "  " + seg : seg));
+      });
+      const budget = Math.max(1, rows - 1);
+      let shown = wrapped;
+      if (shown.length > budget) {
+        shown = [...wrapped.slice(0, budget - 1), d(`  … +${wrapped.length - (budget - 1)} more (full plan via the CLI --dry-run)`)];
       }
       return [...shown, prompt].map((l) => clipToWidth(l, wrapW) + CLEAR_EOL).join("\n");
     }
@@ -1583,6 +1735,17 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         if (spawnView?.canSpawn && s === "y") return doSpawn();
         spawnOpen = false;
         spawnView = null;
+        return paint();
+      }
+      if (syncOpen) {
+        // SYNC confirm gate: swallow keys while in flight (Ctrl-C above still aborts the
+        // cockpit); a DELETE needs a deliberate capital `Y` (a reflexive `y` cancels),
+        // purely-additive takes `y`; the can't-sync message dismisses on any key; ANY
+        // other key cancels back to the cockpit.
+        if (syncBusy) return;
+        if (syncView?.canSync && s === (syncView.hasDelete ? "Y" : "y")) return doSync();
+        syncOpen = false;
+        syncView = null;
         return paint();
       }
       if (resetOpen) {
