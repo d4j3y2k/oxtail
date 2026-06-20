@@ -49,7 +49,10 @@ export function computeTeardownPlan(
 // RESET's confirm gate so the operator sees EXACTLY what would be touched.
 export function renderTeardownPlan(plan: TeardownPlan): string {
   const lines: string[] = [];
-  lines.push(`teardown targets (kill-pane + respawn, per-pane only): ${plan.targets.length}`);
+  // respawn-pane -k = reset-the-pane-IN-PLACE (kills its process tree, restarts the
+  // shell, keeps the pane + its marker). NOT `kill-pane`, which DESTROYS the pane —
+  // the wording matters because this line is what an operator reads before a destroy.
+  lines.push(`teardown targets (respawn-pane -k, reset-in-place, per-pane only): ${plan.targets.length}`);
   for (const { window, pane } of plan.targets) {
     lines.push(
       `  ${pane.pane}  ${pane.session}:${pane.windowIndex} "${pane.windowName}" ` +

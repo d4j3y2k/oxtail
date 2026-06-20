@@ -25,12 +25,7 @@ import {
   type EnsureWindowResult,
 } from "./ensure-window.js";
 import { withFleetLock } from "./lock.js";
-import {
-  listPanesWithMarkers,
-  markersInSession,
-  readPaneMarker,
-  type TmuxRun,
-} from "./ownership.js";
+import { listPanesWithMarkers, markersInSession, type TmuxRun } from "./ownership.js";
 import { computeTeardownPlan, renderTeardownPlan, type TeardownPlan } from "./teardown.js";
 import type { FleetSpec } from "./types.js";
 
@@ -122,33 +117,39 @@ export function renderResetPlan(
 }
 
 // Reset ONE target pane to a clean shell. The DESTRUCTIVE primitive, gated by an
-// IMMEDIATE pane-id TOCTOU re-check: the pane must STILL carry OUR fleetId marker
-// (readPaneMarker returns null if the pane is gone, or a different value if the
-// operator re-pointed it). respawn-pane -k kills the pane's process tree + restarts
-// the shell in repoRoot, PRESERVING the marker (live-verified). Targets by PANE ID,
-// never session:window — the id is the stable identity once mutation begins.
+// IMMEDIATE live re-probe of the FULL spec-target identity (codex P6): the pane must
+// still EXIST, still carry OUR fleetId marker, still be in the intended SESSION, and
+// still bear the spec WINDOW NAME. Marker alone is not the allowlist — "matches a
+// spec window" is the other half, so an operator rename/move between plan and
+// mutation must SKIP, not relaunch-on-top. Targets by PANE ID (the stable identity
+// once mutation begins). respawn-pane -k -c repoRoot restarts the pane's original
+// (default-shell) command, PRESERVING the marker (live-verified).
 function teardownTarget(
   run: TmuxRun,
-  pane: string,
-  windowName: string,
-  fleetId: string,
+  paneId: string,
+  expect: { session: string; windowName: string; fleetId: string },
   repoRoot: string,
 ): TeardownResult {
-  const marker = readPaneMarker(pane, run);
-  if (marker !== fleetId) {
+  const live = listPanesWithMarkers(run).find((p) => p.pane === paneId);
+  if (!live) {
+    return { pane: paneId, window: expect.windowName, ok: false, action: "skipped", reason: `TOCTOU: pane ${paneId} is gone — left untouched` };
+  }
+  if (live.managedBy !== expect.fleetId || live.session !== expect.session || live.windowName !== expect.windowName) {
     return {
-      pane,
-      window: windowName,
+      pane: paneId,
+      window: expect.windowName,
       ok: false,
       action: "skipped",
-      reason: `TOCTOU: marker is ${marker ? `"${marker}"` : "gone"} (≠ ${fleetId}) — pane changed since the plan; left untouched`,
+      reason:
+        `TOCTOU: pane drifted since the plan (now ${live.session}:"${live.windowName}" marker ` +
+        `${live.managedBy ? `"${live.managedBy}"` : "none"}; expected ${expect.session}:"${expect.windowName}" ${expect.fleetId}) — left untouched`,
     };
   }
   try {
-    run(["respawn-pane", "-k", "-c", repoRoot, "-t", pane]);
-    return { pane, window: windowName, ok: true, action: "reset" };
+    run(["respawn-pane", "-k", "-c", repoRoot, "-t", paneId]);
+    return { pane: paneId, window: expect.windowName, ok: true, action: "reset" };
   } catch (e) {
-    return { pane, window: windowName, ok: false, action: "skipped", reason: `respawn-pane failed: ${String(e)}` };
+    return { pane: paneId, window: expect.windowName, ok: false, action: "skipped", reason: `respawn-pane failed: ${String(e)}` };
   }
 }
 
@@ -180,29 +181,40 @@ export async function resetFleet(
 ): Promise<ResetResult> {
   const dryRun = opts.dryRun ?? true;
   const run = opts.run ?? defaultRun;
+  const discover = () =>
+    opts.fleetId ? ({ ok: true, fleetId: opts.fleetId } as const) : discoverFleetId(sessionName, run);
 
-  const disc = opts.fleetId
-    ? ({ ok: true, fleetId: opts.fleetId } as const)
-    : discoverFleetId(sessionName, run);
-  if (!disc.ok) {
-    return { fleetId: null, sessionName, dryRun, plan: null, teardowns: [], relaunches: [], ok: false, error: disc.reason };
-  }
-  const fleetId = disc.fleetId;
-  const plan = computeTeardownPlan(spec, fleetId, sessionPanes(run, sessionName));
-
+  // DRY-RUN preview: discover + plan OUTSIDE the lock (read-only, mutates nothing).
   if (dryRun) {
-    opts.log?.(renderResetPlan(spec, fleetId, sessionName, plan));
-    return { fleetId, sessionName, dryRun: true, plan, teardowns: [], relaunches: [], ok: true };
+    const disc = discover();
+    if (!disc.ok) {
+      return { fleetId: null, sessionName, dryRun: true, plan: null, teardowns: [], relaunches: [], ok: false, error: disc.reason };
+    }
+    const plan = computeTeardownPlan(spec, disc.fleetId, sessionPanes(run, sessionName));
+    opts.log?.(renderResetPlan(spec, disc.fleetId, sessionName, plan));
+    return { fleetId: disc.fleetId, sessionName, dryRun: true, plan, teardowns: [], relaunches: [], ok: true };
   }
 
+  // MUTATING path: acquire the lock FIRST, THEN discover + compute the plan INSIDE
+  // it. A plan computed BEFORE the lock goes STALE while a concurrent RESET mutates
+  // — e.g. both see `max` missing → the second creates a DUPLICATE window, or it
+  // re-respawns a freshly-relaunched pane (codex P6). The lock must cover planning,
+  // not just mutation.
   const ensure = opts.ensure ?? realEnsureWindow;
   const ensureDeps = (): EnsureWindowDeps => ({ run, now: opts.now, log: opts.log, ...opts.ensureDeps });
   return withFleetLock(repoRoot, async () => {
+    const disc = discover();
+    if (!disc.ok) {
+      return { fleetId: null, sessionName, dryRun: false, plan: null, teardowns: [], relaunches: [], ok: false, error: disc.reason };
+    }
+    const fleetId = disc.fleetId;
+    const plan = computeTeardownPlan(spec, fleetId, sessionPanes(run, sessionName));
+
     // PHASE 1 — QUIESCE: respawn-k EVERY target straight through (no relaunch yet,
-    // so no old/new coexistence), each preceded by its pane-id TOCTOU re-check. No
+    // so no old/new coexistence), each preceded by its live spec-target re-check. No
     // readiness binding here, so order/parallelism is irrelevant — do them all.
     const teardowns: TeardownResult[] = plan.targets.map(({ window, pane }) =>
-      teardownTarget(run, pane.pane, window.name, fleetId, repoRoot),
+      teardownTarget(run, pane.pane, { session: sessionName, windowName: window.name, fleetId }, repoRoot),
     );
 
     // PHASE 2 — RELAUNCH, SEQUENTIALLY (readiness binds one launch at a time).

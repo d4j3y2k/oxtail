@@ -1,9 +1,10 @@
 import { strict as assert } from "node:assert";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { EnsureWindowResult } from "./ensure-window.js";
+import { fleetLockPath } from "./lock.js";
 import type { PaneInfo } from "./ownership.js";
 import { discoverFleetId, resetFleet } from "./reset.js";
 import type { FleetSpec, FleetWindowSpec } from "./types.js";
@@ -31,22 +32,28 @@ function row(p: Partial<PaneInfo> & { pane: string }): PaneInfo {
   };
 }
 
-// Fake tmux: list-panes returns rows in tmux's REAL octal-escaped -F form (\037);
-// show-options returns the per-pane marker (mutable via markerOverride, for TOCTOU
-// sim); new-window -P -F returns a fresh pane id; respawn-pane is a no-op. A shared
-// `seq` records teardown vs relaunch ORDER (relaunch pushes happen in the injected
-// ensure) so we can assert quiesce-first.
-function fakeTmux(panes: PaneInfo[], markerOverride: Record<string, string> = {}) {
+// Fake tmux. list-panes returns the live pane set in tmux's REAL octal-escaped -F
+// form (\037) — teardownTarget re-probes via listPanesWithMarkers, so the TOCTOU is
+// exercised through the SAME read path as the plan. `drift` mutates the live panes at
+// a given list-panes call # (to simulate an operator changing a pane between plan and
+// mutation). new-window -P -F returns a fresh pane id; respawn-pane is a no-op. A
+// shared `seq` records teardown vs relaunch ORDER (relaunch pushes in the injected
+// ensure) so quiesce-first is assertable.
+function fakeTmux(
+  panes: PaneInfo[],
+  opts: { driftAtCall?: number; drift?: (live: PaneInfo[]) => void } = {},
+) {
   const seq: string[] = [];
-  const markers: Record<string, string> = {};
-  for (const p of panes) if (p.managedBy) markers[p.pane] = p.managedBy;
-  Object.assign(markers, markerOverride);
+  const live = panes.map((p) => ({ ...p }));
+  let listCalls = 0;
   let newPaneSeq = 100;
   const run = (args: string[]): string => {
     if (args[0] === "respawn-pane") seq.push(`teardown:${args[args.indexOf("-t") + 1]}`);
     if (args[0] === "list-panes") {
+      listCalls += 1;
+      if (opts.driftAtCall === listCalls && opts.drift) opts.drift(live);
       return (
-        panes
+        live
           .map((p) =>
             [p.pane, p.session, p.windowIndex, p.windowName, p.panePid, p.currentCommand, p.managedBy ?? ""].join(
               "\\037",
@@ -55,7 +62,6 @@ function fakeTmux(panes: PaneInfo[], markerOverride: Record<string, string> = {}
           .join("\n") + "\n"
       );
     }
-    if (args[0] === "show-options") return (markers[args[args.indexOf("-t") + 1]] ?? "") + "\n";
     if (args[0] === "new-window") return `%${newPaneSeq++}\n`;
     return "";
   };
@@ -132,6 +138,19 @@ test("DRY-RUN (the default) mutates NOTHING — no respawn-pane, no new-window",
   });
 });
 
+test("the DRY-RUN preview reads state OUTSIDE the lock (a read-only preview takes no lock)", async () => {
+  await withRepo(async (repoRoot) => {
+    const fx = fakeTmux([row({ pane: "%1", windowName: "main" })]);
+    let heldDuringRead = true;
+    const run = (args: string[]) => {
+      if (args[0] === "list-panes") heldDuringRead = existsSync(fleetLockPath(repoRoot));
+      return fx.run(args);
+    };
+    await resetFleet({ ...spec, windows: [spec.windows[0]] }, repoRoot, "oxtail", { run });
+    assert.equal(heldDuringRead, false, "dry-run preview must not hold the fleet lock");
+  });
+});
+
 // ── live reset ─────────────────────────────────────────────────────────────────────
 
 test("live RESET: teardown ALL targets BEFORE any relaunch (quiesce-first), then relaunch sequentially", async () => {
@@ -145,15 +164,34 @@ test("live RESET: teardown ALL targets BEFORE any relaunch (quiesce-first), then
     assert.equal(res.ok, true);
     assert.deepEqual(res.teardowns.map((t) => t.action), ["reset", "reset", "reset"]);
     assert.equal(res.relaunches.length, 3);
-    // QUIESCE-FIRST: every teardown precedes every relaunch in the shared sequence.
     const lastTeardown = fx.seq.findLastIndex((s) => s.startsWith("teardown:"));
     const firstRelaunch = fx.seq.findIndex((s) => s.startsWith("relaunch:"));
     assert.ok(lastTeardown < firstRelaunch, `all teardowns must precede all relaunches: ${fx.seq.join(", ")}`);
-    // Relaunch lands on the SAME (torn-down, marker-preserved) panes.
     assert.deepEqual(
       fx.seq.filter((s) => s.startsWith("relaunch:")),
       ["relaunch:main@%1", "relaunch:max@%2", "relaunch:codex@%3"],
     );
+  });
+});
+
+test("the MUTATING plan is computed INSIDE the fleet lock (no stale-plan-outside-lock race)", async () => {
+  await withRepo(async (repoRoot) => {
+    // codex P6: a plan computed before the lock goes stale while a concurrent RESET
+    // mutates. Every state read on the mutating path must hold the lock — asserted by
+    // the lock dir being present at each list-panes (discovery, plan, TOCTOU re-probe).
+    const fx = fakeTmux([row({ pane: "%1", windowName: "main" })]);
+    const lockHeldDuringReads: boolean[] = [];
+    const run = (args: string[]) => {
+      if (args[0] === "list-panes") lockHeldDuringReads.push(existsSync(fleetLockPath(repoRoot)));
+      return fx.run(args);
+    };
+    await resetFleet({ ...spec, windows: [spec.windows[0]] }, repoRoot, "oxtail", {
+      dryRun: false,
+      run,
+      ensure: fx.ensure,
+    });
+    assert.ok(lockHeldDuringReads.length > 0, "state was read");
+    assert.ok(lockHeldDuringReads.every((held) => held), "every plan-state read must hold the fleet lock");
   });
 });
 
@@ -175,36 +213,64 @@ test("NEVER kill-session — RESET is strictly per-pane respawn", async () => {
   });
 });
 
-test("TOCTOU: a target whose marker changed since the plan is SKIPPED — not torn down, not relaunched", async () => {
+// ── TOCTOU (full spec-target re-check) ───────────────────────────────────────────
+
+test("TOCTOU: a target whose WINDOW was renamed since the plan is SKIPPED (spec-target drift, codex)", async () => {
   await withRepo(async (repoRoot) => {
-    // %2 was a plan target (managedBy=FLEET in the listing) but its live marker
-    // flipped (operator re-pointed it) before the mutation → must be left untouched.
+    // %2 is a plan target, but its window is renamed before its teardown re-probe
+    // (list-panes call #4: discover=1, plan=2, td%1=3, td%2=4). Marker still ours, but
+    // the spec-target no longer matches → must skip, NOT relaunch-on-top.
     const fx = fakeTmux(
-      [
-        row({ pane: "%1", windowName: "main" }),
-        row({ pane: "%2", windowName: "max", currentCommand: "claude" }),
-      ],
-      { "%2": "someone-else-7777" },
+      [row({ pane: "%1", windowName: "main" }), row({ pane: "%2", windowName: "max", currentCommand: "claude" })],
+      {
+        driftAtCall: 4,
+        drift: (live) => {
+          const m = live.find((p) => p.pane === "%2");
+          if (m) m.windowName = "renamed-by-hand";
+        },
+      },
     );
     const res = await resetFleet({ ...spec, windows: [spec.windows[0], spec.windows[1]] }, repoRoot, "oxtail", {
       dryRun: false,
       run: fx.run,
       ensure: fx.ensure,
     });
-    const max = res.teardowns.find((t) => t.pane === "%2");
-    assert.equal(max?.action, "skipped");
-    assert.match(max?.reason ?? "", /TOCTOU/);
-    assert.ok(!fx.seq.includes("teardown:%2"), "the changed pane is never respawned");
-    assert.ok(!fx.seq.some((s) => s.startsWith("relaunch:max")), "and never relaunched");
+    const maxT = res.teardowns.find((t) => t.pane === "%2");
+    assert.equal(maxT?.action, "skipped");
+    assert.match(maxT?.reason ?? "", /drifted/);
+    assert.ok(!fx.seq.includes("teardown:%2"), "the renamed pane is never respawned");
+    assert.ok(!fx.seq.some((s) => s.startsWith("relaunch:max")), "and never relaunched onto");
     assert.equal(res.ok, false, "a skipped target makes the overall reset not-ok");
-    // The untouched-marker pane %1 still resets normally.
-    assert.ok(fx.seq.includes("teardown:%1"));
+    assert.ok(fx.seq.includes("teardown:%1"), "the unchanged main pane still resets");
   });
 });
 
+test("TOCTOU: a target whose MARKER flipped to a foreign fleet since the plan is SKIPPED", async () => {
+  await withRepo(async (repoRoot) => {
+    const fx = fakeTmux(
+      [row({ pane: "%1", windowName: "main" }), row({ pane: "%2", windowName: "max", currentCommand: "claude" })],
+      {
+        driftAtCall: 4,
+        drift: (live) => {
+          const m = live.find((p) => p.pane === "%2");
+          if (m) m.managedBy = "someone-else-7777";
+        },
+      },
+    );
+    const res = await resetFleet({ ...spec, windows: [spec.windows[0], spec.windows[1]] }, repoRoot, "oxtail", {
+      dryRun: false,
+      run: fx.run,
+      ensure: fx.ensure,
+    });
+    assert.equal(res.teardowns.find((t) => t.pane === "%2")?.action, "skipped");
+    assert.ok(!fx.seq.includes("teardown:%2"), "a now-foreign pane is never respawned");
+  });
+});
+
+// ── missing windows ─────────────────────────────────────────────────────────────────
+
 test("missing windows (no managed pane) are CREATED fresh (new-window -P -F) and launched", async () => {
   await withRepo(async (repoRoot) => {
-    // Only main exists/marked; max + codex are missing → fresh windows.
     const fx = fakeTmux([row({ pane: "%1", windowName: "main" })]);
     const created: string[] = [];
     const run = (args: string[]) => {
@@ -213,12 +279,8 @@ test("missing windows (no managed pane) are CREATED fresh (new-window -P -F) and
     };
     const res = await resetFleet(spec, repoRoot, "oxtail", { dryRun: false, run, ensure: fx.ensure });
     assert.equal(res.plan?.missing.map((w) => w.name).sort().join(","), "codex,max");
-    assert.deepEqual(created.sort(), ["codex", "max"], "missing windows created by name via new-window");
-    // All three relaunched: the torn-down main + the two created windows.
-    assert.deepEqual(
-      res.relaunches.map((r) => r.window).sort(),
-      ["codex", "main", "max"],
-    );
+    assert.deepEqual(created.sort(), ["codex", "max"], "missing windows created by name");
+    assert.deepEqual(res.relaunches.map((r) => r.window).sort(), ["codex", "main", "max"]);
     assert.ok(res.ok);
   });
 });
