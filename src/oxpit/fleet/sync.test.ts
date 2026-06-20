@@ -218,3 +218,50 @@ test("syncFleet: refuses an unmanaged session (no fleet to converge) — points 
   assert.equal(res.ok, false);
   assert.match(res.error ?? "", /no oxpit-managed fleet|use SPAWN/i);
 });
+
+test("syncFleet: a FAILED add SKIPS the delete (don't tear down a degraded fleet) — codex MEDIUM", async () => {
+  await withRepo(async (repoRoot) => {
+    // spec swaps max→test: ADD test (which FAILS to launch), DELETE max. max must survive.
+    const fx = fakeSync([row({ pane: "%1", windowName: "main" }), row({ pane: "%2", windowName: "max" })]);
+    const failingEnsure = async (o: { target: string; window: FleetWindowSpec; fleetId: string; cwd: string }): Promise<EnsureWindowResult> => {
+      fx.seq.push(`ensure:${o.window.name}@${o.target}`);
+      const ok = o.window.name !== "test"; // the new "test" add fails
+      return {
+        window: o.window.name,
+        occupancy: ok ? "empty-shell" : "unknown",
+        action: ok ? "launched" : "aborted",
+        ok,
+        sessionId: ok ? `sid-${o.window.name}` : null,
+        reason: ok ? undefined : "launch failed",
+      };
+    };
+    const res = await syncFleet({ name: "oxtail", windows: [{ name: "main", agent: "claude" }, { name: "test", agent: "claude" }] }, repoRoot, "oxtail", {
+      dryRun: false,
+      run: fx.run,
+      ensure: failingEnsure,
+      kill: fx.kill,
+    });
+    assert.equal(res.ok, false, "a failed ADD makes the sync not-ok");
+    assert.ok(!fx.seq.includes("kill:%2"), "max is NOT deleted while its replacement failed to launch");
+    assert.ok(
+      res.removed.some((r) => r.window === "max" && !r.ok && /skipped|degraded/i.test(r.reason ?? "")),
+      "the delete is recorded as skipped (degraded fleet)",
+    );
+  });
+});
+
+test("syncFleet: a STALE preview fleetId (≠ the session's live fleet) is refused — codex MEDIUM", async () => {
+  await withRepo(async (repoRoot) => {
+    const fx = fakeSync([row({ pane: "%1", windowName: "main" })]); // the session's LIVE fleet is FID
+    const res = await syncFleet({ name: "oxtail", windows: [{ name: "main", agent: "claude" }] }, repoRoot, "oxtail", {
+      dryRun: false,
+      run: fx.run,
+      ensure: fx.ensure,
+      kill: fx.kill,
+      fleetId: "fleet-STALE0000", // a preview id that no longer matches the live session
+    });
+    assert.equal(res.ok, false, "a stale preview fleet identity is refused");
+    assert.match(res.error ?? "", /changed since the preview|re-open the SYNC preview/i);
+    assert.equal(fx.seq.length, 0, "nothing mutated when the fleet identity is stale");
+  });
+});

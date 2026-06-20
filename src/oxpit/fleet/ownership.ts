@@ -133,26 +133,37 @@ export function readPaneMarker(pane: string, run: TmuxRun = tmux): string | null
 
 // Remove the tmux WINDOW containing `pane` — the cockpit's per-window kill: that one
 // agent stops and its window/tab disappears, the rest of the fleet keeps running.
-// Three guards, all fail-CLOSED (refuse + reason, never a destructive surprise):
-//   1. OWNERSHIP — the pane must carry an @oxpit_managed marker (a human's window is
-//      never ours to kill).
+// Four guards, all fail-CLOSED (refuse + reason, never a destructive surprise):
+//   1. EXPECTED IDENTITY — the pane must STILL carry `expectedFleetId` (the fleet the
+//      caller intends to kill in). A bare "is it managed?" check is NOT enough (codex
+//      HIGH): between a SYNC plan and the kill, a non-lock-respecting actor could
+//      re-mark the pane to ANOTHER fleet; a uniform-marker-only guard would then kill
+//      that other fleet's window. So the destructive primitive carries the expected id
+//      all the way down and rejects a marker that changed.
 //   2. LAST-WINDOW — killing the session's only window COLLAPSES the session (tmux
 //      closes a session with no windows). That's destroy-the-fleet, not a per-window
 //      kill — refuse and point at RESET / an explicit kill-session.
 //   3. UNMANAGED-SPLIT — `kill-window` takes EVERY pane in the window, so if a human
 //      split a pane into our window, killing it destroys their work. The additive-
 //      safety pillar is "untagged panes are NEVER touched", so refuse unless EVERY
-//      pane in the window carries THIS fleet's marker. (max's stricter call over the
-//      WIP's "acceptable since the window is ours" — flagged for codex review.)
+//      pane in the window carries `expectedFleetId` (strict — codex confirmed correct).
 // `-t <pane>` targets the window the pane belongs to (verified vs tmux 3.5a: list-panes
 // -t <pane> is window-scoped; #{session_windows} is the session's window count).
 export function killManagedWindow(
   pane: string,
+  expectedFleetId: string,
   run: TmuxRun = tmux,
 ): { ok: true; fleetId: string } | { ok: false; reason: string } {
+  // (1) EXPECTED-IDENTITY guard: the pane must STILL be THIS fleet's (not unmarked, not
+  // re-marked to another fleet since the plan).
   const marker = readPaneMarker(pane, run);
-  if (!marker) {
-    return { ok: false, reason: `pane ${pane} is not oxpit-managed (no @oxpit_managed marker) — refusing to kill` };
+  if (marker !== expectedFleetId) {
+    return {
+      ok: false,
+      reason: marker
+        ? `pane ${pane} is now marked by a DIFFERENT fleet ("${marker}", expected "${expectedFleetId}") — it changed since the plan; refusing to kill`
+        : `pane ${pane} is not oxpit-managed (no @oxpit_managed marker) — refusing to kill`,
+    };
   }
   // (2) LAST-WINDOW guard.
   let windowCount: number;
@@ -167,17 +178,17 @@ export function killManagedWindow(
       reason: `pane ${pane} is in the session's ONLY window — killing it would destroy the whole session; use RESET, or kill the session explicitly`,
     };
   }
-  // (3) UNMANAGED-SPLIT guard: every pane in the window must carry THIS fleet's marker.
+  // (3) UNMANAGED-SPLIT guard: every pane in the window must carry `expectedFleetId`.
   // `#{pane_id}=#{@oxpit_managed}` is unambiguous — a pane_id is "%N" and a fleetId is
   // [A-Za-z0-9_-] (mintFleetId), so neither contains "=" (and no 0x1F to escape). An
-  // empty marker (a human split) → mismatch → refuse.
+  // empty marker (a human split) or a different fleet's marker → mismatch → refuse.
   try {
     const out = run(["list-panes", "-t", pane, "-F", "#{pane_id}=#{@oxpit_managed}"]);
     for (const line of out.split("\n")) {
       const l = line.trim();
       if (!l) continue;
       const m = l.slice(l.indexOf("=") + 1);
-      if (m !== marker) {
+      if (m !== expectedFleetId) {
         return {
           ok: false,
           reason: `the window of pane ${pane} contains a pane this fleet doesn't own (${m ? `marker "${m}"` : "unmanaged — a human split"}) — refusing to kill (won't destroy unmanaged work)`,
@@ -189,7 +200,7 @@ export function killManagedWindow(
   }
   try {
     run(["kill-window", "-t", pane]);
-    return { ok: true, fleetId: marker };
+    return { ok: true, fleetId: expectedFleetId };
   } catch (e) {
     return { ok: false, reason: `kill-window failed: ${String(e)}` };
   }

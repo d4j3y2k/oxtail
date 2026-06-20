@@ -147,7 +147,7 @@ export interface SyncOptions {
   confirmedAdd?: string[];
   ensure?: typeof realEnsureWindow; // injectable for tests
   ensureDeps?: EnsureWindowDeps;
-  kill?: (pane: string, run: TmuxRun) => ReturnType<typeof killManagedWindow>; // injectable for tests
+  kill?: (pane: string, expectedFleetId: string, run: TmuxRun) => ReturnType<typeof killManagedWindow>; // injectable for tests
   now?: () => number;
   log?: (msg: string) => void;
 }
@@ -226,12 +226,22 @@ export async function syncFleet(
   // MUTATING path: acquire the lock FIRST, then discover + compute the plan INSIDE it
   // so the executed plan reflects the locked truth (mirrors resetFleet).
   const ensure = opts.ensure ?? realEnsureWindow;
-  const kill = opts.kill ?? ((p, r) => killManagedWindow(p, r));
+  const kill = opts.kill ?? killManagedWindow;
   const ensureDeps = (): EnsureWindowDeps => ({ run, now: opts.now, log: opts.log, ...opts.ensureDeps });
   return withFleetLock(repoRoot, async () => {
-    const disc = discover();
-    if (!disc.ok) return errResult(false, disc.reason);
-    const fleetId = disc.fleetId;
+    // ALWAYS live-discover the fleetId under the lock — never trust a cached/preview
+    // fleetId as success (codex MEDIUM, mirrors resetFleet). When a preview fleetId was
+    // supplied, REQUIRE the live one to still match, else abort: a session that became
+    // another fleet / human-only since the preview must NOT be mutated.
+    const live = discoverFleetForSync(sessionName, run);
+    if (!live.ok) return errResult(false, live.reason);
+    if (opts.fleetId && opts.fleetId !== live.fleetId) {
+      return errResult(
+        false,
+        `fleet changed since the preview (now "${live.fleetId}", expected "${opts.fleetId}") — re-open the SYNC preview`,
+      );
+    }
+    const fleetId = live.fleetId;
     let plan = computeSyncPlan(spec, fleetId, sessionPanes(run, sessionName));
 
     // CONFIRM-FIDELITY: act on ONLY the operator-confirmed add/remove sets ∩ the
@@ -269,9 +279,22 @@ export async function syncFleet(
     for (const { window, pane } of plan.keep) {
       kept.push(await ensure({ target: pane.pane, window, fleetId, cwd: repoRoot }, ensureDeps()));
     }
-    // DELETE last — kill-window each removed pane (guarded inside killManagedWindow).
+    // DELETE last — but ONLY if every ADD + KEEP succeeded (codex MEDIUM): never tear
+    // down a fleet member while a replacement is degraded (an ADD that failed to launch).
+    // kill-window passes the live fleetId as the EXPECTED identity (codex HIGH) so a pane
+    // re-marked since the plan is refused, not killed.
+    const addKeepOk = added.every((a) => a.ok) && kept.every((k) => k.ok);
     for (const p of plan.remove) {
-      const r = kill(p.pane, run);
+      if (!addKeepOk) {
+        removed.push({
+          pane: p.pane,
+          window: p.windowName,
+          ok: false,
+          reason: "skipped — an ADD or KEEP failed; not deleting while the fleet is degraded (fix the launch, then re-run)",
+        });
+        continue;
+      }
+      const r = kill(p.pane, fleetId, run);
       removed.push(
         r.ok ? { pane: p.pane, window: p.windowName, ok: true } : { pane: p.pane, window: p.windowName, ok: false, reason: r.reason },
       );

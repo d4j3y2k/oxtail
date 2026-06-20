@@ -26,7 +26,7 @@ import { captureClipboardImage } from "./clipboard.js";
 import { parseStatusArgs, USAGE } from "./cli.js";
 import { loadFleetConfig, modelOptionsForAgent, validateFleetSpec, writeFleetScaffold } from "./fleet/spec.js";
 import { renderSpawnPlan, spawnFleet, tmuxSessionExists, tmuxSessionName } from "./fleet/spawn.js";
-import { killManagedWindow } from "./fleet/ownership.js";
+import { killManagedWindow, readPaneMarker } from "./fleet/ownership.js";
 import { buildResetPlan, discoverFleetId, renderResetPlan, resetFleet } from "./fleet/reset.js";
 import { listPanesWithMarkers } from "./fleet/ownership.js";
 import type { FleetSpec } from "./fleet/types.js";
@@ -839,7 +839,12 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     function doKillWindow(agent: FleetAgent): void {
       const label = agent.window_name ?? agent.short_id;
       if (!agent.tmux_pane) return setStatus(warn(`no tmux pane for ${label} — can't kill`, opts.color));
-      const r = killManagedWindow(agent.tmux_pane);
+      // Read the marker NOW and pass it as the EXPECTED fleet identity (codex HIGH) — a
+      // direct kill has no plan→delete gap, but the primitive now requires the caller's
+      // intended fleetId, and this refuses an unmarked / re-marked pane.
+      const fleetId = readPaneMarker(agent.tmux_pane);
+      if (!fleetId) return setStatus(warn(`"${label}" isn't oxpit-managed — can't kill`, opts.color));
+      const r = killManagedWindow(agent.tmux_pane, fleetId);
       if (r.ok) {
         setStatus(ok(`✓ killed window "${label}"`, opts.color));
         refresh(true); // the window's gone — re-read the fleet
