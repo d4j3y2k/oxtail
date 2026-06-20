@@ -32,6 +32,27 @@ export function tmuxSessionName(base: string): string {
   return base.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 60) || "fleet";
 }
 
+// Does a tmux session with this EXACT name already exist? Exact-string match over
+// list-sessions (not `has-session -t <name>`, whose prefix/fnmatch target
+// resolution could false-positive "oxtail" against "oxtail-2"). No tmux server /
+// no sessions ⇒ the list call errors ⇒ nothing to collide with ⇒ false.
+function sessionExists(run: TmuxRun, name: string): boolean {
+  let out: string;
+  try {
+    out = run(["list-sessions", "-F", "#{session_name}"]);
+  } catch {
+    return false;
+  }
+  return out.split("\n").some((l) => l.trim() === name);
+}
+
+// Cockpit-facing convenience: pre-check the collision BEFORE the operator confirms
+// a SPAWN, so the menu can surface "session exists" up front. The real safety is
+// spawnFleet's own in-lock guard; this is just the early signal.
+export function tmuxSessionExists(name: string, run: TmuxRun = defaultRun): boolean {
+  return sessionExists(run, name);
+}
+
 export interface SpawnOptions {
   dryRun?: boolean; // default TRUE — print the plan, mutate nothing
   run?: TmuxRun;
@@ -112,6 +133,22 @@ export async function spawnFleet(
   const ensure = opts.ensure ?? realEnsureWindow;
   return withFleetLock(repoRoot, async () => {
     const results: EnsureWindowResult[] = [];
+    // Refuse-to-clobber, TOCTOU-checked INSIDE the lock: SPAWN only ever CREATES
+    // (the destructive half is RESET/P6), so never lay a fleet on top of an
+    // existing session. spec.name defaults to the repo basename, which collides
+    // with a fleet already running in that repo — exactly the case to refuse. The
+    // operator resolves it with an explicit fresh name (or RESET, once it lands).
+    if (sessionExists(run, sessionName)) {
+      return {
+        fleetId,
+        sessionName,
+        dryRun: false,
+        plan,
+        results,
+        ok: false,
+        error: `tmux session "${sessionName}" already exists — refusing to spawn on top of it (SPAWN only creates; use an explicit fresh name, or RESET to rebuild).`,
+      };
+    }
     try {
       // Create the session (first window) + the remaining windows up-front as
       // empty shells; the LAUNCHES below are what must stay sequential.

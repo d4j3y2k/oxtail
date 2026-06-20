@@ -24,6 +24,9 @@ import { NUDGE_TEXT, sendOperatorMessage } from "./operator.js";
 import { formatAttachmentNote, stageAttachment, type StagedAttachment } from "./attachments.js";
 import { captureClipboardImage } from "./clipboard.js";
 import { parseStatusArgs, USAGE } from "./cli.js";
+import { loadFleetConfig } from "./fleet/spec.js";
+import { renderSpawnPlan, spawnFleet, tmuxSessionExists, tmuxSessionName } from "./fleet/spawn.js";
+import type { FleetSpec } from "./fleet/types.js";
 
 const ALT_ON = "\x1b[?1049h";
 const ALT_OFF = "\x1b[?1049l";
@@ -202,6 +205,15 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     let logMsgCount = 0; // last-rendered message count (for cursor clamping)
     let logAvail = 0; // last-rendered visible body lines (for cursor paging)
     let pendingNudgeKey: string | null = null; // agentKey awaiting 'y' to confirm a nudge
+    // SPAWN overlay (P4): a full-screen plan preview + y-confirm gate. `S` computes
+    // the dry-run plan (read-only) and opens it; `y` executes the real spawn. Cached
+    // so the confirm can't re-resolve against a changed fleet. spawnBusy locks the
+    // overlay while a live spawn (sequential ensure_window, possibly minutes) runs.
+    let spawnOpen = false;
+    let spawnView:
+      | { lines: string[]; canSpawn: boolean; spec: FleetSpec; sessionName: string }
+      | null = null;
+    let spawnBusy = false;
     let composing = false; // typing a custom operator message in the TUI
     let composeBuf = ""; // the message being typed
     let composeTargetKey: string | null = null; // agentKey the message is bound to
@@ -243,7 +255,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
 
     // Fleet-mode footer keys (log mode carries its own footer inside the panel).
     function footer(): string {
-      const keys = "↑↓ move  ⏎ jump  n nudge  m msg  l log  w thread  r refresh  ? help  ⌃C quit";
+      const keys = "↑↓ move  ⏎ jump  n nudge  m msg  S spawn  l log  w thread  r refresh  ? help  ⌃C quit";
       const now = Date.now();
       const msg = now < statusUntil && status ? "  " + status : "";
       return "\n" + dim("  " + keys, opts.color) + msg;
@@ -263,6 +275,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "  l             toggle the comms-log bottom panel (fleet stays visible above)",
         "  w             open the selected agent's thread in the panel (per-agent)",
         "                in the panel: ↑↓ move the › cursor (or scroll an expanded msg) · w expand · j/k agents · f filter · ⏎ jump",
+        "  S             spawn a new agent fleet — shows the plan, y to confirm (refuses to clobber a live session)",
         "  r             force refresh    ?  toggle help    ⌃C (Ctrl-C)  quit",
         "",
         d("  🟢 active   🟡 idle   ⚫ dead (exited / pid-reused)"),
@@ -355,7 +368,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     // overlay / log mode, and for dead·self·pane-less rows. capturePaneActivity
     // re-verifies the pane id (a recycled id never captures a stranger).
     function maybeCaptureSelected(force: boolean): void {
-      if (composing || helpOpen || mode === "log") return;
+      if (composing || helpOpen || spawnOpen || mode === "log") return;
       const idx = selectedIndex();
       const a = idx >= 0 ? snapshot.agents[idx] : undefined;
       if (!a || a.liveness === "dead" || a.is_self || !a.tmux_pane) {
@@ -538,6 +551,10 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         stdout.write(HOME + helpFrame(width, rows) + CLEAR_BELOW);
         return;
       }
+      if (spawnOpen) {
+        stdout.write(HOME + spawnFrame(width, rows) + CLEAR_BELOW);
+        return;
+      }
       if (composing) {
         // Compose field at the BOTTOM; fleet/log stays visible above. Size the top
         // region to the remaining rows and pad so the field is pinned to the foot.
@@ -704,6 +721,118 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
           if (torndown) return;
           setStatus(warn(`nudge error: ${e instanceof Error ? e.message : e}`, opts.color));
         });
+    }
+
+    // ── SPAWN (P4): plan overlay → y-confirm → execute ───────────────────────
+    // Open the READ-ONLY plan overlay for THIS project: resolve the fleet spec
+    // (project>global>default), render the exact dry-run plan (tmux commands +
+    // per-window recipes, incl. the --effort flags), and pre-check the session-name
+    // collision so the operator sees up-front whether `y` will run or is blocked.
+    // Mutates nothing — the real spawn is doSpawn, gated behind the confirm.
+    function openSpawn(): void {
+      if (spawnOpen || spawnBusy) return;
+      const cfg = loadFleetConfig(snapshot.project_root);
+      if (!cfg.ok) {
+        return setStatus(
+          warn(`spawn: fleet config invalid (${cfg.source}: ${cfg.path}) — ${cfg.error}`, opts.color),
+        );
+      }
+      const spec = cfg.spec;
+      const sessionName = tmuxSessionName(spec.name);
+      const collision = tmuxSessionExists(sessionName);
+      const b = (s: string) => (opts.color ? `\x1b[1m\x1b[36m${s}\x1b[0m` : s);
+      const d = (s: string) => dim(s, opts.color);
+      const lines: string[] = [
+        b("SPAWN — stand up a new agent fleet"),
+        d(`  fleet "${spec.name}" · source ${cfg.source}${cfg.path ? ` (${cfg.path})` : ""}`),
+        d(
+          `  → tmux session "${sessionName}" · ${spec.windows.length} window(s): ${spec.windows.map((w) => w.name).join(", ")}`,
+        ),
+        "",
+      ];
+      if (collision) {
+        lines.push(
+          warn(
+            `  ⚠ a tmux session "${sessionName}" already exists — SPAWN is blocked here (it only CREATES, never clobbers).`,
+            opts.color,
+          ),
+        );
+        lines.push(d("    spawn from a fresh repo, or RESET the existing fleet (coming soon)."));
+        lines.push("");
+      }
+      lines.push(d("  plan — nothing runs until you confirm:"));
+      for (const pl of renderSpawnPlan(spec, "<minted@spawn>", sessionName).split("\n")) {
+        lines.push("  " + pl);
+      }
+      spawnView = { lines, canSpawn: !collision, spec, sessionName };
+      spawnOpen = true;
+      paint();
+    }
+
+    // Execute the previewed SPAWN for real (non-dry-run). Doubly guarded: the overlay
+    // only offers `y` when there's no collision, AND spawnFleet re-checks refuse-to-
+    // clobber inside its lock. Additive — never attaches/switches, never touches
+    // another session. The sequential ensure_window can take minutes, so the overlay
+    // shows a "spawning…" line and swallows keys (spawnBusy) until it resolves; the
+    // fleet then refreshes so the new session appears in the cockpit.
+    function doSpawn(): void {
+      if (!spawnView || spawnBusy || !spawnView.canSpawn) return;
+      const { spec, sessionName } = spawnView;
+      spawnBusy = true;
+      spawnView = {
+        ...spawnView,
+        lines: [
+          ...spawnView.lines,
+          "",
+          dim(`  spawning "${sessionName}"… creating the session, launching agents sequentially`, opts.color),
+        ],
+      };
+      paint();
+      spawnFleet(spec, snapshot.project_root, { dryRun: false, sessionName })
+        .then((r) => {
+          spawnBusy = false;
+          spawnOpen = false;
+          spawnView = null;
+          if (torndown) return;
+          if (r.ok) {
+            const up = r.results.filter((x) => x.ok).length;
+            setStatus(
+              ok(`✓ spawned "${r.sessionName}" — ${up}/${r.results.length} windows up [${r.fleetId}]`, opts.color),
+            );
+            refresh(true); // surface the new fleet in the cockpit
+          } else {
+            setStatus(warn(`spawn failed: ${r.error ?? "see per-window results"}`, opts.color));
+          }
+        })
+        .catch((e) => {
+          spawnBusy = false;
+          spawnOpen = false;
+          spawnView = null;
+          if (torndown) return;
+          setStatus(warn(`spawn error: ${e instanceof Error ? e.message : e}`, opts.color));
+        });
+    }
+
+    // The SPAWN overlay frame (full-screen, like helpFrame). Windows the plan to the
+    // terminal height while ALWAYS keeping the confirm prompt on the last row (the
+    // plan can run longer than a short terminal). Pure render.
+    function spawnFrame(width: number, rows: number): string {
+      if (!spawnView) return "";
+      const d = (s: string) => dim(s, opts.color);
+      const prompt = spawnBusy
+        ? d("  working… (Ctrl-C aborts the cockpit)")
+        : spawnView.canSpawn
+          ? warn("  press y to SPAWN · any other key to cancel", opts.color)
+          : warn("  press any key to close", opts.color);
+      const budget = Math.max(1, rows - 1); // reserve the prompt row
+      let shown = spawnView.lines;
+      if (shown.length > budget) {
+        shown = [
+          ...spawnView.lines.slice(0, budget - 1),
+          d(`  … +${spawnView.lines.length - (budget - 1)} more (full plan via the CLI --dry-run)`),
+        ];
+      }
+      return [...shown, prompt].map((l) => clipToWidth(l, width) + CLEAR_EOL).join("\n");
     }
 
     // Send the composed custom message to the bound agent (resolved by session key,
@@ -940,6 +1069,16 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (s === "\x03") return teardown(0); // Ctrl-C only — `q` is intentionally NOT a
       // quit (too easy to fat-finger next to the nav keys; David 2026-06-17). It falls
       // through to a harmless no-op in every mode.
+      if (spawnOpen) {
+        // SPAWN confirm gate: while a spawn is in flight, swallow keys (Ctrl-C above
+        // still aborts the cockpit); `y` (only when not collision-blocked) executes;
+        // ANY other key closes the overlay without spawning.
+        if (spawnBusy) return;
+        if (spawnView?.canSpawn && s === "y") return doSpawn();
+        spawnOpen = false;
+        spawnView = null;
+        return paint();
+      }
       if (s === "?") {
         helpOpen = !helpOpen;
         return paint();
@@ -1015,6 +1154,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         );
       }
       if (s === "m") return startCompose();
+      if (s === "S") return openSpawn(); // capital-S: deliberate (no fat-finger), opens the plan
       if (s === "w") {
         // item 4: open the selected agent's thread (filtered) in the bottom panel,
         // cursor on its latest message. ↑↓ then move the cursor; w expands it.

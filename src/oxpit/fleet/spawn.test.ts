@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { EnsureWindowResult } from "./ensure-window.js";
-import { planSpawn, renderSpawnPlan, spawnFleet, tmuxSessionName } from "./spawn.js";
+import { planSpawn, renderSpawnPlan, spawnFleet, tmuxSessionExists, tmuxSessionName } from "./spawn.js";
 import type { FleetSpec } from "./types.js";
 
 const spec: FleetSpec = {
@@ -114,6 +114,41 @@ test("a window whose pane can't be resolved is reported, not skipped silently", 
     assert.equal(res.results.length, 2);
     assert.ok(res.results.every((r) => /could not resolve pane/.test(r.reason ?? "")));
   });
+});
+
+test("REFUSES to spawn on top of an existing session (no clobber, no new-session)", async () => {
+  await withHome(async () => {
+    const calls: string[][] = [];
+    const res = await spawnFleet(spec, "/repo", {
+      dryRun: false,
+      sessionName: "demo-fleet",
+      run: (args) => {
+        calls.push(args);
+        // a session named exactly "demo-fleet" is already running
+        if (args[0] === "list-sessions") return "other\ndemo-fleet\nthird\n";
+        return "";
+      },
+    });
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /already exists — refusing to spawn on top of it/);
+    assert.equal(res.results.length, 0);
+    // the refusal happened BEFORE any mutation
+    assert.ok(!calls.some((c) => c[0] === "new-session"), "must not create a session on collision");
+  });
+});
+
+test("tmuxSessionExists is an EXACT-name match (no prefix false-positive)", () => {
+  const run = (args: string[]): string =>
+    args[0] === "list-sessions" ? "oxtail\noxtail-2\nmyrepo\n" : "";
+  assert.equal(tmuxSessionExists("oxtail", run), true);
+  assert.equal(tmuxSessionExists("oxtail-2", run), true);
+  assert.equal(tmuxSessionExists("oxt", run), false); // prefix must NOT match
+  assert.equal(tmuxSessionExists("myrepo-x", run), false);
+  // no tmux server (run throws) ⇒ nothing to collide with
+  const throwing = (): string => {
+    throw new Error("no server running");
+  };
+  assert.equal(tmuxSessionExists("oxtail", throwing), false);
 });
 
 test("session-creation failure aborts with an error, no per-window results", async () => {
