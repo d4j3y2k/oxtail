@@ -273,6 +273,15 @@ export interface EnsureWindowResult {
 //      is idempotent, so a double-send is harmless.
 // classifyPaneReadiness runs against an injected capture() so the loop is unit-
 // testable against canned pane buffers without real tmux.
+//
+// RESIDUAL version-coupling (max): tui-ready is a mere accelerator, but "busy"
+// ("esc to interrupt") is still load-bearing — it's the guard that keeps a re-send
+// from interleaving into a mid-turn Codex. It fails CLOSED: a busy FALSE-positive
+// (a future re-skin whose indicator we misread as busy) would wait out readyWaitMs
+// and abort+dump — never a keystroke-interleave; a busy false-negative self-corrects
+// (the happy path is idle-on-send-1, and rollout-proof gates success). Far narrower
+// than the old whole-gate string coupling. Watch-item: a busy-string fixture if the
+// Codex chrome changes.
 export interface CodexSelfJoinDeps {
   capture: () => string;
   fire: () => Promise<void>;
@@ -410,7 +419,11 @@ async function defaultLaunch(
         sleep: napMs,
         settleMs: deps.selfJoinSettleMs,
         maxSends: deps.selfJoinMaxSends,
-        rolloutBudgetMs: deps.selfJoinRolloutBudgetMs ?? deps.readinessTimeoutMs,
+        // Its OWN budget (codexSelfJoin default 15s), NOT readinessTimeoutMs (max): a
+        // join-created rollout lands ~1-3s after submit, so 15s is comfortable margin
+        // AND re-sends a genuine miss promptly — inheriting Claude's ~45s drop-wait
+        // would just stall the re-send. Bigger is interleave-safe but needlessly slow.
+        rolloutBudgetMs: deps.selfJoinRolloutBudgetMs,
         log: deps.log,
       }),
     // POLL for pane-bound adoption — registry adoption (Claude's hook reading the

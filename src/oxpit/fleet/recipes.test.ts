@@ -231,7 +231,7 @@ test("sendLiteral with a confirm needle that never prints fails", async () => {
   if (!res.ok) assert.match(res.reason, /confirm needle .* never printed/);
 });
 
-test("claimCheck before any waitExternal is a hard error (no session bound)", async () => {
+test("claimCheck before a session is bound is a hard error", async () => {
   const recipe: Recipe = {
     client: "claude",
     label: "main",
@@ -240,7 +240,7 @@ test("claimCheck before any waitExternal is a hard error (no session bound)", as
   };
   const res = await executeRecipe(recipe, fx().fx);
   assert.equal(res.ok, false);
-  if (!res.ok) assert.match(res.reason, /before waitExternal bound a session/);
+  if (!res.ok) assert.match(res.reason, /before a session was bound/);
 });
 
 test("an explicit abort step stops with its reason", async () => {

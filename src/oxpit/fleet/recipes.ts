@@ -5,16 +5,16 @@
 //   • a dry-run can print the EXACT steps before anything mutates a pane, and
 //   • the executor is unit-testable against injected effects (no real tmux).
 //
-// The single load-bearing readiness step is `waitExternal`: it blocks on the
-// launch-time filesystem artifact (readiness.ts), which is the source of truth
-// that the agent came up and what its session id is — never a TUI string. The
-// other steps (sendLiteral/key/classifyPane/claimCheck/abort) carry the
+// Readiness is binding the session id from EXTERNAL state (a filesystem artifact),
+// never a TUI string — but the two clients bind it through DIFFERENT steps because
+// their artifact TIMING differs (live-verified):
+//   • Claude → `waitExternal`: its SessionStart drop is a LAUNCH-TIME artifact, so a
+//     passive launch→watch binds the id.
+//   • Codex → `selfJoinClaim`: a fresh Codex writes NO rollout until its first turn,
+//     so readiness inverts to stimulus→proof — the join turn creates the rollout we
+//     bind from. (See selfJoinClaim below + ensure-window.codexSelfJoin.)
+// The remaining steps (sendLiteral/key/classifyPane/claimCheck/abort) carry the
 // configuration + external-confirmation ceremony layered on top.
-//
-// P2 ships the DSL + executor + a MINIMAL validated SPAWN recipe (launch →
-// waitExternal → claimCheck). Effort/join chords and exact launch flags are
-// finalized + live-verified in P3 alongside the spec; the DSL already supports
-// them so that work is additive.
 
 import type { ClientType } from "../../clients.js";
 import type { PaneClassification } from "./classify.js";
@@ -125,12 +125,8 @@ export function buildSelfJoinInstruction(): string {
   ].join(" ");
 }
 
-// The SPAWN recipe: launch into the empty shell, wait for the launch artifact to
-// bind the session, (Codex only) fire the cooperative self-claim, then confirm
-// registry adoption. Effort chords + classifyPane gates are layered in as P3
-// finalizes (the DSL supports them).
-//
-// The two clients have FUNDAMENTALLY DIFFERENT readiness shapes (live-verified):
+// The SPAWN/RESET recipe per window. The two clients have FUNDAMENTALLY DIFFERENT
+// readiness shapes (live-verified):
 //   • Claude — SessionStart drop is a LAUNCH-TIME artifact + the hook auto-joins, so:
 //       launch → waitExternal(drop binds id) → claimCheck.
 //   • Codex — writes NO rollout until its first turn, and has no auto-join, so a
@@ -301,7 +297,7 @@ export async function executeRecipe(recipe: Recipe, fx: RecipeEffects): Promise<
           return {
             ok: false,
             failed: step,
-            reason: "claimCheck reached before waitExternal bound a session",
+            reason: "claimCheck reached before a session was bound (waitExternal/selfJoinClaim)",
             sessionId,
           };
         }
