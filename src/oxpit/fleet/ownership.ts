@@ -61,8 +61,21 @@ export function listPanesWithMarkers(run: TmuxRun = tmux): PaneInfo[] {
   } catch {
     return [];
   }
+  // tmux renders a control byte placed in the -F TEMPLATE as an OCTAL ESCAPE in
+  // its output — verified on tmux 3.5a: the 0x1F (\x1f) field separator comes
+  // back as the literal 4-char string "\037", NOT a raw byte. So a naive split on
+  // raw 0x1F finds nothing, every row collapses into one field (length < 7 →
+  // skipped), and the WHOLE ownership listing silently empties against a real
+  // tmux server — which breaks the level probe (probePane → null → "unknown" →
+  // SPAWN aborts every window) and RESET's fleetId discovery. The mocked unit
+  // tests fed an idealized raw-0x1F payload and never saw this; the live
+  // integration test (spawn-tmux.test.ts) did. Undo the escape — and tolerate a
+  // tmux that emitted the byte raw — before splitting. No legal field can hold a
+  // real 0x1F (tmux escapes those identically; fleet/pane names forbid control
+  // chars), so this can never mis-split a value.
+  const normalized = out.replace(/\\037/g, FS);
   const rows: PaneInfo[] = [];
-  for (const line of out.split("\n")) {
+  for (const line of normalized.split("\n")) {
     if (!line) continue;
     const f = line.split(FS);
     if (f.length < 7) continue;

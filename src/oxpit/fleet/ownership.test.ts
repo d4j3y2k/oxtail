@@ -31,6 +31,38 @@ test("listPanesWithMarkers parses fields and maps empty marker to null", () => {
   assert.equal(panes[2].managedBy, "other-55556666");
 });
 
+// Real tmux escapes the 0x1F separator placed in the -F TEMPLATE to the literal
+// 4-char string "\037" in its OUTPUT (verified tmux 3.5a). The parser MUST undo
+// that, or it returns nothing against a live server — silently emptying the
+// ownership listing (breaks the level probe AND RESET). The raw-\x1f mock above
+// could never catch this; this feeds the escaped form a real tmux emits.
+function fakeRunEscaped(rows: string[][]): (args: string[]) => string {
+  return () => rows.map((r) => r.join("\\037")).join("\n") + "\n";
+}
+
+test("listPanesWithMarkers parses tmux's OCTAL-ESCAPED separator (real -F output)", () => {
+  const run = fakeRunEscaped([
+    ["%1", "oxtail", "0", "main", "1000", "claude", "oxtail-abcd1234"],
+    ["%9", "oxtail", "0", "main", "2000", "nvim", ""], // unmarked human split
+  ]);
+  const panes = listPanesWithMarkers(run);
+  assert.equal(panes.length, 2, "escaped separators must still yield rows");
+  assert.equal(panes[0].pane, "%1");
+  assert.equal(panes[0].session, "oxtail");
+  assert.equal(panes[0].managedBy, "oxtail-abcd1234");
+  assert.equal(panes[1].managedBy, null);
+});
+
+test("markersInSession works on tmux's OCTAL-ESCAPED output (the live-tmux path)", () => {
+  const run = fakeRunEscaped([
+    ["%1", "oxtail", "0", "main", "1000", "claude", "oxtail-abcd1234"],
+    ["%2", "oxtail", "1", "max", "1001", "claude", "oxtail-abcd1234"],
+    ["%3", "other", "0", "main", "1002", "claude", "other-99"],
+  ]);
+  assert.deepEqual(markersInSession("oxtail", run), ["oxtail-abcd1234"]);
+  assert.deepEqual(markersInSession("other", run), ["other-99"]);
+});
+
 test("listPanesWithMarkers tolerates a window name containing spaces", () => {
   const run = fakeRun([["%1", "my session", "0", "main window", "1000", "claude", "f-1"]]);
   const panes = listPanesWithMarkers(run);
