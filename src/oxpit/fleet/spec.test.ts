@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { defaultFleet, loadFleetConfig, writeFleetScaffold } from "./spec.js";
+import { defaultFleet, loadFleetConfig, validateFleetSpec, writeFleetScaffold } from "./spec.js";
 
 function withDirs<T>(fn: (repoRoot: string, home: string) => T): T {
   const repoRoot = mkdtempSync(join(tmpdir(), "oxtail-spec-repo-"));
@@ -268,5 +268,32 @@ test("writeFleetScaffold writes a loadable .oxtail/fleet.json, then refuses to c
     const again = writeFleetScaffold(repoRoot, spec);
     assert.equal(again.ok, false, "must not clobber an existing config");
     if (!again.ok) assert.match(again.reason, /already exists/);
+
+    // …but the editor's explicit save (overwrite:true) DOES replace it.
+    const forced = writeFleetScaffold(repoRoot, { ...spec, name: "renamed" }, { overwrite: true });
+    assert.equal(forced.ok, true, "overwrite:true replaces an existing config");
+    const reloaded = loadFleetConfig(repoRoot, { home });
+    if (reloaded.ok) assert.equal(reloaded.spec.name, "renamed");
   });
+});
+
+test("validateFleetSpec accepts a good in-memory spec, rejects bad ones (editor's gate)", () => {
+  const good = validateFleetSpec({
+    name: "demo",
+    windows: [
+      { name: "main", agent: "claude", model: "opus[1m]", effort: "xhigh", remoteControl: true },
+      { name: "codex", agent: "codex", model: "gpt-5.5" },
+    ],
+  });
+  assert.equal(good.ok, true);
+
+  for (const bad of [
+    { name: "x", windows: [] }, // empty
+    { name: "x", windows: [{ name: "a", agent: "claude" }, { name: "a", agent: "codex" }] }, // dup names
+    { name: "x", windows: [{ name: "a", agent: "codex", remoteControl: true }] }, // rc on codex
+    { name: "x", windows: [{ name: "a", agent: "claude", effort: "MAX" }] }, // bad effort token
+  ]) {
+    const r = validateFleetSpec(bad);
+    assert.equal(r.ok, false, `should reject ${JSON.stringify(bad)}`);
+  }
 });

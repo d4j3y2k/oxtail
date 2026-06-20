@@ -130,12 +130,25 @@ export function projectFleetConfigPath(repoRoot: string): string {
 // effective spec so you don't author JSON from scratch. REFUSES to clobber an
 // existing config (edit it directly). The leading comment is JSONC-legal (the
 // loader uses jsonc-parser).
+// Validate an IN-MEMORY spec (what the in-TUI editor builds) against the same zod
+// schema the file loader uses — name uniqueness, tmux-safe window names, valid
+// effort tokens, claude-only remoteControl, etc. So the editor can refuse to spawn
+// or save an invalid fleet with the same messages a bad .oxtail/fleet.json gets.
+export function validateFleetSpec(
+  data: unknown,
+): { ok: true; spec: FleetSpec } | { ok: false; error: string } {
+  const parsed = FleetSchema.safeParse(data);
+  if (!parsed.success) return { ok: false, error: formatZodError(parsed.error) };
+  return { ok: true, spec: parsed.data };
+}
+
 export function writeFleetScaffold(
   repoRoot: string,
   spec: FleetSpec,
+  opts: { overwrite?: boolean } = {},
 ): { ok: true; path: string } | { ok: false; reason: string } {
   const path = projectFleetConfigPath(repoRoot);
-  if (existsSync(path)) {
+  if (!opts.overwrite && existsSync(path)) {
     return { ok: false, reason: `a config already exists at ${path} — edit it directly` };
   }
   try {

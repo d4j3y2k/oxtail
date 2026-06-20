@@ -24,7 +24,7 @@ import { NUDGE_TEXT, sendOperatorMessage } from "./operator.js";
 import { formatAttachmentNote, stageAttachment, type StagedAttachment } from "./attachments.js";
 import { captureClipboardImage } from "./clipboard.js";
 import { parseStatusArgs, USAGE } from "./cli.js";
-import { loadFleetConfig, writeFleetScaffold } from "./fleet/spec.js";
+import { loadFleetConfig, validateFleetSpec, writeFleetScaffold } from "./fleet/spec.js";
 import { renderSpawnPlan, spawnFleet, tmuxSessionExists, tmuxSessionName } from "./fleet/spawn.js";
 import { buildResetPlan, discoverFleetId, renderResetPlan, resetFleet } from "./fleet/reset.js";
 import { listPanesWithMarkers } from "./fleet/ownership.js";
@@ -217,6 +217,20 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       | { lines: string[]; canSpawn: boolean; spec: FleetSpec; sessionName: string }
       | null = null;
     let spawnBusy = false;
+    // Fleet config EDITOR (grid + hotkeys) — `S` opens this; edit windows in place,
+    // then `y` → the plan/confirm overlay → spawn, or `w` → save .oxtail/fleet.json.
+    type EditWin = {
+      name: string;
+      agent: "claude" | "codex";
+      model: string;
+      effort: string;
+      role: string;
+      remoteControl: boolean;
+    };
+    let fleetEdit: { fleetName: string; windows: EditWin[]; cursor: number; note: string } | null = null;
+    // Active when typing into a text field (name/model/fleet-name).
+    let fleetEditInput: { field: "name" | "model" | "fleetName"; buf: string } | null = null;
+    const EFFORT_CYCLE = ["", "low", "medium", "high", "xhigh", "max"];
     // RESET overlay (P6): a full-screen RED plan + survivors preview → DELIBERATE
     // confirm. `R` (capital, distinct from SPAWN) computes the dry-run plan for the
     // SELECTED agent's session and opens it; a SECOND `R` (NOT `y` — defeats SPAWN
@@ -297,7 +311,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "  l             toggle the comms-log bottom panel (fleet stays visible above)",
         "  w             open the selected agent's thread in the panel (per-agent)",
         "                in the panel: ↑↓ move the › cursor (or scroll an expanded msg) · w expand · j/k agents · f filter · ⏎ jump",
-        "  S             spawn a new agent fleet — shows the plan, y to confirm (refuses to clobber a live session)",
+        "  S             configure + spawn a fleet — grid editor (n/m/f/t/r edit a window · a/d add/delete · w save · y spawn)",
         "  R             RESET the selected agent's fleet — teardown + relaunch (red plan; R again to confirm, NOT y)",
         "  r             force refresh    ?  toggle help    ⌃C (Ctrl-C)  quit",
         "",
@@ -391,7 +405,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     // overlay / log mode, and for dead·self·pane-less rows. capturePaneActivity
     // re-verifies the pane id (a recycled id never captures a stranger).
     function maybeCaptureSelected(force: boolean): void {
-      if (composing || helpOpen || spawnOpen || resetOpen || mode === "log") return;
+      if (composing || helpOpen || spawnOpen || resetOpen || fleetEdit || mode === "log") return;
       const idx = selectedIndex();
       const a = idx >= 0 ? snapshot.agents[idx] : undefined;
       if (!a || a.liveness === "dead" || a.is_self || !a.tmux_pane) {
@@ -572,6 +586,10 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       const rows = stdout.rows || 24;
       if (helpOpen) {
         stdout.write(HOME + helpFrame(width, rows) + CLEAR_BELOW);
+        return;
+      }
+      if (fleetEdit) {
+        stdout.write(HOME + fleetEditorFrame(width, rows) + CLEAR_BELOW);
         return;
       }
       if (spawnOpen) {
@@ -756,38 +774,25 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     // per-window recipes, incl. the --effort flags), and pre-check the session-name
     // collision so the operator sees up-front whether `y` will run or is blocked.
     // Mutates nothing — the real spawn is doSpawn, gated behind the confirm.
-    function openSpawn(): void {
+    // Build + open the read-only SPAWN plan/confirm overlay for a spec — the "exactly
+    // what will run" screen reached from the editor's `y`. Pre-checks the collision
+    // for the gate; spawnFleet re-checks refuse-to-clobber inside its lock.
+    function openSpawnPlan(spec: FleetSpec, sessionName: string, sourceLine: string): void {
       if (spawnOpen || spawnBusy) return;
-      const cfg = loadFleetConfig(snapshot.project_root);
-      if (!cfg.ok) {
-        return setStatus(
-          warn(`spawn: fleet config invalid (${cfg.source}: ${cfg.path}) — ${cfg.error}`, opts.color),
-        );
-      }
-      const spec = cfg.spec;
-      const sessionName = tmuxSessionName(spec.name);
       const collision = tmuxSessionExists(sessionName);
       const b = (s: string) => (opts.color ? `\x1b[1m\x1b[36m${s}\x1b[0m` : s);
       const d = (s: string) => dim(s, opts.color);
       const lines: string[] = [
-        b("SPAWN — stand up a new agent fleet"),
-        d(`  fleet "${spec.name}" · source ${cfg.source}${cfg.path ? ` (${cfg.path})` : ""}`),
-        d(
-          `  → tmux session "${sessionName}" · ${spec.windows.length} window(s): ${spec.windows.map((w) => w.name).join(", ")}`,
-        ),
-        cfg.source === "default"
-          ? d("  customize: press w to write a .oxtail/fleet.json you can edit (window count · per-window model/effort/remote-control)")
-          : d(`  customize: edit ${cfg.path}`),
+        b("SPAWN — review & confirm"),
+        d(`  ${sourceLine}`),
+        d(`  → tmux session "${sessionName}" · ${spec.windows.length} window(s): ${spec.windows.map((w) => w.name).join(", ")}`),
         "",
       ];
       if (collision) {
         lines.push(
-          warn(
-            `  ⚠ a tmux session "${sessionName}" already exists — SPAWN is blocked here (it only CREATES, never clobbers).`,
-            opts.color,
-          ),
+          warn(`  ⚠ a tmux session "${sessionName}" already exists — SPAWN is blocked (it only CREATES, never clobbers).`, opts.color),
         );
-        lines.push(d("    spawn from a fresh repo, or RESET the existing fleet (coming soon)."));
+        lines.push(d("    rename the fleet (F in the editor), or RESET the existing fleet."));
         lines.push("");
       }
       lines.push(d("  plan — nothing runs until you confirm:"));
@@ -799,19 +804,207 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       paint();
     }
 
-    // Scaffold the effective spec to .oxtail/fleet.json so the operator has a
-    // starting point to edit (the "easy config" entry — `w` in the SPAWN overlay).
-    // Refuses to clobber an existing config. Closes the overlay so they can go edit.
-    function doScaffoldFleetConfig(): void {
-      if (!spawnView) return;
-      const r = writeFleetScaffold(snapshot.project_root, spawnView.spec);
-      spawnOpen = false;
-      spawnView = null;
-      if (r.ok) {
-        setStatus(ok(`✓ wrote ${r.path} — edit it, then press S to spawn the customized fleet`, opts.color));
-      } else {
-        setStatus(warn(`scaffold: ${r.reason}`, opts.color));
+    // ── fleet config EDITOR (grid + hotkeys) ───────────────────────────────────
+    // `S` opens this, seeded from the effective spec (project>global>default). Edit
+    // the windows in place; `y` → the plan/confirm overlay → spawn; `w` → save.
+    function openFleetEditor(): void {
+      if (fleetEdit || spawnOpen || spawnBusy || resetOpen) return;
+      const cfg = loadFleetConfig(snapshot.project_root);
+      if (!cfg.ok) {
+        return setStatus(warn(`config invalid (${cfg.source}: ${cfg.path}) — ${cfg.error} — fix or delete it`, opts.color));
       }
+      const windows: EditWin[] = cfg.spec.windows.map((w) => ({
+        name: w.name,
+        agent: w.agent,
+        model: w.model ?? "",
+        effort: w.effort ?? "",
+        role: w.role ?? "",
+        remoteControl: w.remoteControl ?? false,
+      }));
+      fleetEdit = {
+        fleetName: cfg.spec.name,
+        windows,
+        cursor: 0,
+        note: `source: ${cfg.source}${cfg.path ? ` (${cfg.path})` : ""}`,
+      };
+      paint();
+    }
+
+    // The edited grid → a FleetSpec (drop empty optional fields). Pure.
+    function specFromEdit(fe: NonNullable<typeof fleetEdit>): FleetSpec {
+      return {
+        name: fe.fleetName,
+        windows: fe.windows.map((w) => ({
+          name: w.name,
+          agent: w.agent,
+          ...(w.model.trim() ? { model: w.model.trim() } : {}),
+          ...(w.effort.trim() ? { effort: w.effort.trim() } : {}),
+          ...(w.role.trim() ? { role: w.role.trim() } : {}),
+          ...(w.remoteControl ? { remoteControl: true } : {}),
+        })),
+      };
+    }
+
+    // `w` — validate the grid, then OVERWRITE .oxtail/fleet.json with it.
+    function doSaveFromEdit(): void {
+      if (!fleetEdit) return;
+      const v = validateFleetSpec(specFromEdit(fleetEdit));
+      if (!v.ok) {
+        fleetEdit.note = `✗ ${v.error}`;
+        return paint();
+      }
+      const r = writeFleetScaffold(snapshot.project_root, v.spec, { overwrite: true });
+      fleetEdit.note = r.ok ? `✓ saved ${r.path}` : `✗ ${r.reason}`;
+      paint();
+    }
+
+    // `y` — validate the grid, then hand the spec to the plan/confirm overlay.
+    function doSpawnFromEdit(): void {
+      if (!fleetEdit) return;
+      const v = validateFleetSpec(specFromEdit(fleetEdit));
+      if (!v.ok) {
+        fleetEdit.note = `✗ cannot spawn: ${v.error}`;
+        return paint();
+      }
+      const spec = v.spec;
+      const sessionName = tmuxSessionName(spec.name);
+      fleetEdit = null;
+      fleetEditInput = null;
+      openSpawnPlan(spec, sessionName, "configured in oxpit (w in the editor saves it to .oxtail/fleet.json)");
+    }
+
+    // The editor grid (full-screen). The cursor row is inverse-video; a text-input
+    // line replaces the hotkey legend while editing name/model/fleet-name.
+    function fleetEditorFrame(width: number, rows: number): string {
+      if (!fleetEdit) return "";
+      const fe = fleetEdit;
+      const b = (s: string) => (opts.color ? `\x1b[1m\x1b[36m${s}\x1b[0m` : s);
+      const d = (s: string) => dim(s, opts.color);
+      const sessionName = tmuxSessionName(fe.fleetName);
+      const lines: string[] = [
+        b("SPAWN — configure fleet") + d(`     fleet "${fe.fleetName}" → session "${sessionName}"`),
+        d(`  ${fe.note}`),
+        "",
+        d("  " + "window".padEnd(14) + "agent".padEnd(8) + "model".padEnd(16) + "effort".padEnd(8) + "rc"),
+      ];
+      fe.windows.forEach((w, i) => {
+        const rc = w.agent === "claude" ? (w.remoteControl ? "on" : "off") : "–";
+        const cells =
+          (w.name || "(unnamed)").padEnd(14) +
+          w.agent.padEnd(8) +
+          (w.model || "–").padEnd(16) +
+          (w.effort || "–").padEnd(8) +
+          rc;
+        if (i === fe.cursor) {
+          lines.push(opts.color ? `\x1b[7m▸ ${cells}\x1b[0m` : `▸ ${cells}`);
+        } else {
+          lines.push(`  ${cells}`);
+        }
+      });
+      lines.push("");
+      if (fleetEditInput) {
+        lines.push(b(`  edit ${fleetEditInput.field}: ${fleetEditInput.buf}█`));
+        lines.push(d("  ⏎ ok · esc cancel"));
+      } else {
+        lines.push(d("  ↑↓ select · a add window · d delete"));
+        lines.push(d("  n name · m model · f effort · t type · r remote-control"));
+        lines.push(d("  F fleet-name · w save .oxtail/fleet.json · y SPAWN · esc cancel"));
+      }
+      return lines
+        .slice(0, Math.max(1, rows))
+        .map((l) => clipToWidth(l, width) + CLEAR_EOL)
+        .join("\n");
+    }
+
+    // Editor key state machine. Text-input mode (name/model/fleet-name) takes keys
+    // first; otherwise the grid hotkeys act on the cursor window.
+    function handleFleetEditKey(s: string): void {
+      const fe = fleetEdit;
+      if (!fe) return;
+      if (fleetEditInput) {
+        const inp = fleetEditInput;
+        if (s === "\x03") return teardown(0);
+        if (s === "\x1b") {
+          fleetEditInput = null;
+          return paint();
+        }
+        if (s[0] === "\x1b") return; // drop arrows/other escapes
+        if (s === "\r" || s === "\n") {
+          const val = inp.buf.trim();
+          if (inp.field === "fleetName") fe.fleetName = val || fe.fleetName;
+          else fe.windows[fe.cursor][inp.field] = val;
+          fleetEditInput = null;
+          return paint();
+        }
+        if (s === "\x7f" || s === "\b") {
+          inp.buf = inp.buf.slice(0, -1);
+          return paint();
+        }
+        inp.buf = (inp.buf + scrubBufferText(s, false)).slice(0, 80);
+        return paint();
+      }
+      const w = fe.windows[fe.cursor];
+      if (s === "\x1b") {
+        fleetEdit = null;
+        return paint();
+      }
+      if (s === "\x1b[A" || s === "k") {
+        fe.cursor = (fe.cursor - 1 + fe.windows.length) % fe.windows.length;
+        return paint();
+      }
+      if (s === "\x1b[B" || s === "j") {
+        fe.cursor = (fe.cursor + 1) % fe.windows.length;
+        return paint();
+      }
+      if (s === "n") {
+        fleetEditInput = { field: "name", buf: w.name };
+        return paint();
+      }
+      if (s === "m") {
+        fleetEditInput = { field: "model", buf: w.model };
+        return paint();
+      }
+      if (s === "F") {
+        fleetEditInput = { field: "fleetName", buf: fe.fleetName };
+        return paint();
+      }
+      if (s === "f") {
+        const i = EFFORT_CYCLE.indexOf(w.effort);
+        w.effort = EFFORT_CYCLE[(i + 1) % EFFORT_CYCLE.length];
+        return paint();
+      }
+      if (s === "t") {
+        w.agent = w.agent === "claude" ? "codex" : "claude";
+        if (w.agent === "codex") w.remoteControl = false; // /rc is claude-only
+        return paint();
+      }
+      if (s === "r") {
+        if (w.agent !== "claude") {
+          fe.note = "remote control is Claude-only";
+          return paint();
+        }
+        w.remoteControl = !w.remoteControl;
+        return paint();
+      }
+      if (s === "a") {
+        let name = `win${fe.windows.length + 1}`;
+        while (fe.windows.some((x) => x.name === name)) name += "x";
+        fe.windows.push({ name, agent: "claude", model: "", effort: "", role: "", remoteControl: false });
+        fe.cursor = fe.windows.length - 1;
+        fe.note = `added window "${name}" — set its model/effort/type`;
+        return paint();
+      }
+      if (s === "d") {
+        if (fe.windows.length <= 1) {
+          fe.note = "a fleet needs at least one window";
+          return paint();
+        }
+        fe.windows.splice(fe.cursor, 1);
+        if (fe.cursor >= fe.windows.length) fe.cursor = fe.windows.length - 1;
+        return paint();
+      }
+      if (s === "w") return doSaveFromEdit();
+      if (s === "y") return doSpawnFromEdit();
     }
 
     // Execute the previewed SPAWN for real (non-dry-run). Doubly guarded: the overlay
@@ -867,8 +1060,8 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       const prompt = spawnBusy
         ? d("  working… (Ctrl-C aborts the cockpit)")
         : spawnView.canSpawn
-          ? warn("  press y to SPAWN · w to save this as .oxtail/fleet.json · any other key to cancel", opts.color)
-          : warn("  w to save this as .oxtail/fleet.json · any other key to close", opts.color);
+          ? warn("  press y to SPAWN · any other key to go back", opts.color)
+          : warn("  press any key to go back", opts.color);
       const budget = Math.max(1, rows - 1); // reserve the prompt row
       let shown = spawnView.lines;
       if (shown.length > budget) {
@@ -1231,12 +1424,12 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (s === "\x03") return teardown(0); // Ctrl-C only — `q` is intentionally NOT a
       // quit (too easy to fat-finger next to the nav keys; David 2026-06-17). It falls
       // through to a harmless no-op in every mode.
+      if (fleetEdit) return handleFleetEditKey(s); // the config editor owns all keys while open
       if (spawnOpen) {
         // SPAWN confirm gate: while a spawn is in flight, swallow keys (Ctrl-C above
-        // still aborts the cockpit); `w` scaffolds the config (overlay stays open);
-        // `y` (only when not collision-blocked) executes; ANY other key cancels.
+        // still aborts the cockpit); `y` (only when not collision-blocked) executes;
+        // ANY other key cancels back to the cockpit (re-open with S to reconfigure).
         if (spawnBusy) return;
-        if (s === "w") return doScaffoldFleetConfig();
         if (spawnView?.canSpawn && s === "y") return doSpawn();
         spawnOpen = false;
         spawnView = null;
@@ -1328,7 +1521,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         );
       }
       if (s === "m") return startCompose();
-      if (s === "S") return openSpawn(); // capital-S: deliberate (no fat-finger), opens the plan
+      if (s === "S") return openFleetEditor(); // capital-S: open the fleet config editor → spawn
       if (s === "R") return openReset(); // capital-R: RESET the selected agent's fleet (red plan)
       if (s === "w") {
         // item 4: open the selected agent's thread (filtered) in the bottom panel,
