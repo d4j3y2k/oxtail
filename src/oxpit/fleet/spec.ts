@@ -62,6 +62,15 @@ const FleetSchema = z
 // The standing fleet (David's roles): main captain + max big-brain + codex. The
 // fleet NAME is derived per-load from the repo basename so two repos don't share
 // a tmux session / ownership fleetId; only the WINDOWS are constant here.
+//
+// EFFORT is asymmetric BY DESIGN, respecting each client's idiom (max Q2): the
+// Claude windows PIN effort explicitly because Claude has no persistent effort
+// config — the spec is its only home, and it's exactly what distinguishes
+// main=xhigh from max=max. The codex window deliberately OMITS effort, so it is
+// NOT pinned to a level for everyone: a spawned codex runs at the operator's OWN
+// ~/.codex/config.toml level (this fleet's box happens to be xhigh there).
+// Injecting `-c model_reasoning_effort` by default would shadow the user's own
+// config — surprising — so "your codex, your config.toml" is the default.
 const DEFAULT_WINDOWS: FleetSpec["windows"] = [
   { name: "main", agent: "claude", model: "opus-4.8", effort: "xhigh", role: "captain" },
   { name: "max", agent: "claude", model: "opus-4.8", effort: "max" },

@@ -13,9 +13,10 @@
 // ("zsh"). So the only thing the command reliably tells us is shell-vs-not. Type
 // + ownership come from oxpit's `@oxpit_managed` marker (set at our spawn,
 // preserved across respawn -k): a non-shell pane carrying THIS fleet's marker is
-// the agent we put there (its model/effort are in-TUI and intentionally NOT
-// re-verified — config changes go through RESET/--force); a non-shell pane we
-// did not mark is never ours to relaunch on top of.
+// the agent we put there (its model/effort were set by launch-time argv flags
+// and are intentionally NOT re-verified by the probe — config changes go through
+// RESET/--force); a non-shell pane we did not mark is never ours to relaunch on
+// top of.
 //
 // Dispatch (P2 — SPAWN; teardown of half-up/wrong-type deferred to RESET/P6):
 //   empty-shell        → launch (run the recipe, then mark the pane managed)
@@ -97,7 +98,8 @@ export function isAgentLiveInPane(
 //
 // marker semantics (max Q1): a marker means "this pane is OURS / occupied by what
 // we spawned", NOT that the byte-identical model/effort is running (those are
-// in-TUI and not re-verified — config changes go through RESET/--force). An
+// launch-time argv flags, not re-verified by the probe — config changes go
+// through RESET/--force). An
 // operator hand-swap within the same pane keeps the marker (pane option), so we
 // NO-OP — safe, by design.
 export function classifyOccupancy(
