@@ -150,3 +150,44 @@ test("a control character in a window name is rejected (FS-separator safety)", (
     if (!r.ok) assert.match(r.error, /control characters/);
   });
 });
+
+test("valid effort level tokens are accepted", () => {
+  withDirs((repoRoot, home) => {
+    for (const lvl of ["low", "medium", "high", "xhigh", "max", "minimal"]) {
+      writeConfig(
+        repoRoot,
+        JSON.stringify({ name: "x", windows: [{ name: "main", agent: "claude", effort: lvl }] }),
+      );
+      const r = loadFleetConfig(repoRoot, { home });
+      assert.equal(r.ok, true, `effort ${lvl} should be accepted`);
+    }
+  });
+});
+
+test("a hostile effort value is rejected — no Codex `-c` TOML/shell injection", () => {
+  withDirs((repoRoot, home) => {
+    // Effort flows into Codex's `-c model_reasoning_effort="<v>"` override, which
+    // Codex re-parses as TOML; a value bearing a quote/comma could inject OTHER
+    // config keys. The level-token shape bans every metacharacter, so the attack
+    // surface is closed at the spec boundary (defense-in-depth with the shell
+    // quoting in recipes.ts). Also rejects uppercase / underscores / empty.
+    const hostile = [
+      `xhigh"`,
+      `high", model="evil`,
+      `max ; rm -rf ~`,
+      `x=y`,
+      `UP`,
+      `x_y`,
+      ``,
+    ];
+    for (const bad of hostile) {
+      writeConfig(
+        repoRoot,
+        JSON.stringify({ name: "x", windows: [{ name: "main", agent: "claude", effort: bad }] }),
+      );
+      const r = loadFleetConfig(repoRoot, { home });
+      assert.equal(r.ok, false, `effort ${JSON.stringify(bad)} should be rejected`);
+      if (!r.ok) assert.match(r.error, /invalid fleet spec/);
+    }
+  });
+});

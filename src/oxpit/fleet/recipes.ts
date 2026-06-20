@@ -68,17 +68,35 @@ export function shellSingleQuote(s: string): string {
 
 // Build the launch command line typed into the empty shell. Keeping the launch
 // a CHILD of the pane shell is what lets readiness.ts bind the artifact's host
-// pid to this pane. The spec's `model` field IS the value the client's --model
-// flag accepts (the spec author owns it; no hardcoded id mapping here) — and it
-// is shell-quoted because it is untrusted spec input.
+// pid to this pane. The spec's `model`/`effort` fields ARE the values the
+// client's flags accept (the spec author owns them; no hardcoded id mapping
+// here) — and they are shell-quoted because they are untrusted spec input.
 //
-// NOTE (P3): the exact flag name and effort application (launch flag vs in-TUI
-// chord) are finalized + live-verified in P3. `--model` is the first cut;
-// effort is intentionally deferred to a chord step rather than guessed here.
+// Effort is a LAUNCH FLAG for BOTH clients (verified against each CLI: `claude
+// --help` lists `--effort <level>`; `codex --help` lists `-c <key=value>` and
+// ~/.codex/config.toml keys it as `model_reasoning_effort`). So there is NO
+// in-TUI chord and no external-verification problem — effort is applied as
+// deterministically as the model:
+//   • Claude → `--effort <level>`  (first-class flag; low|medium|high|xhigh|max).
+//   • Codex  → `-c model_reasoning_effort="<level>"`  (a config override that
+//     supersedes ~/.codex/config.toml for THIS launch only; same key the
+//     persistent config uses). Codex re-parses the value as TOML, so its
+//     injection-safety rests on the spec's effort-token constraint (spec.ts
+//     `effortStr` bans `"`/`=`/commas); shellSingleQuote then makes the whole
+//     `key="value"` a single shell token. The default fleet sets no Codex effort,
+//     so a default-fleet Codex inherits config.toml — this path is for custom
+//     specs.
 export function buildLaunchCommand(window: FleetWindowSpec): string {
   const base = window.agent === "claude" ? "claude" : "codex";
   const parts = [base];
   if (window.model) parts.push("--model", shellSingleQuote(window.model));
+  if (window.effort) {
+    if (window.agent === "claude") {
+      parts.push("--effort", shellSingleQuote(window.effort));
+    } else {
+      parts.push("-c", shellSingleQuote(`model_reasoning_effort="${window.effort}"`));
+    }
+  }
   return parts.join(" ");
 }
 

@@ -31,9 +31,30 @@ test("clientTypeFor maps the AgentKind to oxtail's ClientType", () => {
 });
 
 test("buildLaunchCommand shell-quotes the spec model into --model", () => {
-  assert.equal(buildLaunchCommand(main), "claude --model 'opus-4.8'");
+  assert.equal(buildLaunchCommand(main), "claude --model 'opus-4.8' --effort 'xhigh'");
   assert.equal(buildLaunchCommand(codexWin), "codex --model 'gpt-5.5'");
   assert.equal(buildLaunchCommand({ name: "x", agent: "claude" }), "claude");
+});
+
+test("buildLaunchCommand applies effort as a launch flag per client", () => {
+  // Claude: first-class --effort flag (verified in `claude --help`).
+  assert.equal(
+    buildLaunchCommand({ name: "max", agent: "claude", model: "opus-4.8", effort: "max" }),
+    "claude --model 'opus-4.8' --effort 'max'",
+  );
+  assert.equal(
+    buildLaunchCommand({ name: "main", agent: "claude", effort: "xhigh" }),
+    "claude --effort 'xhigh'",
+  );
+  // Codex: a `-c` config override on the same key its config.toml uses, value
+  // TOML-quoted to match the documented `-c model="o3"` form, and the whole
+  // key="value" kept a single shell-quoted token (no command injection).
+  assert.equal(
+    buildLaunchCommand({ name: "codex", agent: "codex", model: "gpt-5.5", effort: "high" }),
+    `codex --model 'gpt-5.5' -c 'model_reasoning_effort="high"'`,
+  );
+  // No effort → no flag: a default-fleet Codex inherits ~/.codex/config.toml.
+  assert.equal(buildLaunchCommand(codexWin), "codex --model 'gpt-5.5'");
 });
 
 test("buildLaunchCommand neutralizes shell metacharacters in a hostile spec model", () => {
@@ -52,7 +73,10 @@ test("shellSingleQuote escapes embedded single quotes", () => {
 test("buildRecipe: Claude omits joinClaim (hook auto-joins)", () => {
   const r = buildRecipe(main);
   assert.deepEqual(r.steps.map((s) => s.op), ["sendLiteral", "waitExternal", "claimCheck"]);
-  assert.equal(r.steps[0].op === "sendLiteral" && r.steps[0].text, "claude --model 'opus-4.8'");
+  assert.equal(
+    r.steps[0].op === "sendLiteral" && r.steps[0].text,
+    "claude --model 'opus-4.8' --effort 'xhigh'",
+  );
   assert.equal(r.steps[1].op === "waitExternal" && r.steps[1].artifact, "claude");
 });
 
@@ -76,8 +100,8 @@ test("recipesForFleet maps each window to a recipe", () => {
 test("renderRecipe prints exact, reviewable dry-run steps", () => {
   const out = renderRecipe(buildRecipe(main));
   assert.match(out, /recipe: claude "main \(captain\)"/);
-  assert.match(out, /launch: claude --model 'opus-4\.8'/);
-  assert.match(out, /1\. sendLiteral "claude --model 'opus-4\.8'"/);
+  assert.match(out, /launch: claude --model 'opus-4\.8' --effort 'xhigh'/);
+  assert.match(out, /1\. sendLiteral "claude --model 'opus-4\.8' --effort 'xhigh'"/);
   assert.match(out, /2\. waitExternal claude/);
   assert.match(out, /3\. claimCheck/);
 });
@@ -109,7 +133,7 @@ test("happy path: binds the session and confirms the claim", async () => {
   const res = await executeRecipe(buildRecipe(main), effects);
   assert.equal(res.ok, true);
   if (res.ok) assert.equal(res.sessionId, "sid-xyz");
-  assert.deepEqual(sent, ["claude --model 'opus-4.8'"]);
+  assert.deepEqual(sent, ["claude --model 'opus-4.8' --effort 'xhigh'"]);
 });
 
 test("Codex happy path fires cooperativeJoin with the bound id, then confirms", async () => {

@@ -25,11 +25,28 @@ const safeStr = z
   .string()
   .regex(/^[^\u0000-\u001f\u007f]+$/, "must be non-empty and free of control characters");
 
+// Effort is the ONE spec field interpolated into a value that gets re-parsed
+// downstream: Codex applies it via `-c model_reasoning_effort="<level>"`, which
+// Codex reads as TOML. The whole launch token is also shell-single-quoted
+// (recipes.ts), so SHELL injection is closed there — but the value still reaches
+// Codex's TOML parser, where an embedded `"` could break out of the string and
+// inject OTHER config keys (TOML injection, distinct from shell injection). So
+// constrain effort to the level-token SHAPE — lowercase letters + hyphen — which
+// makes quotes / `=` / commas / whitespace structurally impossible, rather than
+// an exact enum so a future level (e.g. "ultra") needs no code bump. Real
+// levels: low, medium, high, xhigh, max (Claude); minimal..xhigh (Codex).
+const effortStr = z
+  .string()
+  .regex(
+    /^[a-z][a-z-]{0,23}$/,
+    "effort must be a lowercase level token (e.g. low, medium, high, xhigh, max)",
+  );
+
 const WindowSchema = z.object({
   name: safeStr,
   agent: z.enum(["claude", "codex"]),
   model: safeStr.optional(),
-  effort: safeStr.optional(),
+  effort: effortStr.optional(),
   role: safeStr.optional(),
 });
 
