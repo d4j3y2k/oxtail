@@ -10,6 +10,7 @@ import {
   type RecipeEffects,
   type RecipeStep,
   renderRecipe,
+  shellSingleQuote,
 } from "./recipes.js";
 import type { FleetWindowSpec } from "./types.js";
 
@@ -27,24 +28,37 @@ test("clientTypeFor maps the AgentKind to oxtail's ClientType", () => {
   assert.equal(clientTypeFor("codex"), "codex");
 });
 
-test("buildLaunchCommand passes the spec model straight to --model", () => {
-  assert.equal(buildLaunchCommand(main), "claude --model opus-4.8");
-  assert.equal(buildLaunchCommand(codexWin), "codex --model gpt-5.5");
+test("buildLaunchCommand shell-quotes the spec model into --model", () => {
+  assert.equal(buildLaunchCommand(main), "claude --model 'opus-4.8'");
+  assert.equal(buildLaunchCommand(codexWin), "codex --model 'gpt-5.5'");
   assert.equal(buildLaunchCommand({ name: "x", agent: "claude" }), "claude");
+});
+
+test("buildLaunchCommand neutralizes shell metacharacters in a hostile spec model", () => {
+  // A repo .oxtail/fleet.json must not be able to run a second command on SPAWN.
+  const evil = buildLaunchCommand({ name: "x", agent: "codex", model: "gpt-5.5; touch /tmp/pwn" });
+  assert.equal(evil, "codex --model 'gpt-5.5; touch /tmp/pwn'");
+  // The metachars live INSIDE the single-quoted token — the shell sees one arg.
+  assert.ok(!/;\s*touch/.test(evil.replace(/'[^']*'/g, "''")), "no bare ; survives outside quotes");
+});
+
+test("shellSingleQuote escapes embedded single quotes", () => {
+  assert.equal(shellSingleQuote("o'clock"), `'o'\\''clock'`);
+  assert.equal(shellSingleQuote("plain"), "'plain'");
 });
 
 test("buildRecipe emits the minimal validated SPAWN sequence", () => {
   const r = buildRecipe(main);
   assert.deepEqual(r.steps.map((s) => s.op), ["sendLiteral", "waitExternal", "claimCheck"]);
-  assert.equal(r.steps[0].op === "sendLiteral" && r.steps[0].text, "claude --model opus-4.8");
+  assert.equal(r.steps[0].op === "sendLiteral" && r.steps[0].text, "claude --model 'opus-4.8'");
   assert.equal(r.steps[1].op === "waitExternal" && r.steps[1].artifact, "claude");
 });
 
 test("renderRecipe prints exact, reviewable dry-run steps", () => {
   const out = renderRecipe(buildRecipe(main));
   assert.match(out, /recipe: claude "main \(captain\)"/);
-  assert.match(out, /launch: claude --model opus-4\.8/);
-  assert.match(out, /1\. sendLiteral "claude --model opus-4\.8"/);
+  assert.match(out, /launch: claude --model 'opus-4\.8'/);
+  assert.match(out, /1\. sendLiteral "claude --model 'opus-4\.8'"/);
   assert.match(out, /2\. waitExternal claude/);
   assert.match(out, /3\. claimCheck/);
 });
@@ -73,7 +87,7 @@ test("happy path: binds the session and confirms the claim", async () => {
   const res = await executeRecipe(buildRecipe(main), effects);
   assert.equal(res.ok, true);
   if (res.ok) assert.equal(res.sessionId, "sid-xyz");
-  assert.deepEqual(sent, ["claude --model opus-4.8"]);
+  assert.deepEqual(sent, ["claude --model 'opus-4.8'"]);
 });
 
 test("waitExternal failure stops the recipe with that reason", async () => {

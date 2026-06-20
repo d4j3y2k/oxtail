@@ -49,10 +49,22 @@ export function clientTypeFor(kind: AgentKind): ClientType {
   return kind === "claude" ? "claude-code" : "codex";
 }
 
+// Single-quote a value so the interactive shell we type the launch into treats
+// it as ONE literal token. `tmux send-keys -l` stops tmux KEY parsing, but the
+// SHELL still interprets `;` backticks `$()` `|` `>` spaces etc — so every
+// SPEC-DERIVED value (which in P3 comes from a repo's .oxtail/fleet.json) MUST
+// be quoted before it joins the command line, or a model like
+// `gpt-5.5; rm -rf ~` would run as a second command on SPAWN (codex P2 BLOCK #1).
+// Constant code tokens (the base command, flag names) are trusted and unquoted.
+export function shellSingleQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
 // Build the launch command line typed into the empty shell. Keeping the launch
 // a CHILD of the pane shell is what lets readiness.ts bind the artifact's host
 // pid to this pane. The spec's `model` field IS the value the client's --model
-// flag accepts (the spec author owns it; no hardcoded id mapping here).
+// flag accepts (the spec author owns it; no hardcoded id mapping here) — and it
+// is shell-quoted because it is untrusted spec input.
 //
 // NOTE (P3): the exact flag name and effort application (launch flag vs in-TUI
 // chord) are finalized + live-verified in P3. `--model` is the first cut;
@@ -60,7 +72,7 @@ export function clientTypeFor(kind: AgentKind): ClientType {
 export function buildLaunchCommand(window: FleetWindowSpec): string {
   const base = window.agent === "claude" ? "claude" : "codex";
   const parts = [base];
-  if (window.model) parts.push("--model", window.model);
+  if (window.model) parts.push("--model", shellSingleQuote(window.model));
   return parts.join(" ");
 }
 
@@ -68,6 +80,14 @@ export function buildLaunchCommand(window: FleetWindowSpec): string {
 // launch artifact to bind the session, confirm registry adoption. Effort/join
 // chords are added in P3 (the DSL supports them; this keeps P2 to the path the
 // spikes proved).
+//
+// PHASING (max Q4): this sequence is validated for CLAUDE — its hook auto-joins,
+// so claimCheck's pane-bound registry entry appears on its own. A fresh CODEX
+// does NOT auto-join (CODEX_THREAD_ID is stripped from its MCP child), so its
+// claimCheck CANNOT pass until P3 inserts a `sendLiteral(<cooperative join with
+// the rollout thread-id>)` step BEFORE claimCheck. Until then a Codex SPAWN
+// correctly aborts at claimCheck — "suite green" means the Claude path, not that
+// Codex SPAWN works yet.
 export function buildRecipe(window: FleetWindowSpec): Recipe {
   const launchCommand = buildLaunchCommand(window);
   return {
@@ -123,7 +143,11 @@ export interface RecipeEffects {
   waitExternal: (
     artifact: AgentKind,
   ) => Promise<{ ok: true; sessionId: string } | { ok: false; reason: string }>;
-  claimCheck: (sessionId: string) => boolean;
+  // External confirmation the bound session is now addressable. May poll (it
+  // waits out registry-adoption lag), so it returns a promise; a sync boolean is
+  // also accepted (tests). MUST be pane-bound, not bare sid presence — see
+  // ensure-window.ts isClaimPaneBound (codex P2 BLOCK #2).
+  claimCheck: (sessionId: string) => boolean | Promise<boolean>;
   log?: (msg: string) => void;
 }
 
@@ -194,7 +218,7 @@ export async function executeRecipe(recipe: Recipe, fx: RecipeEffects): Promise<
             sessionId,
           };
         }
-        if (!fx.claimCheck(sessionId)) {
+        if (!(await fx.claimCheck(sessionId))) {
           return {
             ok: false,
             failed: step,

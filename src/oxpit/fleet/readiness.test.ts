@@ -104,14 +104,30 @@ test("an artifact born before the launch floor is rejected (stale leftover)", ()
   assert.equal(res.status, "pending");
 });
 
-test("same-second artifact within the skew floor is accepted", () => {
-  // born 1.5s before the ms-granular launch instant — inside MTIME_FLOOR_SKEW_MS
+test("claude: a drop 1.5s before launch is accepted (whole-second written_at grace)", () => {
   const res = selectBoundArtifact(
-    "codex",
-    [obs({ sessionId: "edge", bornAtMs: 8_500 })],
+    "claude",
+    [obs({ sessionId: "edge", hostPpid: 7, bornAtMs: 8_500 })],
     ctx({ launchInstantMs: 10_000 }),
   );
   assert.equal(res.status, "ready");
+});
+
+test("codex floor is TIGHT: a rollout 0.5s before launch is rejected, 0.1s is ok", () => {
+  // ms-granular birthtime → only a hair of jitter tolerated (max A4a), shrinking
+  // the window a foreign same-cwd rollout could sneak through.
+  const early = selectBoundArtifact(
+    "codex",
+    [obs({ sessionId: "foreign", bornAtMs: 9_500 })],
+    ctx({ launchInstantMs: 10_000 }),
+  );
+  assert.equal(early.status, "pending");
+  const ours = selectBoundArtifact(
+    "codex",
+    [obs({ sessionId: "ours", bornAtMs: 9_900 })],
+    ctx({ launchInstantMs: 10_000 }),
+  );
+  assert.equal(ours.status, "ready");
 });
 
 test("two co-fresh same-cwd artifacts are AMBIGUOUS, never guessed", () => {

@@ -44,11 +44,15 @@ export interface ArtifactObservation {
   path: string; // artifact file path — diagnostics only
 }
 
-// written_at is whole-second (so a same-second artifact can read slightly BEFORE
-// a ms-granular launch instant), plus a touch of clock skew. New-file identity
-// (baseline diff) is the primary disambiguator; this floor only guards a stale
-// drop that slipped in between snapshot and launch.
-const MTIME_FLOOR_SKEW_MS = 2_000;
+// Per-client mtime-floor skew (max A4a). Claude drops carry a WHOLE-SECOND
+// written_at, so a same-second drop can read up to ~1s before a ms-granular
+// launch instant → 2s grace. Codex rollouts carry ms-granular birthtimeMs, so
+// they need only a hair of clock jitter — a wide grace there needlessly widens
+// the window in which a foreign same-cwd rollout could pass the floor. New-file
+// identity (baseline diff) is the primary disambiguator; this floor is the
+// secondary guard against a stale artifact slipping in between snapshot+launch.
+const CLAUDE_FLOOR_SKEW_MS = 2_000;
+const CODEX_FLOOR_SKEW_MS = 250;
 
 const UUID_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/;
 
@@ -206,10 +210,11 @@ export function selectBoundArtifact(
   observations: ArtifactObservation[],
   ctx: SelectCtx,
 ): SelectResult {
+  const floorSkew = kind === "claude" ? CLAUDE_FLOOR_SKEW_MS : CODEX_FLOOR_SKEW_MS;
   const fresh = observations.filter(
     (o) =>
       !ctx.baseline.has(o.sessionId) &&
-      o.bornAtMs >= ctx.launchInstantMs - MTIME_FLOOR_SKEW_MS &&
+      o.bornAtMs >= ctx.launchInstantMs - floorSkew &&
       cwdMatches(o.cwd, ctx.cwd),
   );
   const bound =

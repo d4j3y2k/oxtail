@@ -3,10 +3,12 @@ import { test } from "node:test";
 import {
   classifyOccupancy,
   ensureWindow,
+  isClaimPaneBound,
   isShellCommand,
   type EnsureWindowDeps,
   type OccupancyProbe,
 } from "./ensure-window.js";
+import type { RegistryEntry } from "../../registry.js";
 import type { RecipeResult } from "./recipes.js";
 import type { FleetWindowSpec } from "./types.js";
 
@@ -146,4 +148,59 @@ test("launch failure → aborts with the recipe reason + a pane dump, does NOT m
   assert.match(res.reason ?? "", /drop never bound to pane/);
   assert.equal(res.paneDump, "PANE DUMP");
   assert.equal(marked, false);
+});
+
+test("A3: a THROWING mark → launched-but-UNMANAGED (not a failure masquerade)", async () => {
+  const res = await ensureWindow(
+    { target: "%5", window: main, fleetId: FLEET, cwd: "/repo" },
+    deps({
+      mark: () => {
+        throw new Error("tmux set-option exit 1");
+      },
+    }),
+  );
+  assert.equal(res.action, "launched");
+  assert.equal(res.ok, true); // the launch SUCCEEDED — don't mask it as a failure
+  assert.equal(res.sessionId, "sid-new");
+  assert.match(res.reason ?? "", /UNMANAGED/);
+});
+
+// ── isClaimPaneBound (the pane-bound claim, codex BLOCK #2 / max A1) ────────────
+
+function entry(over: Partial<RegistryEntry> & { server_pid: number }): RegistryEntry {
+  return {
+    started_at: 1,
+    client: { type: "claude-code", session_id: "sid", transcript_path: null, session_id_source: "env", cwd: "/repo" },
+    tmux_pane: "%5",
+    tmux_session: "s",
+    state: null,
+    ...over,
+  } as RegistryEntry;
+}
+
+test("claim binds only when type + cwd match AND server_pid resolves to OUR pane", () => {
+  const e = entry({ server_pid: 100 });
+  assert.ok(
+    isClaimPaneBound("sid", { target: "%5", agent: "claude", cwd: "/repo" }, {
+      readAll: () => [e],
+      resolvePane: (pid) => (pid === 100 ? "%5" : null),
+    }),
+  );
+});
+
+test("claim does NOT bind when the entry's pid resolves to a DIFFERENT pane", () => {
+  const e = entry({ server_pid: 100 });
+  assert.ok(
+    !isClaimPaneBound("sid", { target: "%5", agent: "claude", cwd: "/repo" }, {
+      readAll: () => [e],
+      resolvePane: () => "%9", // some other pane (or a dead/passive entry)
+    }),
+  );
+});
+
+test("claim does NOT bind on a wrong client type or wrong cwd (same sid)", () => {
+  const wrongType = entry({ server_pid: 100, client: { type: "codex", session_id: "sid", transcript_path: null, session_id_source: "env", cwd: "/repo" } });
+  const wrongCwd = entry({ server_pid: 101, client: { type: "claude-code", session_id: "sid", transcript_path: null, session_id_source: "env", cwd: "/elsewhere" } });
+  const deps2 = { readAll: () => [wrongType, wrongCwd], resolvePane: () => "%5" };
+  assert.ok(!isClaimPaneBound("sid", { target: "%5", agent: "claude", cwd: "/repo" }, deps2));
 });
