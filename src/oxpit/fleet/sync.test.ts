@@ -325,3 +325,45 @@ test("syncFleet HIGH (compile-sim): a remove-target RENAMED during the ADD/KEEP 
     assert.equal(res.ok, false, "a skipped drift makes the sync not-ok (re-run converges)");
   });
 });
+
+test("syncFleet (codex M1): a KEEP failure is REPORTED but does NOT block the deletes (ADD-only gate)", async () => {
+  await withRepo(async (repoRoot) => {
+    // live: main(%1) + max(%2), both ours. spec keeps main, removes max. The KEEP ensure of
+    // main FAILS (a transient probe-null) — but max must STILL be deleted (a KEEP is not the
+    // "replacement" the gate guards; an ADD is).
+    const fx = fakeSync([row({ pane: "%1", windowName: "main" }), row({ pane: "%2", windowName: "max" })]);
+    const failingKeepEnsure = async (o: { window: FleetWindowSpec }): Promise<EnsureWindowResult> => {
+      fx.seq.push(`ensure:${o.window.name}`);
+      const ok = o.window.name !== "main"; // the KEEP of "main" fails transiently
+      return {
+        window: o.window.name,
+        occupancy: ok ? "empty-shell" : "unknown",
+        action: ok ? "launched" : "aborted",
+        ok,
+        sessionId: ok ? "x" : null,
+        reason: ok ? undefined : "probe null (transient)",
+      };
+    };
+    const res = await syncFleet({ name: "oxtail", windows: [{ name: "main", agent: "claude" }] }, repoRoot, "oxtail", {
+      dryRun: false,
+      run: fx.run,
+      ensure: failingKeepEnsure,
+      kill: fx.kill,
+    });
+    assert.ok(fx.seq.includes("kill:%2"), "the delete is NOT blocked by a KEEP failure");
+    assert.equal(res.ok, false, "but the KEEP failure makes the sync result not-ok (visible)");
+    assert.ok(res.kept.some((k) => !k.ok), "the failed KEEP is reported in the result");
+  });
+});
+
+test("renderSyncPlan (codex M2): a duplicate-name DELETE is annotated as a duplicate of the kept window", () => {
+  // two managed "main" panes (%1, %5); spec has one "main" → %1 kept, %5 removed (stray).
+  const panes = [
+    pane({ pane: "%1", windowName: "main", managedBy: FID }),
+    pane({ pane: "%5", windowName: "main", managedBy: FID }),
+  ];
+  const specOne: FleetSpec = { name: "fleet", windows: [{ name: "main", agent: "claude" }] };
+  const out = renderSyncPlan(specOne, FID, "sess", computeSyncPlan(specOne, FID, panes));
+  assert.match(out, /- DELETE/);
+  assert.match(out, /duplicate of kept "main"/, "the duplicate-name delete is annotated so the operator sees WHY one main dies");
+});

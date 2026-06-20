@@ -70,9 +70,14 @@ export function renderSyncPlan(spec: FleetSpec, fleetId: string, sessionName: st
     }
   }
   if (plan.remove.length) {
+    // A DELETE whose windowName ALSO appears in the KEEP set is a DUPLICATE — two of our
+    // panes share the name, the spec keeps one, so the extra copy dies. Annotate it so the
+    // operator understands why one "main" is kept while another "main" is deleted (codex UX).
+    const keptNames = new Set(plan.keep.map((k) => k.window.name));
     lines.push(`  - DELETE (ours, removed from the spec → kill-window): ${plan.remove.length}`);
     for (const p of plan.remove) {
-      lines.push(`    - ${p.pane} ${p.session}:${p.windowIndex} "${p.windowName}" (${p.currentCommand}, pid ${p.panePid})`);
+      const dup = keptNames.has(p.windowName) ? ` — duplicate of kept "${p.windowName}"` : "";
+      lines.push(`    - ${p.pane} ${p.session}:${p.windowIndex} "${p.windowName}" (${p.currentCommand}, pid ${p.panePid})${dup}`);
     }
   }
   if (plan.survivors.length) {
@@ -281,11 +286,14 @@ export async function syncFleet(
     for (const { window, pane } of plan.keep) {
       kept.push(await ensure({ target: pane.pane, window, fleetId, cwd: repoRoot, sessionName }, ensureDeps()));
     }
-    // DELETE last — but ONLY if every ADD + KEEP succeeded (codex MEDIUM): never tear
-    // down a fleet member while a replacement is degraded (an ADD that failed to launch).
-    // kill-window passes the live fleetId as the EXPECTED identity (codex HIGH) so a pane
-    // re-marked since the plan is refused, not killed.
-    const addKeepOk = added.every((a) => a.ok) && kept.every((k) => k.ok);
+    // DELETE last — but ONLY if every ADD succeeded (codex MEDIUM, refined by compile-sim):
+    // the "replacement" a delete must not race is an ADD, not a KEEP. A KEEP failure (often
+    // a TRANSIENT probe-null on an already-running agent) still makes the result not-ok and
+    // visible, but must NOT block the deletes — else one flaky tmux read on a healthy kept
+    // window aborts the whole converge. So a failed ADD blocks ALL deletes; a failed KEEP is
+    // reported, not blocking. kill-window also passes the live fleetId as the EXPECTED
+    // identity (codex HIGH) so a pane re-marked since the plan is refused, not killed.
+    const addOk = added.every((a) => a.ok);
     // Re-probe live identity NOW — AFTER the ADD/KEEP awaits — and re-validate each
     // remove-target before its kill, mirroring resetFleet's teardownTarget (compile-sim
     // HIGH): the DELETE loop runs after seconds of launch round-trips, so an operator
@@ -294,12 +302,12 @@ export async function syncFleet(
     // drifted name (renamed-to-a-spec-window, a recycled pane-id, gone) is SKIPPED.
     const liveByPane = new Map(sessionPanes(run, sessionName).map((p) => [p.pane, p]));
     for (const p of plan.remove) {
-      if (!addKeepOk) {
+      if (!addOk) {
         removed.push({
           pane: p.pane,
           window: p.windowName,
           ok: false,
-          reason: "skipped — an ADD or KEEP failed; not deleting while the fleet is degraded (fix the launch, then re-run)",
+          reason: "skipped — an ADD failed to launch; not deleting while a replacement is degraded (fix the launch, then re-run)",
         });
         continue;
       }
