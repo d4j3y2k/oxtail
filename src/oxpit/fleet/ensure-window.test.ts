@@ -204,3 +204,37 @@ test("claim does NOT bind on a wrong client type or wrong cwd (same sid)", () =>
   const deps2 = { readAll: () => [wrongType, wrongCwd], resolvePane: () => "%5" };
   assert.ok(!isClaimPaneBound("sid", { target: "%5", agent: "claude", cwd: "/repo" }, deps2));
 });
+
+test("claim does NOT bind a STALE entry whose pid was recycled (proc_sig mismatch)", () => {
+  // codex round-2: pid 100 now resolves to OUR pane, but it's an unrelated
+  // recycled process — its live start-time sig differs from the dead entry's.
+  const stale = entry({ server_pid: 100, proc_sig: "Mon Jan  1 00:00:00 2020" });
+  assert.ok(
+    !isClaimPaneBound("sid", { target: "%5", agent: "claude", cwd: "/repo" }, {
+      readAll: () => [stale],
+      resolvePane: () => "%5",
+      resolveSig: () => "Fri Jun 19 22:00:00 2026",
+    }),
+  );
+});
+
+test("claim binds when proc_sig matches the live process under our pane", () => {
+  const live = entry({ server_pid: 100, proc_sig: "Fri Jun 19 22:00:00 2026" });
+  assert.ok(
+    isClaimPaneBound("sid", { target: "%5", agent: "claude", cwd: "/repo" }, {
+      readAll: () => [live],
+      resolvePane: () => "%5",
+      resolveSig: () => "Fri Jun 19 22:00:00 2026",
+    }),
+  );
+});
+
+test("claim fails closed on an entry with no cwd (malformed/passive)", () => {
+  const noCwd = entry({ server_pid: 100, client: { type: "claude-code", session_id: "sid", transcript_path: null, session_id_source: "env", cwd: "" } });
+  assert.ok(
+    !isClaimPaneBound("sid", { target: "%5", agent: "claude", cwd: "/repo" }, {
+      readAll: () => [noCwd],
+      resolvePane: () => "%5",
+    }),
+  );
+});

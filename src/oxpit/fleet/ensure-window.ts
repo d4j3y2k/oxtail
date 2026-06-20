@@ -32,7 +32,12 @@ import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { realpathSync } from "node:fs";
 import { capturePane, fireKeystrokes, waitForPaneLine } from "../../keystrokes.js";
-import { currentPaneForServerPid, readAllPassive, type RegistryEntry } from "../../registry.js";
+import {
+  currentPaneForServerPid,
+  processStartSig,
+  readAllPassive,
+  type RegistryEntry,
+} from "../../registry.js";
 import { classifyPaneReadiness } from "./classify.js";
 import { listPanesWithMarkers, markPaneManaged, type PaneInfo, type TmuxRun } from "./ownership.js";
 import { awaitLaunchArtifact, snapshotBaseline } from "./readiness.js";
@@ -114,17 +119,25 @@ function realpathish(p: string): string {
 export interface ClaimBindDeps {
   readAll?: () => RegistryEntry[];
   resolvePane?: (serverPid: number) => string | null;
+  resolveSig?: (pid: number) => string;
 }
 
 // Is `sessionId` addressable AS the agent we just launched INTO `target`? Bare
 // sid presence is not enough (codex P2 BLOCK #2): a coincidental same-cwd peer,
 // or a dead/passive entry from readAllPassive(), can carry the same sid while
 // pointing at a DIFFERENT pane. So we require a registry entry that (1) is the
-// right client type, (2) records the same cwd, and (3) whose live server_pid
-// currently resolves (process-tree) to OUR launched pane. The pane resolution
-// also gives liveness for free — a dead pid resolves to null ≠ target. This is
-// what lets ensure_window refuse to mark a pane managed when addressability
-// actually landed somewhere else.
+// right client type, (2) records the same cwd (MANDATORY — a malformed entry
+// with no cwd fails closed), (3) passes a pid-reuse guard, AND (4) whose live
+// server_pid currently resolves (process-tree) to OUR launched pane.
+//
+// (3) closes codex's round-2 residual: currentPaneForServerPid proves a LIVE
+// process with this pid sits under target, but NOT that the (possibly stale,
+// passive) registry file still belongs to it. If that pid was recycled by an
+// unrelated process that happens to live in our pane before the real MCP child
+// rewrites <pid>.json, a dead entry would otherwise pass. The recorded proc_sig
+// won't match the recycled process's live start-time sig — reject. Same defense
+// as chooseVerifiedWakePane: only a POSITIVELY-different sig refuses; a transient
+// empty ps reading falls through to the pane check.
 export function isClaimPaneBound(
   sessionId: string,
   opts: { target: string; agent: AgentKind; cwd: string },
@@ -132,6 +145,7 @@ export function isClaimPaneBound(
 ): boolean {
   const readAll = deps.readAll ?? readAllPassive;
   const resolvePane = deps.resolvePane ?? currentPaneForServerPid;
+  const resolveSig = deps.resolveSig ?? processStartSig;
   const wantType = clientTypeFor(opts.agent);
   let entries: RegistryEntry[];
   try {
@@ -143,7 +157,11 @@ export function isClaimPaneBound(
   for (const e of entries) {
     if (e.client.session_id !== sessionId) continue;
     if (e.client.type !== wantType) continue;
-    if (e.client.cwd && realpathish(e.client.cwd) !== cwd) continue;
+    if (!e.client.cwd || realpathish(e.client.cwd) !== cwd) continue;
+    if (e.proc_sig) {
+      const liveSig = resolveSig(e.server_pid);
+      if (liveSig && liveSig !== e.proc_sig) continue; // pid recycled — not our process
+    }
     if (resolvePane(e.server_pid) === opts.target) return true;
   }
   return false;
