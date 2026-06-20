@@ -40,3 +40,27 @@ test("shell-ready: a trailing prompt glyph on an otherwise quiet pane", () => {
 test("unknown when nothing matches (executor treats as a gate failure)", () => {
   assert.equal(classifyPaneReadiness("some random mid-scroll output\nno prompt here", "claude-code").readiness, "unknown");
 });
+
+// ── false-ready negatives (codex AMEND #3) ─────────────────────────────────────
+
+test("a percent-progress line is NOT shell-ready (100% ends in % but is no prompt)", () => {
+  assert.equal(classifyPaneReadiness("Building... 100%", "claude-code").readiness, "unknown");
+  assert.equal(classifyPaneReadiness("downloaded 42%", "codex").readiness, "unknown");
+});
+
+test("log text mentioning shortcuts/ctrl is NOT tui-ready", () => {
+  assert.equal(
+    classifyPaneReadiness("hint: press ctrl+c to copy the output", "claude-code").readiness,
+    "unknown",
+  );
+  assert.equal(
+    classifyPaneReadiness("see the docs for shortcuts and keybindings", "codex").readiness,
+    "unknown",
+  );
+});
+
+test("shortcut chrome in deep scrollback (not the bottom region) is NOT tui-ready", () => {
+  // "? for shortcuts" buried 8+ lines up, with non-chrome at the bottom.
+  const buf = ["? for shortcuts", ...Array(8).fill("build log line"), "compiling module x"].join("\n");
+  assert.equal(classifyPaneReadiness(buf, "claude-code").readiness, "unknown");
+});

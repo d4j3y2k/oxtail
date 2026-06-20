@@ -38,27 +38,39 @@ function busy(lines: string[]): boolean {
   return lines.some((l) => /esc to interrupt/i.test(l));
 }
 
+// The bottom region of a pane is where live chrome (footer / prompt) sits; idle
+// TUI/shell signals are checked ONLY here, not across the whole buffer, so a
+// shortcut string or a `%` in historical scrollback can't false-positive
+// (codex AMEND #3). Returns the last `n` non-empty lines, most-recent first.
+function tailLines(lines: string[], n: number): string[] {
+  const out: string[] = [];
+  for (let i = lines.length - 1; i >= 0 && out.length < n; i--) {
+    const l = lines[i].trimEnd();
+    if (l) out.push(l);
+  }
+  return out;
+}
+
 function tuiReady(lines: string[], clientType: ClientType): boolean {
-  // Best-effort idle-TUI affordance. Claude footers carry "? for shortcuts";
-  // Codex carries a "/ commands" / shortcuts hint. Neither is guaranteed across
-  // builds, so a miss falls through to shell/unknown rather than a false ready.
-  const hay = lines.join("\n");
-  if (clientType === "claude-code") return /\? for shortcuts|\bfor shortcuts\b/i.test(hay);
-  if (clientType === "codex") return /\bfor shortcuts\b|\/ commands|ctrl\+./i.test(hay);
+  // Best-effort idle-TUI affordance, anchored on bottom-region footer chrome.
+  // Dropped the over-broad /ctrl\+./ (matched any "ctrl+c" in logs). Still
+  // build-dependent → a miss falls to shell/unknown, never a false ready. The
+  // exact footer strings are confirmed against live agents at the P3 gate, where
+  // the first classifyPane step actually consumes this.
+  const tail = tailLines(lines, 6).join("\n");
+  if (clientType === "claude-code") return /\? for shortcuts/i.test(tail);
+  if (clientType === "codex") return /\? for shortcuts|\/ for commands/i.test(tail);
   return false;
 }
 
-const SHELL_PROMPT_TAIL = /[$%#❯›»]\s*$/;
+// A real shell prompt has the glyph at start-of-line or after whitespace
+// (`host % `), so requiring a preceding boundary rejects a value that merely
+// ends in one (`100%`, `done.`). Checked only on the last non-empty line.
+const SHELL_PROMPT_TAIL = /(^|\s)[$%#❯›»]\s*$/;
 
 function shellReady(lines: string[]): boolean {
-  // A shell that is sitting at a prompt: the last non-empty line ends in a
-  // common prompt glyph. Conservative — used only as a weak positive.
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const l = lines[i].trimEnd();
-    if (!l) continue;
-    return SHELL_PROMPT_TAIL.test(l);
-  }
-  return false;
+  const tail = tailLines(lines, 1);
+  return tail.length > 0 && SHELL_PROMPT_TAIL.test(tail[0]);
 }
 
 export function classifyPaneReadiness(buf: string, clientType: ClientType): PaneClassification {
