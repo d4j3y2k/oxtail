@@ -29,6 +29,7 @@ import { renderSpawnPlan, spawnFleet, tmuxSessionExists, tmuxSessionName } from 
 import { buildResetPlan, discoverFleetId, renderResetPlan, resetFleet } from "./fleet/reset.js";
 import { listPanesWithMarkers } from "./fleet/ownership.js";
 import type { FleetSpec } from "./fleet/types.js";
+import { inferProjectRoot, safeRealpath } from "../scope.js";
 
 const ALT_ON = "\x1b[?1049h";
 const ALT_OFF = "\x1b[?1049l";
@@ -227,6 +228,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       | {
           lines: string[];
           spec: FleetSpec;
+          repoRoot: string; // the SELECTED agent's project root (not the cockpit's) — --all safe
           sessionName: string;
           fleetId: string;
           confirmedTargets: string[];
@@ -871,11 +873,15 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (resetOpen || resetBusy || spawnOpen) return;
       const idx = selectedIndex();
       const agent = idx >= 0 ? snapshot.agents[idx] : undefined;
-      const sessionName = agent?.tmux_session ?? null;
-      if (!sessionName) {
+      if (!agent?.tmux_session) {
         return setStatus(warn("reset: select an agent that's in a tmux session first", opts.color));
       }
-      const cfg = loadFleetConfig(snapshot.project_root);
+      const sessionName = agent.tmux_session;
+      // Derive the SELECTED agent's OWN project root (not the cockpit's) so an --all
+      // cross-project row resets + relaunches in ITS project with ITS spec (codex P6).
+      // Single-project mode already matched (project_root === the agent's project).
+      const repoRoot = safeRealpath(inferProjectRoot(agent.cwd));
+      const cfg = loadFleetConfig(repoRoot);
       if (!cfg.ok) {
         return setStatus(warn(`reset: fleet config invalid (${cfg.source}) — ${cfg.error}`, opts.color));
       }
@@ -893,6 +899,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       resetView = {
         lines,
         spec,
+        repoRoot,
         sessionName,
         fleetId,
         confirmedTargets: plan.targets.map((t) => t.pane.pane),
@@ -909,14 +916,14 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     // destructive run is in flight; the fleet refreshes on completion.
     function doReset(): void {
       if (!resetView || resetBusy) return;
-      const { spec, sessionName, fleetId, confirmedTargets, confirmedMissing } = resetView;
+      const { spec, repoRoot, sessionName, fleetId, confirmedTargets, confirmedMissing } = resetView;
       resetBusy = true;
       resetView = {
         ...resetView,
         lines: [...resetView.lines, "", dim(`  resetting "${sessionName}"… tearing down, relaunching`, opts.color)],
       };
       paint();
-      resetFleet(spec, snapshot.project_root, sessionName, { dryRun: false, fleetId, confirmedTargets, confirmedMissing })
+      resetFleet(spec, repoRoot, sessionName, { dryRun: false, fleetId, confirmedTargets, confirmedMissing })
         .then((r) => {
           resetBusy = false;
           resetOpen = false;
@@ -928,8 +935,19 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
             const drift = skipped ? ` · ${skipped} appeared-since, skipped (re-run to include)` : "";
             setStatus(ok(`✓ reset "${r.sessionName}" — ${up}/${r.relaunches.length} relaunched${drift}`, opts.color));
             refresh(true);
+          } else if (r.error) {
+            // discovery-level failure — nothing was torn down.
+            setStatus(warn(`reset failed: ${r.error}`, opts.color));
           } else {
-            setStatus(warn(`reset failed: ${r.error ?? "see per-pane results"}`, opts.color));
+            // per-pane partial failure (max): surface the count + first CONCRETE reason
+            // (not "see results" pointing nowhere), and refresh so the resulting
+            // half-reset state shows immediately — for a destroy, the post-failure state
+            // is exactly what the operator needs to see.
+            const torn = r.teardowns.filter((t) => t.ok).length;
+            const why =
+              r.teardowns.find((t) => !t.ok)?.reason ?? r.relaunches.find((x) => !x.ok)?.reason ?? "see results";
+            setStatus(warn(`reset: ${torn}/${r.teardowns.length} torn down — ${why}`, opts.color));
+            refresh(true);
           }
         })
         .catch((e) => {

@@ -233,8 +233,19 @@ export async function resetFleet(
   const ensure = opts.ensure ?? realEnsureWindow;
   const ensureDeps = (): EnsureWindowDeps => ({ run, now: opts.now, log: opts.log, ...opts.ensureDeps });
   return withFleetLock(repoRoot, async () => {
-    const disc = discover();
+    // ALWAYS live-discover under the lock — never trust a cached/preview fleetId as
+    // discovery success (codex P6): a session that went human-only / unowned since the
+    // preview must behave like "nothing to RESET", NOT get our windows injected via
+    // confirmedMissing. When a fleetId was provided (from the preview), REQUIRE the live
+    // one to still match — confirm-fidelity for the fleet IDENTITY, not just its panes.
+    const disc = discoverFleetId(sessionName, run);
     if (!disc.ok) return errResult(false, disc.reason);
+    if (opts.fleetId && disc.fleetId !== opts.fleetId) {
+      return errResult(
+        false,
+        `fleet changed since the preview (now "${disc.fleetId}", expected "${opts.fleetId}") — re-open the RESET preview`,
+      );
+    }
     const fleetId = disc.fleetId;
     const panes = sessionPanes(run, sessionName);
     let plan = computeTeardownPlan(spec, fleetId, panes);

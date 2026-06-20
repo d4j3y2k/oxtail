@@ -329,6 +329,47 @@ test("survivors: the session's non-fleet (unmarked human) panes are surfaced + s
   });
 });
 
+test("P2: a cached preview fleetId can't bypass live discovery — a session gone UNOWNED refuses (no injection)", async () => {
+  await withRepo(async (repoRoot) => {
+    // Operator previewed fleet X; by confirm time the session is human-only (no X
+    // markers). The live run must re-discover under the lock, find nothing of ours, and
+    // REFUSE — NOT inject the confirmedMissing windows into a now-foreign session.
+    const created: string[] = [];
+    const fx = fakeTmux([row({ pane: "%1", windowName: "editor", managedBy: null, currentCommand: "nvim" })]);
+    const run = (args: string[]) => {
+      if (args[0] === "new-window") created.push(args[args.indexOf("-n") + 1]);
+      return fx.run(args);
+    };
+    const res = await resetFleet(spec, repoRoot, "oxtail", {
+      dryRun: false,
+      run,
+      ensure: fx.ensure,
+      fleetId: "oxtail-abcd1234", // the cached preview fleetId
+      confirmedMissing: ["main", "max", "codex"],
+    });
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /nothing to RESET/);
+    assert.deepEqual(created, [], "no windows injected into a now-unowned session");
+  });
+});
+
+test("P2: a cached fleetId that no longer matches the LIVE one refuses (re-open the preview)", async () => {
+  await withRepo(async (repoRoot) => {
+    // The session is now owned by a DIFFERENT fleet than the preview's.
+    const fx = fakeTmux([row({ pane: "%1", windowName: "main", managedBy: "oxtail-99999999" })]);
+    const res = await resetFleet(spec, repoRoot, "oxtail", {
+      dryRun: false,
+      run: fx.run,
+      ensure: fx.ensure,
+      fleetId: "oxtail-abcd1234", // preview expected this; live is oxtail-99999999
+      confirmedTargets: ["%1"],
+    });
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /fleet changed since the preview/);
+    assert.ok(!fx.seq.includes("teardown:%1"), "nothing torn down on a fleet-identity mismatch");
+  });
+});
+
 test("resetFleet errors (no mutation) when the session has nothing of ours", async () => {
   await withRepo(async (repoRoot) => {
     const seen: string[][] = [];

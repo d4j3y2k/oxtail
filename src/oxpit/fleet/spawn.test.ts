@@ -74,10 +74,9 @@ test("live SPAWN creates the session + windows, then ensures each SEQUENTIALLY",
       dryRun: false,
       run: (args) => {
         calls.push(args);
-        if (args[0] === "list-panes") {
-          const win = args[2].split(":")[1];
-          return win === "main" ? "%10\n" : "%11\n";
-        }
+        // -P -F captures each pane id AT CREATION (new-session = first window).
+        if (args[0] === "new-session") return "%10\n";
+        if (args[0] === "new-window") return args.includes("codex") ? "%11\n" : "%12\n";
         return "";
       },
       ensure: async ({ target, window }) => {
@@ -106,7 +105,7 @@ test("a window whose pane can't be resolved is reported, not skipped silently", 
   await withHome(async () => {
     const res = await spawnFleet(spec, "/repo", {
       dryRun: false,
-      run: (args) => (args[0] === "list-panes" ? "" : ""), // no pane id ever
+      run: () => "", // new-session / new-window -P -F return no pane id ever
       ensure: async ({ window }) =>
         ({ window: window.name, occupancy: "empty-shell", action: "launched", ok: true, sessionId: "x" }) satisfies EnsureWindowResult,
     });

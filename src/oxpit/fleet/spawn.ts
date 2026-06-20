@@ -103,17 +103,6 @@ export function renderSpawnPlan(spec: FleetSpec, fleetId: string, sessionName: s
   return lines.join("\n");
 }
 
-// Resolve the active pane id of a freshly-created window.
-function paneForWindow(run: TmuxRun, sessionName: string, windowName: string): string | null {
-  try {
-    const out = run(["list-panes", "-t", `${sessionName}:${windowName}`, "-F", "#{pane_id}"]);
-    const first = out.split("\n").find((l) => l.trim());
-    return first ? first.trim() : null;
-  } catch {
-    return null;
-  }
-}
-
 export async function spawnFleet(
   spec: FleetSpec,
   repoRoot: string,
@@ -149,19 +138,24 @@ export async function spawnFleet(
         error: `tmux session "${sessionName}" already exists — refusing to spawn on top of it (SPAWN only creates; use an explicit fresh name, or RESET to rebuild).`,
       };
     }
+    const paneByWindow = new Map<string, string>();
     try {
-      // Create the session (first window) + the remaining windows up-front as
-      // empty shells; the LAUNCHES below are what must stay sequential.
-      run(["new-session", "-d", "-s", sessionName, "-n", spec.windows[0].name, "-c", repoRoot]);
+      // Create the session + each window, capturing each pane id DIRECTLY at creation
+      // via -P -F (codex P6): never re-resolve `${session}:${windowName}` afterwards —
+      // a dup/human same-name window would be a targeting footgun. The LAUNCHES below
+      // (ensure_window) are what must stay sequential.
+      const first = run(["new-session", "-d", "-P", "-F", "#{pane_id}", "-s", sessionName, "-n", spec.windows[0].name, "-c", repoRoot]);
+      paneByWindow.set(spec.windows[0].name, first.trim());
       for (const w of spec.windows.slice(1)) {
-        run(["new-window", "-t", sessionName, "-n", w.name, "-c", repoRoot]);
+        const p = run(["new-window", "-P", "-F", "#{pane_id}", "-t", sessionName, "-n", w.name, "-c", repoRoot]);
+        paneByWindow.set(w.name, p.trim());
       }
     } catch (e) {
       return { fleetId, sessionName, dryRun: false, plan, results, ok: false, error: `session creation failed: ${String(e)}` };
     }
 
     for (const window of spec.windows) {
-      const pane = paneForWindow(run, sessionName, window.name);
+      const pane = paneByWindow.get(window.name);
       if (!pane) {
         results.push({
           window: window.name,
