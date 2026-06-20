@@ -42,6 +42,7 @@ import { classifyPaneReadiness } from "./classify.js";
 import { listPanesWithMarkers, markPaneManaged, type PaneInfo, type TmuxRun } from "./ownership.js";
 import { awaitLaunchArtifact, snapshotBaseline } from "./readiness.js";
 import {
+  buildJoinInstruction,
   buildRecipe,
   clientTypeFor,
   executeRecipe,
@@ -265,9 +266,14 @@ async function defaultLaunch(
         : "";
       return { ok: false, reason: `${r.reason}${extra}` };
     },
+    // Type the cooperative self-claim into the pane (Codex only — Claude recipes
+    // never reach this step). The agent runs claim_session with the id oxpit read
+    // from the rollout; confirmation is the registry (claimCheck below), NOT the
+    // agent's reply text (external-state-as-truth).
+    cooperativeJoin: (sid) => fireKeystrokes(target, clientType, buildJoinInstruction(sid)),
     // POLL for pane-bound adoption — registry adoption (Claude's hook reading the
-    // SessionStart drop on a separate detection pass; Codex's cooperative join in
-    // P3) lands LATER than waitExternal (which returns the instant the artifact
+    // SessionStart drop on a separate detection pass; Codex's cooperative join)
+    // lands LATER than waitExternal (which returns the instant the artifact
     // appears, the earliest signal). A single shot would false-abort a launch
     // that actually succeeded (max A1 + codex BLOCK #2).
     claimCheck: (sid) =>

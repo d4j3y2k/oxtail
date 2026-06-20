@@ -2,6 +2,7 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import type { PaneClassification } from "./classify.js";
 import {
+  buildJoinInstruction,
   buildLaunchCommand,
   buildRecipe,
   clientTypeFor,
@@ -9,6 +10,7 @@ import {
   type Recipe,
   type RecipeEffects,
   type RecipeStep,
+  recipesForFleet,
   renderRecipe,
   shellSingleQuote,
 } from "./recipes.js";
@@ -47,11 +49,28 @@ test("shellSingleQuote escapes embedded single quotes", () => {
   assert.equal(shellSingleQuote("plain"), "'plain'");
 });
 
-test("buildRecipe emits the minimal validated SPAWN sequence", () => {
+test("buildRecipe: Claude omits joinClaim (hook auto-joins)", () => {
   const r = buildRecipe(main);
   assert.deepEqual(r.steps.map((s) => s.op), ["sendLiteral", "waitExternal", "claimCheck"]);
   assert.equal(r.steps[0].op === "sendLiteral" && r.steps[0].text, "claude --model 'opus-4.8'");
   assert.equal(r.steps[1].op === "waitExternal" && r.steps[1].artifact, "claude");
+});
+
+test("buildRecipe: Codex inserts joinClaim BEFORE claimCheck (no auto-join)", () => {
+  const r = buildRecipe(codexWin);
+  assert.deepEqual(r.steps.map((s) => s.op), ["sendLiteral", "waitExternal", "joinClaim", "claimCheck"]);
+});
+
+test("buildJoinInstruction is a single direct claim_session call with the id (codex live phrasing)", () => {
+  const s = buildJoinInstruction("019ee2db-thread");
+  assert.match(s, /^Call the oxtail MCP tool claim_session with session_id "019ee2db-thread" now\./);
+  assert.ok(!s.startsWith("/"), "no leading slash command");
+  assert.ok(!/```|\$\(|;/.test(s), "no code fences / shell syntax");
+});
+
+test("recipesForFleet maps each window to a recipe", () => {
+  const recipes = recipesForFleet({ windows: [main, codexWin] });
+  assert.deepEqual(recipes.map((r) => r.client), ["claude", "codex"]);
 });
 
 test("renderRecipe prints exact, reviewable dry-run steps", () => {
@@ -77,6 +96,9 @@ function fx(over: Partial<RecipeEffects> = {}): { fx: RecipeEffects; sent: strin
     confirmLine: async () => true,
     classify: (): PaneClassification => ({ readiness: "tui-ready" }),
     waitExternal: async () => ({ ok: true, sessionId: "sid-xyz" }),
+    cooperativeJoin: async (sid) => {
+      sent.push(`<join:${sid}>`);
+    },
     claimCheck: () => true,
   };
   return { fx: { ...base, ...over }, sent };
@@ -88,6 +110,27 @@ test("happy path: binds the session and confirms the claim", async () => {
   assert.equal(res.ok, true);
   if (res.ok) assert.equal(res.sessionId, "sid-xyz");
   assert.deepEqual(sent, ["claude --model 'opus-4.8'"]);
+});
+
+test("Codex happy path fires cooperativeJoin with the bound id, then confirms", async () => {
+  const { fx: effects, sent } = fx();
+  const res = await executeRecipe(buildRecipe(codexWin), effects);
+  assert.equal(res.ok, true);
+  if (res.ok) assert.equal(res.sessionId, "sid-xyz");
+  // launch command, then the join fired with the bound session id
+  assert.deepEqual(sent, ["codex --model 'gpt-5.5'", "<join:sid-xyz>"]);
+});
+
+test("joinClaim before a bound session is a hard error", async () => {
+  const recipe: Recipe = {
+    client: "codex",
+    label: "codex",
+    launchCommand: "codex",
+    steps: [{ op: "joinClaim" }],
+  };
+  const res = await executeRecipe(recipe, fx().fx);
+  assert.equal(res.ok, false);
+  if (!res.ok) assert.match(res.reason, /joinClaim reached before/);
 });
 
 test("waitExternal failure stops the recipe with that reason", async () => {

@@ -32,6 +32,12 @@ export type RecipeStep =
   | { op: "waitExternal"; artifact: AgentKind; note?: string }
   // Gate: the pane must currently classify into one of `expect`, else abort.
   | { op: "classifyPane"; expect: PaneReadiness[]; note?: string }
+  // Cooperative self-claim: type a one-line instruction into the pane telling
+  // the agent to register the just-bound session in oxtail's registry. Needed
+  // ONLY for clients with no auto-join (Codex — CODEX_THREAD_ID is stripped from
+  // its MCP child); Claude's SessionStart hook auto-joins, so its recipe omits
+  // this step. Runs AFTER waitExternal (uses the bound session id).
+  | { op: "joinClaim"; note?: string }
   // External confirmation that the bound session is now resolvable in oxtail's
   // registry (adoption landed) — not a pane-text check.
   | { op: "claimCheck"; note?: string }
@@ -76,30 +82,56 @@ export function buildLaunchCommand(window: FleetWindowSpec): string {
   return parts.join(" ");
 }
 
-// The minimal validated SPAWN recipe: launch into the empty shell, wait for the
-// launch artifact to bind the session, confirm registry adoption. Effort/join
-// chords are added in P3 (the DSL supports them; this keeps P2 to the path the
-// spikes proved).
+// The one-line instruction oxpit types into a freshly-spawned Codex to make it
+// register the just-bound session. EXPLICIT-id form: oxpit already read the
+// thread-id from the rollout, so it tells Codex exactly what to claim rather than
+// trusting Codex to self-resolve $CODEX_THREAD_ID (same value, but explicit
+// removes the env dependency and gives an exact, confirmable target).
 //
-// PHASING (max Q4): this sequence is validated for CLAUDE — its hook auto-joins,
-// so claimCheck's pane-bound registry entry appears on its own. A fresh CODEX
-// does NOT auto-join (CODEX_THREAD_ID is stripped from its MCP child), so its
-// claimCheck CANNOT pass until P3 inserts a `sendLiteral(<cooperative join with
-// the rollout thread-id>)` step BEFORE claimCheck. Until then a Codex SPAWN
-// correctly aborts at claimCheck — "suite green" means the Claude path, not that
-// Codex SPAWN works yet.
+// Phrasing per the live Codex peer (it knows its own first-turn ergonomics): a
+// single direct MCP tool-call instruction is the most reliable thing for a fresh
+// Codex to execute — NO leading slash, code fences, shell syntax, or multi-step
+// prose, and claim_session (not register_my_session) for the compact verify. The
+// "reply Registered" tail is a human/diagnostic signal only — oxpit's truth is
+// the registry (claimCheck/isClaimPaneBound), never this pane text.
+export function buildJoinInstruction(sessionId: string): string {
+  return (
+    `Call the oxtail MCP tool claim_session with session_id "${sessionId}" now. ` +
+    `If it succeeds, reply exactly: Registered: ${sessionId}`
+  );
+}
+
+// The SPAWN recipe: launch into the empty shell, wait for the launch artifact to
+// bind the session, (Codex only) fire the cooperative self-claim, then confirm
+// registry adoption. Effort chords + classifyPane gates are layered in as P3
+// finalizes (the DSL supports them).
+//
+// PHASING (max Q4): Claude auto-joins via its SessionStart hook, so its recipe is
+// launch → waitExternal → claimCheck. Codex has no auto-join, so it gets an extra
+// joinClaim step BEFORE claimCheck; without it a fresh Codex could never satisfy
+// the pane-bound claimCheck.
 export function buildRecipe(window: FleetWindowSpec): Recipe {
   const launchCommand = buildLaunchCommand(window);
+  const steps: RecipeStep[] = [
+    { op: "sendLiteral", text: launchCommand, note: "launch into the empty shell" },
+    { op: "waitExternal", artifact: window.agent, note: "bind session via launch artifact" },
+  ];
+  if (window.agent === "codex") {
+    steps.push({ op: "joinClaim", note: "cooperative self-claim (Codex has no auto-join)" });
+  }
+  steps.push({ op: "claimCheck", note: "confirm the bound session is registry-resolvable" });
   return {
     client: window.agent,
     label: window.role ? `${window.name} (${window.role})` : window.name,
     launchCommand,
-    steps: [
-      { op: "sendLiteral", text: launchCommand, note: "launch into the empty shell" },
-      { op: "waitExternal", artifact: window.agent, note: "bind session via launch artifact" },
-      { op: "claimCheck", note: "confirm the bound session is registry-resolvable" },
-    ],
+    steps,
   };
+}
+
+// Map a whole fleet spec to per-window recipes (SPAWN runs ensure_window over
+// these in order). Pure — for dry-run and SPAWN planning.
+export function recipesForFleet(spec: { windows: FleetWindowSpec[] }): Recipe[] {
+  return spec.windows.map(buildRecipe);
 }
 
 function renderStep(s: RecipeStep): string {
@@ -112,6 +144,8 @@ function renderStep(s: RecipeStep): string {
       return `waitExternal ${s.artifact} (${s.artifact === "claude" ? "SessionStart drop, ppid→pane" : "rollout file, new-file+cwd"})`;
     case "classifyPane":
       return `classifyPane expect [${s.expect.join(", ")}]`;
+    case "joinClaim":
+      return `joinClaim (cooperative self-claim, Codex)`;
     case "claimCheck":
       return `claimCheck`;
     case "abort":
@@ -143,6 +177,10 @@ export interface RecipeEffects {
   waitExternal: (
     artifact: AgentKind,
   ) => Promise<{ ok: true; sessionId: string } | { ok: false; reason: string }>;
+  // Fire the cooperative self-claim instruction (joinClaim step) into the pane,
+  // built from the bound session id. ensure-window wires this to fireKeystrokes
+  // of buildJoinInstruction; Claude recipes never invoke it.
+  cooperativeJoin: (sessionId: string) => Promise<void>;
   // External confirmation the bound session is now addressable. May poll (it
   // waits out registry-adoption lag), so it returns a promise; a sync boolean is
   // also accepted (tests). MUST be pane-bound, not bare sid presence — see
@@ -207,6 +245,19 @@ export async function executeRecipe(recipe: Recipe, fx: RecipeEffects): Promise<
             sessionId,
           };
         }
+        break;
+      }
+      case "joinClaim": {
+        if (!sessionId) {
+          return {
+            ok: false,
+            failed: step,
+            reason: "joinClaim reached before waitExternal bound a session",
+            sessionId,
+          };
+        }
+        log(`firing cooperative self-claim for ${sessionId}`);
+        await fx.cooperativeJoin(sessionId);
         break;
       }
       case "claimCheck": {
