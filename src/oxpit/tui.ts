@@ -24,7 +24,7 @@ import { NUDGE_TEXT, sendOperatorMessage } from "./operator.js";
 import { formatAttachmentNote, stageAttachment, type StagedAttachment } from "./attachments.js";
 import { captureClipboardImage } from "./clipboard.js";
 import { parseStatusArgs, USAGE } from "./cli.js";
-import { loadFleetConfig, validateFleetSpec, writeFleetScaffold } from "./fleet/spec.js";
+import { loadFleetConfig, modelOptionsForAgent, validateFleetSpec, writeFleetScaffold } from "./fleet/spec.js";
 import { renderSpawnPlan, spawnFleet, tmuxSessionExists, tmuxSessionName } from "./fleet/spawn.js";
 import { buildResetPlan, discoverFleetId, renderResetPlan, resetFleet } from "./fleet/reset.js";
 import { listPanesWithMarkers } from "./fleet/ownership.js";
@@ -228,9 +228,13 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       remoteControl: boolean;
     };
     let fleetEdit: { fleetName: string; windows: EditWin[]; cursor: number; note: string } | null = null;
-    // Active when typing into a text field (name/model/fleet-name).
-    let fleetEditInput: { field: "name" | "model" | "fleetName"; buf: string } | null = null;
-    const EFFORT_CYCLE = ["", "low", "medium", "high", "xhigh", "max"];
+    // Active when typing into a text field — only NAMES are free text (window name /
+    // fleet name); everything else is a pick-from-list menu (you shouldn't have to
+    // know an exact model id, David).
+    let fleetEditInput: { field: "name" | "fleetName"; buf: string } | null = null;
+    // The pop-up selection menu for model / effort: shows the valid options to pick.
+    let fleetEditPick: { field: "model" | "effort"; options: string[]; cursor: number } | null = null;
+    const EFFORT_OPTIONS = ["", "low", "medium", "high", "xhigh", "max"];
     // RESET overlay (P6): a full-screen RED plan + survivors preview → DELIBERATE
     // confirm. `R` (capital, distinct from SPAWN) computes the dry-run plan for the
     // SELECTED agent's session and opens it; a SECOND `R` (NOT `y` — defeats SPAWN
@@ -902,7 +906,21 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         }
       });
       lines.push("");
-      if (fleetEditInput) {
+      if (fleetEditPick) {
+        const pk = fleetEditPick;
+        lines.push(b(`  select ${pk.field} for "${fe.windows[fe.cursor].name}":`));
+        pk.options.forEach((opt, i) => {
+          const label = opt === "" ? "(default)" : opt;
+          lines.push(
+            i === pk.cursor
+              ? opts.color
+                ? `\x1b[7m  ▸ ${label}\x1b[0m`
+                : `  ▸ ${label}`
+              : `    ${label}`,
+          );
+        });
+        lines.push(d("  ↑↓ · ⏎ pick · esc cancel"));
+      } else if (fleetEditInput) {
         lines.push(b(`  edit ${fleetEditInput.field}: ${fleetEditInput.buf}█`));
         lines.push(d("  ⏎ ok · esc cancel"));
       } else {
@@ -916,11 +934,36 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         .join("\n");
     }
 
-    // Editor key state machine. Text-input mode (name/model/fleet-name) takes keys
-    // first; otherwise the grid hotkeys act on the cursor window.
+    // Editor key state machine. An open pick-menu (model/effort) or text-input (names
+    // only) takes keys first; otherwise the grid hotkeys act on the cursor window.
     function handleFleetEditKey(s: string): void {
       const fe = fleetEdit;
       if (!fe) return;
+      // The model/effort pick-menu takes keys first while open.
+      if (fleetEditPick) {
+        const pk = fleetEditPick;
+        if (s === "\x03") return teardown(0);
+        if (s === "\x1b") {
+          fleetEditPick = null;
+          return paint();
+        }
+        if (s === "\x1b[A" || s === "k") {
+          pk.cursor = (pk.cursor - 1 + pk.options.length) % pk.options.length;
+          return paint();
+        }
+        if (s === "\x1b[B" || s === "j") {
+          pk.cursor = (pk.cursor + 1) % pk.options.length;
+          return paint();
+        }
+        if (s === "\r" || s === "\n" || s === " ") {
+          const val = pk.options[pk.cursor];
+          if (pk.field === "model") fe.windows[fe.cursor].model = val;
+          else fe.windows[fe.cursor].effort = val;
+          fleetEditPick = null;
+          return paint();
+        }
+        return; // swallow other keys while the menu is open
+      }
       if (fleetEditInput) {
         const inp = fleetEditInput;
         if (s === "\x03") return teardown(0);
@@ -961,7 +1004,11 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         return paint();
       }
       if (s === "m") {
-        fleetEditInput = { field: "model", buf: w.model };
+        // Pick from the curated per-agent model list (+ a "(default)" / inherit
+        // option); preserve a custom hand-edited value as a selectable entry.
+        const base = [...modelOptionsForAgent(w.agent), ""];
+        const options = base.includes(w.model) ? base : [w.model, ...base];
+        fleetEditPick = { field: "model", options, cursor: Math.max(0, options.indexOf(w.model)) };
         return paint();
       }
       if (s === "F") {
@@ -969,13 +1016,20 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         return paint();
       }
       if (s === "f") {
-        const i = EFFORT_CYCLE.indexOf(w.effort);
-        w.effort = EFFORT_CYCLE[(i + 1) % EFFORT_CYCLE.length];
+        fleetEditPick = {
+          field: "effort",
+          options: EFFORT_OPTIONS,
+          cursor: Math.max(0, EFFORT_OPTIONS.indexOf(w.effort)),
+        };
         return paint();
       }
       if (s === "t") {
         w.agent = w.agent === "claude" ? "codex" : "claude";
         if (w.agent === "codex") w.remoteControl = false; // /rc is claude-only
+        // a model valid for the old agent may be invalid for the new one → reset to
+        // the new agent's default (e.g. opus[1m] ↔ gpt-5.5); keep "" (inherit) as-is.
+        const opts = modelOptionsForAgent(w.agent);
+        if (w.model && !opts.includes(w.model)) w.model = opts[0];
         return paint();
       }
       if (s === "r") {

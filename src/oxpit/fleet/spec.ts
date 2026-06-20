@@ -121,6 +121,20 @@ export function defaultFleet(repoRoot?: string): FleetSpec {
   return { name, windows: DEFAULT_WINDOWS.map((w) => ({ ...w })) };
 }
 
+// Curated model options for the in-TUI editor's picker — so a user doesn't have to
+// KNOW an exact `--model` id (the opus-4.8 trap). Claude values are LIVE-verified
+// aliases (`claude --model X`): opus[1m] (latest Opus + 1M context, the standing
+// fleet), opus, sonnet, haiku. (sonnet[1m]/haiku[1m] need 1M-context usage credits,
+// so only opus carries the [1m] variant here.) Codex is conservative — gpt-5.5 is
+// the verified default; add more as they're confirmed. A custom value in a
+// hand-edited config still works (the editor preserves it); these are just the menu.
+export const CLAUDE_MODELS = ["opus[1m]", "opus", "sonnet", "haiku"] as const;
+export const CODEX_MODELS = ["gpt-5.5"] as const;
+
+export function modelOptionsForAgent(agent: "claude" | "codex"): string[] {
+  return [...(agent === "claude" ? CLAUDE_MODELS : CODEX_MODELS)];
+}
+
 export function projectFleetConfigPath(repoRoot: string): string {
   return join(repoRoot, ".oxtail", "fleet.json");
 }
