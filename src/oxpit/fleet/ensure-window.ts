@@ -61,33 +61,55 @@ export function isShellCommand(cmd: string): boolean {
 }
 
 export type OccupancyProbe = {
+  pane: string;
   currentCommand: string;
   panePid: number;
   managedBy: string | null;
 };
 
+// Is a LIVE oxtail-registered agent currently hosted under `pane`? Used to
+// disambiguate the marked+shell case below. A dead agent's server_pid no longer
+// resolves to any pane (currentPaneForServerPid walks live ps+tmux), so only a
+// genuinely-live agent in this pane matches. Injectable for tests.
+export function isAgentLiveInPane(
+  pane: string,
+  deps: { readAll?: () => RegistryEntry[]; resolvePane?: (serverPid: number) => string | null } = {},
+): boolean {
+  const readAll = deps.readAll ?? readAllPassive;
+  const resolvePane = deps.resolvePane ?? currentPaneForServerPid;
+  try {
+    return readAll().some((e) => resolvePane(e.server_pid) === pane);
+  } catch {
+    return false;
+  }
+}
+
 // PURE level-probe classifier. See the file header for why type comes from the
 // marker, not pane_current_command.
 //
-// A2 (max, must-fix before P5 live SPAWN / RESET-P6): the shell check is BEFORE
-// the marker, so a MARKED pane that transiently reads as a shell classifies as
-// empty-shell → relaunch. That is CORRECT for a crashed-to-shell agent (we want
-// to relaunch) but WRONG for a live agent momentarily foregrounding a shell-named
-// child (we'd launch on top). It is not reachable on the P2 SPAWN path — fresh
-// windows are unmarked, and a running claude/codex keeps the tty foreground so
-// the command reads as a version-string/node, never a shell (matches the spike).
-// But this is the reusable crux RESET runs over LIVE fleets: before then, the
-// marked+shell case must consult pane-subtree liveness (currentPaneForServerPid/
-// ancestry) — live agent ⇒ healthy-right-type, absent ⇒ empty-shell.
+// A2 (max): the marked+shell case is ambiguous from one sample — a crashed-to-
+// shell agent (relaunch) vs a live agent transiently foregrounding a shell-named
+// child (NO-OP). Resolve it with `agentLiveInPane` (pane-subtree liveness via the
+// registry): a live agent ⇒ healthy-right-type, none ⇒ empty-shell. Without the
+// predicate (pure default) marked+shell is treated as empty-shell, which is safe
+// on the SPAWN path (fresh windows are unmarked) but ensureWindow ALWAYS supplies
+// the predicate so the live-fleet RESET path is correct.
 //
 // marker semantics (max Q1): a marker means "this pane is OURS / occupied by what
 // we spawned", NOT that the byte-identical model/effort is running (those are
 // in-TUI and not re-verified — config changes go through RESET/--force). An
 // operator hand-swap within the same pane keeps the marker (pane option), so we
 // NO-OP — safe, by design.
-export function classifyOccupancy(probe: OccupancyProbe | null, fleetId: string): WindowOccupancy {
+export function classifyOccupancy(
+  probe: OccupancyProbe | null,
+  fleetId: string,
+  agentLiveInPane?: () => boolean,
+): WindowOccupancy {
   if (!probe || !Number.isFinite(probe.panePid) || probe.panePid <= 0) return "unknown";
-  if (isShellCommand(probe.currentCommand)) return "empty-shell";
+  if (isShellCommand(probe.currentCommand)) {
+    if (probe.managedBy === fleetId && agentLiveInPane?.()) return "healthy-right-type";
+    return "empty-shell";
+  }
   if (probe.managedBy === fleetId) return "healthy-right-type";
   return "wrong-type";
 }
@@ -293,7 +315,12 @@ export async function ensureWindow(
 ): Promise<EnsureWindowResult> {
   const { target, window, fleetId, cwd } = opts;
   const probe = (deps.probe ?? ((p) => probePaneInfo(p, deps.run)))(target);
-  const occupancy = classifyOccupancy(probe, fleetId);
+  // Resolve the marked+shell ambiguity against live pane-subtree state (A2).
+  const occupancy = classifyOccupancy(
+    probe,
+    fleetId,
+    probe ? () => isAgentLiveInPane(probe.pane) : undefined,
+  );
   const head = { window: window.name, occupancy, sessionId: null as string | null };
   deps.log?.(`[ensure ${window.name}] probe → ${occupancy}`);
 

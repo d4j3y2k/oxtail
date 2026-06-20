@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   classifyOccupancy,
   ensureWindow,
+  isAgentLiveInPane,
   isClaimPaneBound,
   isShellCommand,
   type EnsureWindowDeps,
@@ -16,7 +17,7 @@ const FLEET = "oxtail-abcd1234";
 const main: FleetWindowSpec = { name: "main", agent: "claude", model: "opus-4.8", role: "captain" };
 
 function probe(over: Partial<OccupancyProbe>): OccupancyProbe {
-  return { currentCommand: "zsh", panePid: 1234, managedBy: null, ...over };
+  return { pane: "%5", currentCommand: "zsh", panePid: 1234, managedBy: null, ...over };
 }
 
 // ── classifyOccupancy (pure level probe) ───────────────────────────────────────
@@ -57,6 +58,41 @@ test("a non-shell pane we did NOT mark is wrong-type (never launch on top)", () 
 test("a missing/dead pane is unknown (abstain, never launch blind)", () => {
   assert.equal(classifyOccupancy(null, FLEET), "unknown");
   assert.equal(classifyOccupancy(probe({ panePid: 0 }), FLEET), "unknown");
+});
+
+// ── A2: marked+shell disambiguation via pane-subtree liveness ───────────────────
+
+test("A2: marked+shell with a LIVE agent in the pane → healthy (no relaunch on top)", () => {
+  const p = probe({ currentCommand: "zsh", managedBy: FLEET });
+  assert.equal(classifyOccupancy(p, FLEET, () => true), "healthy-right-type");
+});
+
+test("A2: marked+shell with NO live agent → empty-shell (crashed-to-shell, relaunch)", () => {
+  const p = probe({ currentCommand: "zsh", managedBy: FLEET });
+  assert.equal(classifyOccupancy(p, FLEET, () => false), "empty-shell");
+});
+
+test("A2: UNMARKED shell is empty-shell regardless of liveness (never consults it)", () => {
+  let consulted = false;
+  const p = probe({ currentCommand: "zsh", managedBy: null });
+  assert.equal(
+    classifyOccupancy(p, FLEET, () => {
+      consulted = true;
+      return true;
+    }),
+    "empty-shell",
+  );
+  assert.equal(consulted, false);
+});
+
+test("isAgentLiveInPane: true only when a registered server_pid resolves to the pane", () => {
+  const entries = [entry({ server_pid: 100 })];
+  assert.ok(
+    isAgentLiveInPane("%5", { readAll: () => entries, resolvePane: (pid) => (pid === 100 ? "%5" : null) }),
+  );
+  assert.ok(
+    !isAgentLiveInPane("%5", { readAll: () => entries, resolvePane: () => "%9" }), // resolves elsewhere / dead
+  );
 });
 
 // ── ensureWindow dispatch (injected seams, no tmux) ────────────────────────────
