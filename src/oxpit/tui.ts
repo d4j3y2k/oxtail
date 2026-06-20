@@ -293,12 +293,40 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       }
     }
 
-    // Fleet-mode footer keys (log mode carries its own footer inside the panel).
-    function footer(): string {
-      const keys = "↑↓ move  ⏎ jump  n nudge  m msg  S spawn  R reset  l log  w thread  r refresh  ? help  ⌃C quit";
+    // Fleet-mode footer key hints, WORD-WRAPPED to the terminal width so a narrow
+    // window doesn't clip them off the right edge. Greedy-packs the items into lines
+    // ≤ width; capped at 2 lines (the overflow merges onto line 2, ANSI-clip guards a
+    // pathologically narrow terminal). footer() + reservedRows() share this so the
+    // table windowing reserves exactly the footer's height (no cursor-home desync).
+    function footerKeyLines(width: number): string[] {
+      const items = [
+        "↑↓ move", "⏎ jump", "n nudge", "m msg", "S spawn", "R reset",
+        "l log", "w thread", "r refresh", "? help", "⌃C quit",
+      ];
+      const maxW = Math.max(16, width - 2);
+      const lines: string[] = [];
+      let cur = "";
+      for (const it of items) {
+        const next = cur ? `${cur}  ${it}` : it;
+        if (next.length > maxW && cur) {
+          lines.push(cur);
+          cur = it;
+        } else {
+          cur = next;
+        }
+      }
+      if (cur) lines.push(cur);
+      if (lines.length <= 2) return lines.map((l) => "  " + l);
+      return [`  ${lines[0]}`, `  ${lines.slice(1).join("  ")}`]; // cap at 2
+    }
+
+    // Fleet-mode footer (log mode carries its own footer inside the panel). The
+    // transient status rides on the last key line so it never adds a row.
+    function footer(width: number): string {
+      const dimmed = footerKeyLines(width).map((l) => dim(l, opts.color));
       const now = Date.now();
-      const msg = now < statusUntil && status ? "  " + status : "";
-      return "\n" + dim("  " + keys, opts.color) + msg;
+      if (now < statusUntil && status) dimmed[dimmed.length - 1] += "  " + status;
+      return "\n" + dimmed.join("\n");
     }
 
     function helpFrame(width: number, rows: number): string {
@@ -337,21 +365,23 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     // Lines of fixed chrome around the agent table, so the table can be windowed to
     // fit the terminal height (paging) — a large fleet can't overflow and desync
     // the cursor-home repaint.
-    function reservedRows(): number {
+    function reservedRows(width: number): number {
       const waiters = snapshot.agents.filter((a) => a.waiting);
       const wgBody = snapshot.cycles.length + waiters.filter((a) => !a.waiting?.in_cycle).length;
       const wgLines =
         waiters.length || snapshot.cycles.length
           ? 2 + Math.min(wgBody, MAX_WAIT_ROWS) + (wgBody > MAX_WAIT_ROWS ? 1 : 0)
           : 0;
-      // header(1) + optional attention line + column header(1) + footer(2) +
-      // wait-graph + warnings + window markers(2) + margin(1)
+      // header(1) + optional attention line + column header(1) + footer(blank + wrapped
+      // key lines) + wait-graph + warnings + window markers(2) + margin(1). The footer
+      // height tracks the width so a wrapped footer doesn't overflow the table window.
       const attn = attentionLine(snapshot, (x) => x) ? 1 : 0;
-      return 1 + attn + 1 + 2 + wgLines + snapshot.warnings.length + 2 + 1;
+      const footerRows = 1 + footerKeyLines(width).length;
+      return 1 + attn + 1 + footerRows + wgLines + snapshot.warnings.length + 2 + 1;
     }
 
     function fleetFrame(width: number, rows: number): string {
-      const maxAgentRows = Math.max(3, rows - reservedRows());
+      const maxAgentRows = Math.max(3, rows - reservedRows(width));
       return renderSnapshot(snapshot, {
         color: opts.color,
         width,
@@ -544,6 +574,34 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       return out;
     }
 
+    // WORD-wrap to `w` columns (break at spaces; char-split a token longer than w).
+    // Used for the plan/confirm body so long recipe steps read cleanly instead of
+    // breaking mid-word.
+    function wrapWords(s: string, w: number): string[] {
+      if (w <= 0 || s.length <= w) return [s];
+      const out: string[] = [];
+      let cur = "";
+      for (const word of s.split(" ")) {
+        let token = word;
+        while (token.length > w) {
+          if (cur) {
+            out.push(cur);
+            cur = "";
+          }
+          out.push(token.slice(0, w));
+          token = token.slice(w);
+        }
+        if (!cur) cur = token;
+        else if (cur.length + 1 + token.length <= w) cur += " " + token;
+        else {
+          out.push(cur);
+          cur = token;
+        }
+      }
+      if (cur) out.push(cur);
+      return out.length ? out : [""];
+    }
+
     // Compose FIELD — a compact input pinned to the bottom of the screen, with the
     // fleet/log still visible above it (paint() sizes the top region and pads so this
     // bar sits at the foot). Replaces the old full-screen modal: messaging from the
@@ -642,7 +700,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       // a wrapped line would push the cursor-home repaint out of sync and corrupt
       // the screen. The renderers already clip their lines; this covers the footer
       // and is idempotent.
-      const body = (fleetFrame(width, rows) + footer())
+      const body = (fleetFrame(width, rows) + footer(width))
         .split("\n")
         .map(clipEOL)
         .join("\n");
@@ -1116,15 +1174,25 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         : spawnView.canSpawn
           ? warn("  press y to SPAWN · any other key to go back", opts.color)
           : warn("  press any key to go back", opts.color);
+      // WRAP the (plain) plan lines so long recipe steps aren't clipped off the right
+      // edge; colored header/source lines have ANSI codes → pass them through to the
+      // ANSI-aware clip (they're short and never need wrapping). Continuation lines are
+      // indented so a wrapped step reads as one logical line.
+      const wrapW = Math.max(8, width);
+      const wrapped = spawnView.lines.flatMap((l) => {
+        if (l.includes("\x1b") || l.length <= wrapW) return [l];
+        // wrap to width-2 so the 2-space continuation indent never pushes past the edge
+        return wrapWords(l, Math.max(8, wrapW - 2)).map((seg, i) => (i ? "  " + seg : seg));
+      });
       const budget = Math.max(1, rows - 1); // reserve the prompt row
-      let shown = spawnView.lines;
+      let shown = wrapped;
       if (shown.length > budget) {
         shown = [
-          ...spawnView.lines.slice(0, budget - 1),
-          d(`  … +${spawnView.lines.length - (budget - 1)} more (full plan via the CLI --dry-run)`),
+          ...wrapped.slice(0, budget - 1),
+          d(`  … +${wrapped.length - (budget - 1)} more (full plan via the CLI --dry-run)`),
         ];
       }
-      return [...shown, prompt].map((l) => clipToWidth(l, width) + CLEAR_EOL).join("\n");
+      return [...shown, prompt].map((l) => clipToWidth(l, wrapW) + CLEAR_EOL).join("\n");
     }
 
     // ── RESET (P6): RED plan overlay → deliberate confirm → destructive execute ──
@@ -1233,15 +1301,20 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       const prompt = resetBusy
         ? d("  working… (Ctrl-C aborts the cockpit)")
         : red("  press R again to RESET (destroy + relaunch) · any other key cancels");
+      const wrapW = Math.max(8, width);
+      const wrapped = resetView.lines.flatMap((l) => {
+        if (l.includes("\x1b") || l.length <= wrapW) return [l];
+        return wrapWords(l, Math.max(8, wrapW - 2)).map((seg, i) => (i ? "  " + seg : seg));
+      });
       const budget = Math.max(1, rows - 1);
-      let shown = resetView.lines;
+      let shown = wrapped;
       if (shown.length > budget) {
         shown = [
-          ...resetView.lines.slice(0, budget - 1),
-          d(`  … +${resetView.lines.length - (budget - 1)} more (full plan via the CLI --dry-run)`),
+          ...wrapped.slice(0, budget - 1),
+          d(`  … +${wrapped.length - (budget - 1)} more (full plan via the CLI --dry-run)`),
         ];
       }
-      return [...shown, prompt].map((l) => clipToWidth(l, width) + CLEAR_EOL).join("\n");
+      return [...shown, prompt].map((l) => clipToWidth(l, wrapW) + CLEAR_EOL).join("\n");
     }
 
     // Send the composed custom message to the bound agent (resolved by session key,
