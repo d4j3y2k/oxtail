@@ -1,0 +1,152 @@
+import { strict as assert } from "node:assert";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+import { defaultFleet, loadFleetConfig } from "./spec.js";
+
+function withDirs<T>(fn: (repoRoot: string, home: string) => T): T {
+  const repoRoot = mkdtempSync(join(tmpdir(), "oxtail-spec-repo-"));
+  const home = mkdtempSync(join(tmpdir(), "oxtail-spec-home-"));
+  try {
+    return fn(repoRoot, home);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+function writeConfig(root: string, contents: string): void {
+  mkdirSync(join(root, ".oxtail"), { recursive: true });
+  writeFileSync(join(root, ".oxtail", "fleet.json"), contents);
+}
+
+const VALID = JSON.stringify({
+  name: "demo",
+  windows: [
+    { name: "main", agent: "claude", model: "opus-4.8", effort: "xhigh", role: "captain" },
+    { name: "codex", agent: "codex", model: "gpt-5.5" },
+  ],
+});
+
+// ── defaults ───────────────────────────────────────────────────────────────────
+
+test("defaultFleet is main/max/codex, named from the repo basename", () => {
+  const f = defaultFleet("/Users/dev/myrepo");
+  assert.equal(f.name, "myrepo");
+  assert.deepEqual(f.windows.map((w) => w.name), ["main", "max", "codex"]);
+  assert.equal(f.windows[0].role, "captain");
+  assert.equal(f.windows[2].agent, "codex");
+});
+
+test("defaultFleet falls back to 'fleet' with no repoRoot", () => {
+  assert.equal(defaultFleet().name, "fleet");
+});
+
+// ── resolution precedence ──────────────────────────────────────────────────────
+
+test("no config anywhere → built-in default", () => {
+  withDirs((repoRoot, home) => {
+    const r = loadFleetConfig(repoRoot, { home });
+    assert.equal(r.ok, true);
+    if (r.ok) {
+      assert.equal(r.source, "default");
+      assert.equal(r.path, null);
+      assert.equal(r.spec.windows.length, 3);
+    }
+  });
+});
+
+test("project config wins over global", () => {
+  withDirs((repoRoot, home) => {
+    writeConfig(home, JSON.stringify({ name: "GLOBAL", windows: [{ name: "g", agent: "claude" }] }));
+    writeConfig(repoRoot, VALID);
+    const r = loadFleetConfig(repoRoot, { home });
+    assert.equal(r.ok, true);
+    if (r.ok) {
+      assert.equal(r.source, "project");
+      assert.equal(r.spec.name, "demo");
+    }
+  });
+});
+
+test("global config used when there is no project config", () => {
+  withDirs((repoRoot, home) => {
+    writeConfig(home, VALID);
+    const r = loadFleetConfig(repoRoot, { home });
+    assert.equal(r.ok, true);
+    if (r.ok) assert.equal(r.source, "global");
+  });
+});
+
+// ── JSONC + validation ─────────────────────────────────────────────────────────
+
+test("JSONC comments and trailing commas are accepted", () => {
+  withDirs((repoRoot, home) => {
+    writeConfig(
+      repoRoot,
+      `{
+        // the captain
+        "name": "demo",
+        "windows": [
+          { "name": "main", "agent": "claude" }, // trailing comma below
+        ],
+      }`,
+    );
+    const r = loadFleetConfig(repoRoot, { home });
+    assert.equal(r.ok, true);
+    if (r.ok) assert.equal(r.spec.windows[0].name, "main");
+  });
+});
+
+test("an EXISTING but malformed config ERRORS — never silently falls to default", () => {
+  withDirs((repoRoot, home) => {
+    writeConfig(repoRoot, `{ "name": "x", "windows": [ { "name": "a" `); // unterminated
+    const r = loadFleetConfig(repoRoot, { home });
+    assert.equal(r.ok, false);
+    if (!r.ok) {
+      assert.equal(r.source, "project");
+      assert.match(r.error, /parse error/i);
+    }
+  });
+});
+
+test("schema violations are reported (bad agent, empty windows, missing name)", () => {
+  withDirs((repoRoot, home) => {
+    const cases: string[] = [
+      JSON.stringify({ name: "x", windows: [] }), // empty
+      JSON.stringify({ name: "x", windows: [{ name: "a", agent: "gpt" }] }), // bad enum
+      JSON.stringify({ windows: [{ name: "a", agent: "claude" }] }), // missing name
+    ];
+    for (const c of cases) {
+      writeConfig(repoRoot, c);
+      const r = loadFleetConfig(repoRoot, { home });
+      assert.equal(r.ok, false, c);
+      if (!r.ok) assert.match(r.error, /invalid fleet spec/);
+    }
+  });
+});
+
+test("duplicate window names are rejected (they map to tmux window names)", () => {
+  withDirs((repoRoot, home) => {
+    writeConfig(
+      repoRoot,
+      JSON.stringify({ name: "x", windows: [{ name: "main", agent: "claude" }, { name: "main", agent: "codex" }] }),
+    );
+    const r = loadFleetConfig(repoRoot, { home });
+    assert.equal(r.ok, false);
+    if (!r.ok) assert.match(r.error, /unique/);
+  });
+});
+
+test("a control character in a window name is rejected (FS-separator safety)", () => {
+  withDirs((repoRoot, home) => {
+    // U+001F is ownership.ts's field separator — a name carrying it would corrupt
+    // list-panes parsing. Built via fromCharCode so no literal control char in source.
+    const badName = "ma" + String.fromCharCode(0x1f) + "in";
+    writeConfig(repoRoot, JSON.stringify({ name: "x", windows: [{ name: badName, agent: "claude" }] }));
+    const r = loadFleetConfig(repoRoot, { home });
+    assert.equal(r.ok, false);
+    if (!r.ok) assert.match(r.error, /control characters/);
+  });
+});
