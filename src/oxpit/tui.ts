@@ -26,6 +26,8 @@ import { captureClipboardImage } from "./clipboard.js";
 import { parseStatusArgs, USAGE } from "./cli.js";
 import { loadFleetConfig } from "./fleet/spec.js";
 import { renderSpawnPlan, spawnFleet, tmuxSessionExists, tmuxSessionName } from "./fleet/spawn.js";
+import { buildResetPlan, discoverFleetId, renderResetPlan, resetFleet } from "./fleet/reset.js";
+import { listPanesWithMarkers } from "./fleet/ownership.js";
 import type { FleetSpec } from "./fleet/types.js";
 
 const ALT_ON = "\x1b[?1049h";
@@ -214,6 +216,24 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       | { lines: string[]; canSpawn: boolean; spec: FleetSpec; sessionName: string }
       | null = null;
     let spawnBusy = false;
+    // RESET overlay (P6): a full-screen RED plan + survivors preview → DELIBERATE
+    // confirm. `R` (capital, distinct from SPAWN) computes the dry-run plan for the
+    // SELECTED agent's session and opens it; a SECOND `R` (NOT `y` — defeats SPAWN
+    // muscle-memory) executes. The confirmed pane-ids/window-names ride into the live
+    // run (confirm-fidelity: a pane that appeared since the preview is never torn down
+    // unseen). resetBusy locks the overlay while the destructive run is in flight.
+    let resetOpen = false;
+    let resetView:
+      | {
+          lines: string[];
+          spec: FleetSpec;
+          sessionName: string;
+          fleetId: string;
+          confirmedTargets: string[];
+          confirmedMissing: string[];
+        }
+      | null = null;
+    let resetBusy = false;
     let composing = false; // typing a custom operator message in the TUI
     let composeBuf = ""; // the message being typed
     let composeTargetKey: string | null = null; // agentKey the message is bound to
@@ -255,7 +275,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
 
     // Fleet-mode footer keys (log mode carries its own footer inside the panel).
     function footer(): string {
-      const keys = "↑↓ move  ⏎ jump  n nudge  m msg  S spawn  l log  w thread  r refresh  ? help  ⌃C quit";
+      const keys = "↑↓ move  ⏎ jump  n nudge  m msg  S spawn  R reset  l log  w thread  r refresh  ? help  ⌃C quit";
       const now = Date.now();
       const msg = now < statusUntil && status ? "  " + status : "";
       return "\n" + dim("  " + keys, opts.color) + msg;
@@ -276,6 +296,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "  w             open the selected agent's thread in the panel (per-agent)",
         "                in the panel: ↑↓ move the › cursor (or scroll an expanded msg) · w expand · j/k agents · f filter · ⏎ jump",
         "  S             spawn a new agent fleet — shows the plan, y to confirm (refuses to clobber a live session)",
+        "  R             RESET the selected agent's fleet — teardown + relaunch (red plan; R again to confirm, NOT y)",
         "  r             force refresh    ?  toggle help    ⌃C (Ctrl-C)  quit",
         "",
         d("  🟢 active   🟡 idle   ⚫ dead (exited / pid-reused)"),
@@ -368,7 +389,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     // overlay / log mode, and for dead·self·pane-less rows. capturePaneActivity
     // re-verifies the pane id (a recycled id never captures a stranger).
     function maybeCaptureSelected(force: boolean): void {
-      if (composing || helpOpen || spawnOpen || mode === "log") return;
+      if (composing || helpOpen || spawnOpen || resetOpen || mode === "log") return;
       const idx = selectedIndex();
       const a = idx >= 0 ? snapshot.agents[idx] : undefined;
       if (!a || a.liveness === "dead" || a.is_self || !a.tmux_pane) {
@@ -553,6 +574,10 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       }
       if (spawnOpen) {
         stdout.write(HOME + spawnFrame(width, rows) + CLEAR_BELOW);
+        return;
+      }
+      if (resetOpen) {
+        stdout.write(HOME + resetFrame(width, rows) + CLEAR_BELOW);
         return;
       }
       if (composing) {
@@ -835,6 +860,107 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       return [...shown, prompt].map((l) => clipToWidth(l, width) + CLEAR_EOL).join("\n");
     }
 
+    // ── RESET (P6): RED plan overlay → deliberate confirm → destructive execute ──
+    // Open the READ-ONLY reset plan for the SELECTED agent's tmux session: discover
+    // the fleetId from its markers, compute the teardown plan + the survivors (the
+    // unmarked human splits that will NOT be touched), and capture the confirmed target
+    // pane-ids / missing window-names. Mutates nothing — doReset is the gated
+    // destructive execute, and it passes the captured set so the live run can only
+    // touch what the operator SAW (confirm-fidelity).
+    function openReset(): void {
+      if (resetOpen || resetBusy || spawnOpen) return;
+      const idx = selectedIndex();
+      const agent = idx >= 0 ? snapshot.agents[idx] : undefined;
+      const sessionName = agent?.tmux_session ?? null;
+      if (!sessionName) {
+        return setStatus(warn("reset: select an agent that's in a tmux session first", opts.color));
+      }
+      const cfg = loadFleetConfig(snapshot.project_root);
+      if (!cfg.ok) {
+        return setStatus(warn(`reset: fleet config invalid (${cfg.source}) — ${cfg.error}`, opts.color));
+      }
+      const spec = cfg.spec;
+      const disc = discoverFleetId(sessionName);
+      if (!disc.ok) return setStatus(warn(`reset: ${disc.reason}`, opts.color));
+      const fleetId = disc.fleetId;
+      const plan = buildResetPlan(spec, fleetId, sessionName);
+      const survivors = listPanesWithMarkers().filter((p) => p.session === sessionName && p.managedBy !== fleetId);
+      const red = (s: string) => (opts.color ? `\x1b[1m\x1b[31m${s}\x1b[0m` : s);
+      const lines: string[] = [
+        red("RESET — tear down + relaunch this fleet (DESTRUCTIVE)"),
+        ...renderResetPlan(spec, fleetId, sessionName, plan, survivors).split("\n").map((l) => "  " + l),
+      ];
+      resetView = {
+        lines,
+        spec,
+        sessionName,
+        fleetId,
+        confirmedTargets: plan.targets.map((t) => t.pane.pane),
+        confirmedMissing: plan.missing.map((w) => w.name),
+      };
+      resetOpen = true;
+      paint();
+    }
+
+    // Execute the previewed RESET. Passes confirmedTargets/confirmedMissing so the live
+    // (fresh-locked) run acts ONLY on what the operator saw — a pane that appeared since
+    // the preview is surfaced, not torn down unseen. Per-pane respawn-k (kill-session
+    // never); the unmarked survivors are structurally untouched. Busy-locked while the
+    // destructive run is in flight; the fleet refreshes on completion.
+    function doReset(): void {
+      if (!resetView || resetBusy) return;
+      const { spec, sessionName, fleetId, confirmedTargets, confirmedMissing } = resetView;
+      resetBusy = true;
+      resetView = {
+        ...resetView,
+        lines: [...resetView.lines, "", dim(`  resetting "${sessionName}"… tearing down, relaunching`, opts.color)],
+      };
+      paint();
+      resetFleet(spec, snapshot.project_root, sessionName, { dryRun: false, fleetId, confirmedTargets, confirmedMissing })
+        .then((r) => {
+          resetBusy = false;
+          resetOpen = false;
+          resetView = null;
+          if (torndown) return;
+          if (r.ok) {
+            const up = r.relaunches.filter((x) => x.ok).length;
+            const skipped = (r.unconfirmed?.targets.length ?? 0) + (r.unconfirmed?.missing.length ?? 0);
+            const drift = skipped ? ` · ${skipped} appeared-since, skipped (re-run to include)` : "";
+            setStatus(ok(`✓ reset "${r.sessionName}" — ${up}/${r.relaunches.length} relaunched${drift}`, opts.color));
+            refresh(true);
+          } else {
+            setStatus(warn(`reset failed: ${r.error ?? "see per-pane results"}`, opts.color));
+          }
+        })
+        .catch((e) => {
+          resetBusy = false;
+          resetOpen = false;
+          resetView = null;
+          if (torndown) return;
+          setStatus(warn(`reset error: ${e instanceof Error ? e.message : e}`, opts.color));
+        });
+    }
+
+    // The RESET overlay frame. Like spawnFrame, but the confirm is a DELIBERATE re-press
+    // of `R` (NOT `y`), default-cancel, so SPAWN muscle-memory can't fire a destroy.
+    function resetFrame(width: number, rows: number): string {
+      if (!resetView) return "";
+      const d = (s: string) => dim(s, opts.color);
+      const red = (s: string) => (opts.color ? `\x1b[1m\x1b[31m${s}\x1b[0m` : s);
+      const prompt = resetBusy
+        ? d("  working… (Ctrl-C aborts the cockpit)")
+        : red("  press R again to RESET (destroy + relaunch) · any other key cancels");
+      const budget = Math.max(1, rows - 1);
+      let shown = resetView.lines;
+      if (shown.length > budget) {
+        shown = [
+          ...resetView.lines.slice(0, budget - 1),
+          d(`  … +${resetView.lines.length - (budget - 1)} more (full plan via the CLI --dry-run)`),
+        ];
+      }
+      return [...shown, prompt].map((l) => clipToWidth(l, width) + CLEAR_EOL).join("\n");
+    }
+
     // Send the composed custom message to the bound agent (resolved by session key,
     // so churn can't re-point it), then leave compose mode.
     function sendCompose(): void {
@@ -1079,6 +1205,17 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         spawnView = null;
         return paint();
       }
+      if (resetOpen) {
+        // RESET confirm gate (DESTRUCTIVE): while a reset is in flight, swallow keys
+        // (Ctrl-C above still aborts); a DELIBERATE re-press of `R` executes — NOT `y`,
+        // so a reflexive SPAWN-muscle-memory `y` CANCELS instead of destroying. ANY
+        // other key closes the overlay.
+        if (resetBusy) return;
+        if (s === "R") return doReset();
+        resetOpen = false;
+        resetView = null;
+        return paint();
+      }
       if (s === "?") {
         helpOpen = !helpOpen;
         return paint();
@@ -1155,6 +1292,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       }
       if (s === "m") return startCompose();
       if (s === "S") return openSpawn(); // capital-S: deliberate (no fat-finger), opens the plan
+      if (s === "R") return openReset(); // capital-R: RESET the selected agent's fleet (red plan)
       if (s === "w") {
         // item 4: open the selected agent's thread (filtered) in the bottom panel,
         // cursor on its latest message. ↑↓ then move the cursor; w expands it.
