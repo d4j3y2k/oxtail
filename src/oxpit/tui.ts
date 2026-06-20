@@ -320,7 +320,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     // table windowing reserves exactly the footer's height (no cursor-home desync).
     function footerKeyLines(width: number): string[] {
       const items = [
-        "↑↓ move", "⏎ jump", "n nudge", "m msg", "S spawn", "R reset", "K kill",
+        "↑↓ move", "⏎ jump", "n nudge", "m msg", "S fleet", "R reset", "K kill",
         "l log", "w thread", "r refresh", "? help", "⌃C quit",
       ];
       const maxW = Math.max(16, width - 2);
@@ -995,7 +995,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       const d = (s: string) => dim(s, opts.color);
       const sessionName = tmuxSessionName(fe.fleetName);
       const lines: string[] = [
-        b("SPAWN — configure fleet") + d(`     fleet "${fe.fleetName}" → session "${sessionName}"`),
+        b("FLEET — configure") + d(`     fleet "${fe.fleetName}" → session "${sessionName}"  (y: spawn if new, sync if it exists)`),
         d(`  ${fe.note}`),
         "",
         d("  " + "window".padEnd(14) + "agent".padEnd(8) + "model".padEnd(16) + "effort".padEnd(8) + "rc"),
@@ -1330,7 +1330,11 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
           } else {
             // codex: surface the degraded/skip reason, not just "failed".
             const firstBad =
-              r.removed.find((x) => !x.ok)?.reason ?? r.added.find((x) => !x.ok)?.reason ?? r.error ?? "see results";
+              r.added.find((x) => !x.ok)?.reason ?? // the ROOT cause (a failed ADD/KEEP)…
+              r.kept.find((x) => !x.ok)?.reason ?? // …surfaces before…
+              r.removed.find((x) => !x.ok)?.reason ?? // …the CONSEQUENCE (a skipped DELETE). codex.
+              r.error ??
+              "see results";
             setStatus(warn(`sync incomplete: ${firstBad}${driftMsg}`, opts.color));
           }
           refresh(true); // surface the converged (or partial) fleet
@@ -1365,7 +1369,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       const budget = Math.max(1, rows - 1);
       let shown = wrapped;
       if (shown.length > budget) {
-        shown = [...wrapped.slice(0, budget - 1), d(`  … +${wrapped.length - (budget - 1)} more (full plan via the CLI --dry-run)`)];
+        shown = [...wrapped.slice(0, budget - 1), d(`  … +${wrapped.length - (budget - 1)} more (resize the terminal taller to see the full plan)`)];
       }
       return [...shown, prompt].map((l) => clipToWidth(l, wrapW) + CLEAR_EOL).join("\n");
     }
