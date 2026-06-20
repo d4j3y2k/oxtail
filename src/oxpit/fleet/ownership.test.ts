@@ -53,6 +53,25 @@ test("listPanesWithMarkers parses tmux's OCTAL-ESCAPED separator (real -F output
   assert.equal(panes[1].managedBy, null);
 });
 
+test("a foreign pane whose NAME contains a literal \\037 is SKIPPED, not made a phantom marker (max P5)", () => {
+  // tmux does NOT escape backslashes, so a window/session name literally holding
+  // the 4 chars "\037" renders identically to the escaped 0x1F separator — safeStr
+  // permits "\","0","3","7". Such a foreign pane (we never spawn it) injects EXTRA
+  // fields; the exact-count guard must SKIP it so it reads as UNOWNED, NOT mis-parse
+  // a truthy field onto `managedBy` and fabricate a phantom fleetId (false ownership
+  // is the dangerous direction for a teardown control). Fails on the old `< 7`.
+  const run = fakeRunEscaped([
+    ["%1", "oxtail", "0", "main", "1000", "claude", "oxtail-abcd1234"], // healthy → 7 fields
+    ["%9", "human", "0", "wei\\037rd", "2000", "nvim", ""], // window name carries \037 → ≥8 fields
+  ]);
+  const panes = listPanesWithMarkers(run);
+  assert.equal(panes.length, 1, "poisoned foreign row skipped, healthy row kept");
+  assert.equal(panes[0].pane, "%1");
+  assert.equal(panes[0].managedBy, "oxtail-abcd1234");
+  // CRITICAL: the foreign \037-named pane must inject NO phantom ownership.
+  assert.deepEqual(markersInSession("human", run), [], "no phantom fleetId from a foreign name");
+});
+
 test("markersInSession works on tmux's OCTAL-ESCAPED output (the live-tmux path)", () => {
   const run = fakeRunEscaped([
     ["%1", "oxtail", "0", "main", "1000", "claude", "oxtail-abcd1234"],
