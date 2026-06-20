@@ -7,7 +7,6 @@
 // (#5), busy/idle activity gating, the strict wake-on-reply default, and the
 // durable pending-ask pull-back.
 
-import { execFileSync } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -22,6 +21,7 @@ import { consumePendingAsk, defaultPendingAskDir } from "./pending-ask.js";
 import { chooseVerifiedWakePane, type RegistryEntry } from "./registry.js";
 import { trace } from "./trace.js";
 import { markWoke, newWakeDebounceStore, recentlyWoke } from "./wake-debounce.js";
+import { fireKeystrokes } from "./keystrokes.js";
 
 // Typed into the peer's TUI as a synthetic prompt, so it lands in their context
 // once per wake — kept terse. For HOOKED Claude Code the delivered envelope
@@ -31,17 +31,9 @@ import { markWoke, newWakeDebounceStore, recentlyWoke } from "./wake-debounce.js
 export const ASK_PEER_WAKE_TEXT =
   "oxtail msg: read_my_messages; reply via send_message; set reply_to=request_id if present";
 
-// Codex's TUI has a paste-burst heuristic at codex-rs/tui/src/bottom_pane/
-// paste_burst.rs (PASTE_BURST_MIN_CHARS=3, PASTE_BURST_CHAR_INTERVAL=8ms,
-// PASTE_ENTER_SUPPRESS_WINDOW=120ms). When `tmux send-keys` blasts the
-// literal-text payload followed immediately by Enter, Codex detects the
-// pattern as a paste and forcibly converts Enter→newline for ~120ms,
-// suppressing the submit. Inserting a delay between the text and the Enter
-// keystrokes lets the suppression window expire so Enter is treated as a
-// real keypress. 500ms is a generous multiple of the documented window for
-// upstream-drift safety — Codex point releases may bump the constant.
-// Verified empirically 2026-05-13 against Codex (gpt-5.5 xhigh).
-const ASK_PEER_CODEX_SUBMIT_DELAY_MS = 500;
+// The Codex paste-burst gap (CODEX_SUBMIT_DELAY_MS) and the low-level fire
+// primitive (fireKeystrokes) now live in ./keystrokes.ts, shared with the oxpit
+// fleet executor; see that module for the paste-burst rationale + verification.
 
 export type WakeStatus =
   | "fired"             // wake keystrokes were sent (peer should enter a turn)
@@ -75,8 +67,8 @@ const ASK_PEER_WAKE_STRATEGY: "auto" | "legacy" | "off" = (() => {
 //   Codex — `tmux send-keys -l <text>` followed by `send-keys Enter` would
 //   work, EXCEPT Codex's paste-burst heuristic suppresses Enter for 120ms
 //   after a fast typing burst (codex-rs/tui/src/bottom_pane/paste_burst.rs).
-//   We insert ASK_PEER_CODEX_SUBMIT_DELAY_MS between the text and the Enter
-//   so the suppression window expires. Verified live 2026-05-13.
+//   fireKeystrokes (./keystrokes.ts) inserts CODEX_SUBMIT_DELAY_MS between the
+//   text and the Enter so the suppression window expires. Verified live 2026-05-13.
 //
 //   Claude Code — `tmux send-keys -l <text>` + immediate `send-keys Enter`,
 //   no inter-keystroke gap. The Claude Code TUI has no paste-burst heuristic
@@ -94,39 +86,13 @@ const ASK_PEER_WAKE_STRATEGY: "auto" | "legacy" | "off" = (() => {
 //   promise; if a new TUI lands and breaks, we treat it as unknown until
 //   verified.
 //
-// Two send-keys calls: the text is interpreted literally (-l) and Enter is
-// parsed as a key event. The -l flag neutralizes any tmux keysequences a
-// malicious peer could plant in its registry entry.
-//
 // askPeerWakeImpl keeps a generic pane→sessionName retry for its own unit
 // tests, but PRODUCTION wakePeer now passes only the process-tree-verified pane
 // (sessionName = null): a self-written tmux_session is not a trustworthy
 // send-keys target (issue #6), and pane-id churn is handled by re-resolving the
 // pane from server_pid on every wake rather than by a session fallback.
-async function defaultFireWakeKeystrokes(
-  target: string,
-  clientType: ClientType,
-  text: string = ASK_PEER_WAKE_TEXT,
-): Promise<void> {
-  // timeout: a hung tmux server must not block the MCP request thread indefinitely.
-  execFileSync("tmux", ["send-keys", "-t", target, "-l", text], {
-    stdio: ["ignore", "pipe", "pipe"],
-    timeout: 2000,
-  });
-  if (clientType === "codex") {
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, ASK_PEER_CODEX_SUBMIT_DELAY_MS);
-      timer.unref?.();
-    });
-  }
-  execFileSync("tmux", ["send-keys", "-t", target, "Enter"], {
-    stdio: ["ignore", "pipe", "pipe"],
-    timeout: 2000,
-  });
-}
-
 // Exported for unit testing the retry path; production callers use wakePeer
-// which wires defaultFireWakeKeystrokes via routing.
+// which wires fireKeystrokes (./keystrokes.ts) via routing.
 export async function askPeerWakeImpl(
   pane: string | null,
   sessionName: string | null,
@@ -207,10 +173,10 @@ export async function wakePeer(
     });
   }
   // Legacy mode bypasses per-client routing: every wake is the v0.6 sequence
-  // (no inter-keystroke delay). Cast to "unknown" so defaultFireWakeKeystrokes
-  // skips the Codex delay branch.
+  // (no inter-keystroke delay). Cast to "unknown" so fireKeystrokes skips the
+  // Codex delay branch.
   const fireType: ClientType = ASK_PEER_WAKE_STRATEGY === "legacy" ? "unknown" : clientType;
-  const fire = (target: string) => defaultFireWakeKeystrokes(target, fireType, wakeText);
+  const fire = (target: string) => fireKeystrokes(target, fireType, wakeText);
   // #5: stamp the debounce BEFORE the (possibly async, paste-burst-delayed) fire
   // so a concurrent second wakePeer for this peer — which runs while we're
   // awaiting send-keys — sees the stamp and coalesces instead of double-firing.

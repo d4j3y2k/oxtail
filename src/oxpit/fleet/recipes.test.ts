@@ -1,0 +1,305 @@
+import { strict as assert } from "node:assert";
+import { test } from "node:test";
+import type { PaneClassification } from "./classify.js";
+import {
+  buildLaunchCommand,
+  buildRcCommand,
+  buildRcSession,
+  buildRecipe,
+  buildSelfJoinInstruction,
+  clientTypeFor,
+  executeRecipe,
+  type Recipe,
+  type RecipeEffects,
+  type RecipeStep,
+  recipesForFleet,
+  renderRecipe,
+  shellSingleQuote,
+} from "./recipes.js";
+import type { FleetWindowSpec } from "./types.js";
+
+const main: FleetWindowSpec = {
+  name: "main",
+  agent: "claude",
+  model: "opus[1m]",
+  effort: "xhigh",
+  role: "captain",
+};
+const codexWin: FleetWindowSpec = { name: "codex", agent: "codex", model: "gpt-5.5" };
+
+test("clientTypeFor maps the AgentKind to oxtail's ClientType", () => {
+  assert.equal(clientTypeFor("claude"), "claude-code");
+  assert.equal(clientTypeFor("codex"), "codex");
+});
+
+test("buildLaunchCommand shell-quotes the spec model into --model", () => {
+  assert.equal(buildLaunchCommand(main), "claude --model 'opus[1m]' --effort 'xhigh'");
+  assert.equal(buildLaunchCommand(codexWin), "codex --model 'gpt-5.5'");
+  assert.equal(buildLaunchCommand({ name: "x", agent: "claude" }), "claude");
+});
+
+test("buildLaunchCommand applies effort as a launch flag per client", () => {
+  // Claude: first-class --effort flag (verified in `claude --help`).
+  assert.equal(
+    buildLaunchCommand({ name: "max", agent: "claude", model: "opus[1m]", effort: "max" }),
+    "claude --model 'opus[1m]' --effort 'max'",
+  );
+  assert.equal(
+    buildLaunchCommand({ name: "main", agent: "claude", effort: "xhigh" }),
+    "claude --effort 'xhigh'",
+  );
+  // Codex: a `-c` config override on the same key its config.toml uses, value
+  // TOML-quoted to match the documented `-c model="o3"` form, and the whole
+  // key="value" kept a single shell-quoted token (no command injection).
+  assert.equal(
+    buildLaunchCommand({ name: "codex", agent: "codex", model: "gpt-5.5", effort: "high" }),
+    `codex --model 'gpt-5.5' -c 'model_reasoning_effort="high"'`,
+  );
+  // No effort → no flag: a default-fleet Codex inherits ~/.codex/config.toml.
+  assert.equal(buildLaunchCommand(codexWin), "codex --model 'gpt-5.5'");
+});
+
+test("buildLaunchCommand neutralizes shell metacharacters in a hostile spec model", () => {
+  // A repo .oxtail/fleet.json must not be able to run a second command on SPAWN.
+  const evil = buildLaunchCommand({ name: "x", agent: "codex", model: "gpt-5.5; touch /tmp/pwn" });
+  assert.equal(evil, "codex --model 'gpt-5.5; touch /tmp/pwn'");
+  // The metachars live INSIDE the single-quoted token — the shell sees one arg.
+  assert.ok(!/;\s*touch/.test(evil.replace(/'[^']*'/g, "''")), "no bare ; survives outside quotes");
+});
+
+test("shellSingleQuote escapes embedded single quotes", () => {
+  assert.equal(shellSingleQuote("o'clock"), `'o'\\''clock'`);
+  assert.equal(shellSingleQuote("plain"), "'plain'");
+});
+
+test("buildRecipe: Claude omits joinClaim (hook auto-joins)", () => {
+  const r = buildRecipe(main);
+  assert.deepEqual(r.steps.map((s) => s.op), ["sendLiteral", "waitExternal", "claimCheck"]);
+  assert.equal(
+    r.steps[0].op === "sendLiteral" && r.steps[0].text,
+    "claude --model 'opus[1m]' --effort 'xhigh'",
+  );
+  assert.equal(r.steps[1].op === "waitExternal" && r.steps[1].artifact, "claude");
+});
+
+test("buildRecipe: Codex uses selfJoinClaim and has NO passive waitExternal (lazy rollout)", () => {
+  // The join IS the readiness stimulus (it creates the rollout), so there's no
+  // separate waitExternal — selfJoinClaim binds the id, then claimCheck confirms.
+  const r = buildRecipe(codexWin);
+  assert.deepEqual(r.steps.map((s) => s.op), ["sendLiteral", "selfJoinClaim", "claimCheck"]);
+  assert.ok(!r.steps.some((s) => s.op === "waitExternal"), "Codex must not passively waitExternal");
+});
+
+test("buildSelfJoinInstruction is a self-resolve join (Bash $CODEX_THREAD_ID → claim_session)", () => {
+  const s = buildSelfJoinInstruction();
+  assert.match(s, /CODEX_THREAD_ID/);
+  assert.match(s, /CODEX_COMPANION_SESSION_ID/); // documented fallback
+  assert.match(s, /claim_session/);
+  assert.ok(!s.startsWith("/"), "no leading slash command");
+  assert.ok(!/```/.test(s), "no code fences");
+  assert.ok(!/"019|session_id "/.test(s), "no pre-baked explicit id — Codex supplies its own");
+});
+
+test("recipesForFleet maps each window to a recipe", () => {
+  const recipes = recipesForFleet({ windows: [main, codexWin] });
+  assert.deepEqual(recipes.map((r) => r.client), ["claude", "codex"]);
+});
+
+test("renderRecipe prints exact, reviewable dry-run steps", () => {
+  const out = renderRecipe(buildRecipe(main));
+  assert.match(out, /recipe: claude "main \(captain\)"/);
+  assert.match(out, /launch: claude --model 'opus\[1m\]' --effort 'xhigh'/);
+  assert.match(out, /1\. sendLiteral "claude --model 'opus\[1m\]' --effort 'xhigh'"/);
+  assert.match(out, /2\. waitExternal claude/);
+  assert.match(out, /3\. claimCheck/);
+});
+
+// ── executor ────────────────────────────────────────────────────────────────
+
+function fx(over: Partial<RecipeEffects> = {}): { fx: RecipeEffects; sent: string[] } {
+  const sent: string[] = [];
+  const base: RecipeEffects = {
+    fireLiteral: async (t) => {
+      sent.push(t);
+    },
+    sendKey: async (k) => {
+      sent.push(`<key:${k}>`);
+    },
+    confirmLine: async () => true,
+    classify: (): PaneClassification => ({ readiness: "tui-ready" }),
+    waitExternal: async () => ({ ok: true, sessionId: "sid-xyz" }),
+    selfJoinClaim: async () => {
+      sent.push("<selfJoin>");
+      return { ok: true, sessionId: "sid-codex" };
+    },
+    claimCheck: () => true,
+    remoteControl: async (rc) => {
+      sent.push(`<rc:${rc}>`);
+    },
+  };
+  return { fx: { ...base, ...over }, sent };
+}
+
+test("happy path: binds the session and confirms the claim", async () => {
+  const { fx: effects, sent } = fx();
+  const res = await executeRecipe(buildRecipe(main), effects);
+  assert.equal(res.ok, true);
+  if (res.ok) assert.equal(res.sessionId, "sid-xyz");
+  assert.deepEqual(sent, ["claude --model 'opus[1m]' --effort 'xhigh'"]);
+});
+
+test("Codex happy path: selfJoinClaim BINDS the session (no pre-bound waitExternal), then confirms", async () => {
+  const { fx: effects, sent } = fx();
+  const res = await executeRecipe(buildRecipe(codexWin), effects);
+  assert.equal(res.ok, true);
+  // the session id comes from selfJoinClaim (the rollout the join creates), NOT a
+  // passive waitExternal.
+  if (res.ok) assert.equal(res.sessionId, "sid-codex");
+  assert.deepEqual(sent, ["codex --model 'gpt-5.5'", "<selfJoin>"]);
+});
+
+test("selfJoinClaim failure stops the recipe with its reason + dump", async () => {
+  const { fx: effects } = fx({
+    selfJoinClaim: async () => ({ ok: false, reason: "no rollout after 3 sends", dump: "PANE TEXT" }),
+  });
+  const res = await executeRecipe(buildRecipe(codexWin), effects);
+  assert.equal(res.ok, false);
+  if (!res.ok) {
+    assert.equal(res.failed.op, "selfJoinClaim");
+    assert.match(res.reason, /no rollout after 3 sends/);
+    assert.equal(res.dump, "PANE TEXT");
+  }
+});
+
+test("a free-standing joinClaim-style step type no longer exists — selfJoinClaim is the binder", async () => {
+  // selfJoinClaim doesn't require a pre-bound session (it PRODUCES one), so the old
+  // "join before a bound session" hard-error is gone by construction.
+  const recipe: Recipe = {
+    client: "codex",
+    label: "codex",
+    launchCommand: "codex",
+    steps: [{ op: "selfJoinClaim" }, { op: "claimCheck" }],
+  };
+  const res = await executeRecipe(recipe, fx().fx);
+  assert.equal(res.ok, true);
+  if (res.ok) assert.equal(res.sessionId, "sid-codex");
+});
+
+test("waitExternal failure stops the recipe with that reason (Claude path)", async () => {
+  // waitExternal is now the CLAUDE readiness step (Codex binds via selfJoinClaim).
+  const { fx: effects } = fx({
+    waitExternal: async () => ({ ok: false, reason: "drop never appeared" }),
+  });
+  const res = await executeRecipe(buildRecipe(main), effects);
+  assert.equal(res.ok, false);
+  if (!res.ok) {
+    assert.equal(res.failed.op, "waitExternal");
+    assert.match(res.reason, /drop never appeared/);
+  }
+});
+
+test("claimCheck failure surfaces non-adoption (external truth, not pane text)", async () => {
+  const { fx: effects } = fx({ claimCheck: () => false });
+  const res = await executeRecipe(buildRecipe(main), effects);
+  assert.equal(res.ok, false);
+  if (!res.ok) {
+    assert.equal(res.failed.op, "claimCheck");
+    assert.match(res.reason, /not resolvable in the oxtail registry/);
+  }
+});
+
+test("classifyPane gate aborts loudly on an unexpected pane state", async () => {
+  const recipe: Recipe = {
+    client: "claude",
+    label: "main",
+    launchCommand: "claude",
+    steps: [{ op: "classifyPane", expect: ["tui-ready"] }],
+  };
+  const { fx: effects } = fx({
+    classify: () => ({ readiness: "blocked-interstitial", reason: "trust-folder prompt" }),
+  });
+  const res = await executeRecipe(recipe, effects);
+  assert.equal(res.ok, false);
+  if (!res.ok) assert.match(res.reason, /blocked-interstitial" \(trust-folder prompt\), expected/);
+});
+
+test("sendLiteral with a confirm needle that never prints fails", async () => {
+  const recipe: Recipe = {
+    client: "claude",
+    label: "main",
+    launchCommand: "x",
+    steps: [{ op: "sendLiteral", text: "setup ; echo NONCE", confirm: "NONCE" }],
+  };
+  const { fx: effects } = fx({ confirmLine: async () => false });
+  const res = await executeRecipe(recipe, effects);
+  assert.equal(res.ok, false);
+  if (!res.ok) assert.match(res.reason, /confirm needle .* never printed/);
+});
+
+test("claimCheck before a session is bound is a hard error", async () => {
+  const recipe: Recipe = {
+    client: "claude",
+    label: "main",
+    launchCommand: "x",
+    steps: [{ op: "claimCheck" }],
+  };
+  const res = await executeRecipe(recipe, fx().fx);
+  assert.equal(res.ok, false);
+  if (!res.ok) assert.match(res.reason, /before a session was bound/);
+});
+
+test("an explicit abort step stops with its reason", async () => {
+  const recipe: Recipe = {
+    client: "codex",
+    label: "codex",
+    launchCommand: "codex",
+    steps: [{ op: "abort", reason: "half-up pane — refusing to type on top" } as RecipeStep],
+  };
+  const res = await executeRecipe(recipe, fx().fx);
+  assert.equal(res.ok, false);
+  if (!res.ok) assert.match(res.reason, /half-up pane/);
+});
+
+// ── remoteControl (Claude /rc) ──────────────────────────────────────────────────
+
+test("buildRcSession + buildRcCommand: <session>-<window> and /rc \"…\"", () => {
+  assert.equal(buildRcSession("strudel", "main"), "strudel-main");
+  assert.equal(buildRcCommand("strudel-main"), '/rc "strudel-main"');
+});
+
+test("buildRecipe: claude + remoteControl appends /rc AFTER claimCheck with the baked session name", () => {
+  const w = { name: "main", agent: "claude" as const, model: "opus[1m]", effort: "xhigh", remoteControl: true };
+  const r = buildRecipe(w, { sessionName: "strudel" });
+  assert.deepEqual(r.steps.map((s) => s.op), ["sendLiteral", "waitExternal", "claimCheck", "remoteControl"]);
+  const rc = r.steps.find((s) => s.op === "remoteControl");
+  assert.equal(rc && rc.op === "remoteControl" && rc.rcSession, "strudel-main");
+  assert.match(renderRecipe(r), /remoteControl \/rc "strudel-main"/);
+});
+
+test("buildRecipe: no remoteControl → no rc step; codex never gets one", () => {
+  const noRc = buildRecipe({ name: "main", agent: "claude", remoteControl: false }, { sessionName: "s" });
+  assert.ok(!noRc.steps.some((s) => s.op === "remoteControl"));
+  // a (rejected-at-spec, but defensively guarded) codex+rc still yields NO rc step.
+  const codexRc = buildRecipe({ name: "codex", agent: "codex", remoteControl: true }, { sessionName: "s" });
+  assert.ok(!codexRc.steps.some((s) => s.op === "remoteControl"), "codex never gets /rc");
+});
+
+test("executor: remoteControl fires /rc after the claim (happy path)", async () => {
+  const w = { name: "main", agent: "claude" as const, model: "opus[1m]", remoteControl: true };
+  const { fx: effects, sent } = fx();
+  const res = await executeRecipe(buildRecipe(w, { sessionName: "strudel" }), effects);
+  assert.equal(res.ok, true);
+  assert.deepEqual(sent, ["claude --model 'opus[1m]'", "<rc:strudel-main>"]);
+});
+
+test("executor: a remoteControl send FAILURE is non-fatal (launch already succeeded)", async () => {
+  const w = { name: "main", agent: "claude" as const, remoteControl: true };
+  const { fx: effects } = fx({
+    remoteControl: async () => {
+      throw new Error("send-keys exploded");
+    },
+  });
+  const res = await executeRecipe(buildRecipe(w, { sessionName: "s" }), effects);
+  assert.equal(res.ok, true, "rc is best-effort — a good launch must not fail on it");
+  if (res.ok) assert.equal(res.sessionId, "sid-xyz");
+});

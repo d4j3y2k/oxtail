@@ -388,6 +388,40 @@ test("phase-e: tail_scan skips malformed and blank lines like the full scan", ()
   }
 });
 
+test("readCodexTranscript: a truncated FINAL line (respawn-k mid-write) is skipped — prior records survive (RESET safety)", () => {
+  // The exact shape a tmux `respawn-pane -k` (RESET teardown) can leave behind:
+  // complete Codex rollout records, then a torn final JSON object cut off mid-write
+  // with NO trailing newline. The reader must return the complete records and drop
+  // the torn tail — this is WHY v1 RESET can hard-kill Codex (respawn-k-only) without
+  // rollout corruption beyond the killed in-flight turn (codex-verified P6 button gate).
+  const dir = mkdtempSync(join(tmpdir(), "oxtail-transcripts-"));
+  const path = join(dir, "rollout.jsonl");
+  const rec = (text: string) =>
+    JSON.stringify({
+      type: "response_item",
+      payload: { type: "message", role: "user", content: [{ type: "input_text", text }] },
+    });
+  const torn =
+    '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"interrup';
+  writeFileSync(path, `${rec("first turn")}\n${rec("second turn")}\n${torn}`); // no trailing newline
+  try {
+    const full = readCodexTranscript(path, { limit: 100 });
+    assert.deepEqual(
+      full.messages.map((m) => m.text),
+      ["first turn", "second turn"],
+      "full scan keeps the complete records, drops the torn tail",
+    );
+    const tail = readCodexTranscript(path, { limit: 100, tailScan: true, chunkSize: 16 });
+    assert.deepEqual(
+      tail.messages.map((m) => m.text),
+      ["first turn", "second turn"],
+      "tail scan likewise skips the torn tail",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("phase-e: tail_scan applies Codex injected-block filtering", () => {
   const { path, cleanup } = writeTempRollout([
     {

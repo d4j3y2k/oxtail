@@ -27,7 +27,7 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 **Claude Code** — add to `~/.claude.json` (global) or any project's `.mcp.json`:
 
 ```jsonc
-{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.22.1"] } } }
+{ "mcpServers": { "oxtail": { "command": "npx", "args": ["-y", "oxtail@0.23.0"] } } }
 ```
 
 **Codex CLI** — add to `~/.codex/config.toml`:
@@ -35,14 +35,14 @@ End users — paste into your MCP config and oxtail is fetched from npm on first
 ```toml
 [mcp_servers.oxtail]
 command = "npx"
-args = ["-y", "oxtail@0.22.1"]
+args = ["-y", "oxtail@0.23.0"]
 ```
 
 **Claude slash command** (`/oxtail-join`) — optional once the hooks are installed (the v0.17 SessionStart hook auto-joins Claude Code sessions; see [How session_id resolution works](#how-session_id-resolution-works-v040)); still the explicit fallback:
 
 ```sh
 mkdir -p ~/.claude/commands
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.22.1/.claude/commands/oxtail-join.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.23.0/.claude/commands/oxtail-join.md \
   -o ~/.claude/commands/oxtail-join.md
 ```
 
@@ -50,9 +50,9 @@ curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.22.1/.claude/command
 
 ```sh
 mkdir -p ~/.codex/skills/oxtail-join/agents
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.22.1/integrations/codex/oxtail-join/SKILL.md \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.23.0/integrations/codex/oxtail-join/SKILL.md \
   -o ~/.codex/skills/oxtail-join/SKILL.md
-curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.22.1/integrations/codex/oxtail-join/agents/openai.yaml \
+curl -L https://raw.githubusercontent.com/d4j3y2k/oxtail/v0.23.0/integrations/codex/oxtail-join/agents/openai.yaml \
   -o ~/.codex/skills/oxtail-join/agents/openai.yaml
 ```
 
@@ -82,7 +82,7 @@ Contributing? `git clone https://github.com/d4j3y2k/oxtail && cd oxtail && npm i
 - `register_my_session` — pin this MCP server's `session_id` directly. Kept for debugging; prefer `claim_session`.
 - `get_my_session` — return this MCP server's own registry entry plus a per-strategy detection diagnosis. Useful for debugging.
 
-See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.22.1/AGENTS.md) for scope and architecture.
+See [design principles](https://github.com/d4j3y2k/oxtail/blob/v0.23.0/AGENTS.md) for scope and architecture.
 
 ## Usage from an agent
 
@@ -257,7 +257,7 @@ All wake paths funnel through one place, which **coalesces** rapid repeat wakes 
 If `ask_peer` returns an abort error before its built-in 60s timeout fires, your MCP client's tool-call ceiling is lower than 60s. Override the bound at server startup:
 
 ```sh
-OXTAIL_ASK_PEER_TIMEOUT_MS=30000 npx -y oxtail@0.22.1
+OXTAIL_ASK_PEER_TIMEOUT_MS=30000 npx -y oxtail@0.23.0
 ```
 
 The server reads the env var once at boot and uses it as the fixed timeout for all `ask_peer` calls in that session. Values must be positive numbers; anything else falls back to the 60000ms default.
@@ -366,8 +366,9 @@ The one thing oxpit *writes* is an **operator message** (`m` to compose, `n` to 
 
 ## Status
 
-v0.22.1. Patch — operator messages sent from the **oxpit** cockpit now reach the target agent **whole**. The pane wake (what the agent reads as a direct message) was capped at 240 chars and trailed off with a bare `…`, so a paragraph-length note arrived chopped mid-sentence and read like the operator had *stopped typing* — the recipient would answer the fragment instead of pulling the full body from its mailbox. The cap is raised to 1500 (normal messages land verbatim) and a genuine overflow now appends an explicit marker naming oxpit as the truncator and pointing at the durable copy (`read_my_messages`). Delivery/mailbox path unchanged; no protocol or hook change (hooks stay **v14**).
+v0.23.0. Minor — **oxpit goes VIEWER → ACTOR.** The fleet cockpit can now stand up, converge, and tear down whole tmux agent-fleets from a `.oxtail/fleet.json` spec, all idempotent and **dry-run by default**: **SPAWN** (create a fresh fleet — one window per spec entry, each agent launched, bound to its launch-time readiness artifact, and auto-joined), **SYNC** (converge a *live* fleet to the spec — add windows it gained, delete windows it lost, and leave healthy ones running **untouched**), and **RESET** (teardown + relaunch in place). Every mutation is **additive-allowlist-guarded** — only panes carrying oxpit's `@oxpit_managed` marker AND matching a spec window are ever touched, so a human's editor or dev-server split in the same session is structurally safe — **confirm-fidelity-gated** (the live run only acts on what the operator saw in the preview), and held under a per-repo fleet lock. Built and hardened by the framework on itself: dual peer review (security + UX) over multiple rounds plus a 3-lens compile-sim gap-hunt. Hooks unchanged (**v14**).
 
+- **oxpit fleet lifecycle — SPAWN / SYNC / RESET (v0.23.0).** oxpit becomes an ACTOR: `S` opens a grid editor over the `.oxtail/fleet.json` fleet spec, then `y` **applies** it — SPAWN a fresh tmux fleet if the session is new, or **SYNC** (converge) a live one if it already exists (add/delete windows without restarting the agents you keep); `R` RESETs a fleet (teardown + relaunch in place); `K` kills one window. The core is an idempotent `ensure_window` — a non-destructive level-probe that no-ops a healthy window and never types into a live agent — bound to a launch-time readiness artifact (Claude's SessionStart drop / Codex's first-turn rollout, ppid/cwd-bound to the launched pane). Safety is structural: an `@oxpit_managed=<fleetId>` ownership marker means a teardown can only ever touch panes oxpit spawned — `kill-session` is banned, deletes are per-window and quadruple-guarded (ownership + last-window + unmanaged-split + a live identity re-check at mutation time), and every destructive run is dry-run-by-default, confirm-fidelity-gated, and lock-held. Designed and reviewed end-to-end by oxtail's own multi-agent loop — built across a context handoff, security- and UX-reviewed by the live Codex peer over four rounds, and gap-hunted by a 3-lens compile-sim that caught two HIGH bugs before ship. Hooks unchanged (v14).
 - **oxpit operator messages arrive whole (v0.22.1).** `operatorWakeText` capped the pane wake at 240 chars + a bare `…`; a paragraph-length operator note was chopped mid-sentence and misread as the operator trailing off (recipient replied *"finish when you can"*) instead of reading the full body from its mailbox. Cap raised 240 → 1500 (normal messages land verbatim in the pane); on real overflow the marker now names oxpit as the truncator and points at `read_my_messages` for the durable full copy. Delivery path untouched — the body was always delivered whole (oxpit's comms-log showed it complete); only the pane preview was lossy. Hooks unchanged (**v14**).
 - **Standalone `oxpit` command + supply-chain hygiene (v0.22.0).** New `oxpit` bin → `npm i -g oxtail` then `oxpit` from any repo (auto-scopes to the cwd project; `npx oxtail oxpit` for no-install); the `oxtail oxpit` subcommand and the standalone bin share one `runOxpitCli` wrapper (single terminal-restore backstop). Lockfile bumped to `hono 4.12.25` / `qs 6.15.2` / `esbuild 0.28.1` (unreachable HTTP-stack advisories; `package.json` deps unchanged, all in-range), repo audit clean, posture documented.
 - **oxpit fleet cockpit (v0.21.0, hooks v14).** `oxtail status` / `oxtail oxpit` — a read-only VIEW that infers liveness, the wait-graph (+ live-deadlock and orphaned-wait detection), real-time tool/pane activity badges, a cross-fleet comms-log, jump-to-pane, and operator messaging/attachments, built on the canonical registry/ledger/mailbox modules rather than re-deriving their semantics. Stranded **work or mail** on a dead owner surfaces as fleet trouble (`--check`). Core touches are additive (a passive non-reaping registry reader, read-only ledger listers, an `origin:"operator"` message provenance, an optional wake-text param); operator messages are unforgeable over MCP and framed untrusted/one-way. Two-reviewer pre-public ship gate (max + codex) with an empirical degradation pass (no-tmux / no-git / non-TTY / narrow / no-color).

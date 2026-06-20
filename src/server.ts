@@ -182,6 +182,15 @@ function makeReadResult(o: {
   };
 }
 
+// KNOWN LIMITATION (tracked follow-up, surfaced by the oxpit P5 fleet review):
+// these `-F` templates split on a literal `|`, but `#{session_name}` and the
+// path fields are arbitrary — a session name or cwd containing `|` mis-splits the
+// row, so scope detection / list_project_sessions can silently lie. Unlike a
+// control byte, `|` is NOT escaped by tmux (only <0x09 / >=0x1d-class bytes are —
+// see ownership.ts), so it survives raw into the output. A real fix wants a
+// tmux-escape-aware separator (e.g. normalize the octal-escaped 0x1F like
+// ownership.ts now does) or per-field queries; left as a follow-up because it's
+// the server detection path, not the fleet ownership blast radius.
 const TMUX_LIST_FORMAT =
   "#{session_name}|#{session_path}|#{session_created}|#{session_attached}|#{session_windows}";
 
