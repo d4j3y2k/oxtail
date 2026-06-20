@@ -13,8 +13,9 @@ import {
   readPaneMarker,
 } from "./ownership.js";
 import type { Recipe } from "./recipes.js";
+import { resetFleet } from "./reset.js";
 import { spawnFleet } from "./spawn.js";
-import type { FleetSpec } from "./types.js";
+import type { FleetSpec, FleetWindowSpec } from "./types.js";
 
 // Opt-in real-tmux integration for the SPAWN orchestration (P5). Gated on
 // OXTAIL_TMUX_TESTS=1 because it spawns real tmux sessions (slow, environment-
@@ -233,6 +234,79 @@ test(
 
         // The stubbed agent-exec fired ONLY for the empty-shell window.
         assert.deepEqual(launched, ["empty"], "launch fired only on empty-shell");
+      } finally {
+        killSession(session);
+      }
+    });
+  },
+);
+
+test(
+  "reset-tmux: REAL respawn-k teardown + relaunch — marker survives, human split untouched, NO kill-session",
+  { skip: skip || !tmuxOk() },
+  async () => {
+    // The DESTRUCTIVE path against real tmux (P5 lesson: live-test the scary code
+    // before trusting it). Real respawn-pane -k teardown; ONLY the relaunch leaf is
+    // stubbed (no billable agents). Verifies: marked panes reset to fresh shells with
+    // the marker preserved, an UNMARKED human split is structurally untouched, and the
+    // session survives (kill-session is banned).
+    const session = `oxtail-reset-test-${process.pid}-${Date.now()}`;
+    const spec: FleetSpec = {
+      name: "oxspike",
+      windows: [
+        { name: "main", agent: "claude", model: "opus-4.8" },
+        { name: "max", agent: "claude", model: "opus-4.8" },
+      ],
+    };
+    await withTempRepo(async (repoRoot) => {
+      const fleetId = mintFleetId("oxspike");
+      const relaunched: string[] = [];
+      const stubEnsure = async (o: { target: string; window: FleetWindowSpec; fleetId: string; cwd: string }) => {
+        relaunched.push(`${o.window.name}@${o.target}`);
+        return {
+          window: o.window.name,
+          occupancy: "empty-shell" as const,
+          action: "launched" as const,
+          ok: true,
+          sessionId: `stub-${o.window.name}`,
+        } satisfies EnsureWindowResult;
+      };
+      const pane = (w: string) => tmuxRaw(["list-panes", "-t", `=${session}:${w}`, "-F", "#{pane_id}"]).trim();
+      const pid = (p: string) => tmuxRaw(["display-message", "-p", "-t", p, "#{pane_pid}"]).trim();
+      try {
+        // Panes created with the DEFAULT-shell idiom oxpit uses (agents are typed in
+        // as children, so the pane's ORIGINAL command is a shell) — which is what
+        // `respawn-pane -k` re-runs, resetting the pane back to a clean shell.
+        tmuxRaw(["new-session", "-d", "-s", session, "-n", "main", "bash --noprofile --norc"]);
+        tmuxRaw(["new-window", "-t", `=${session}`, "-n", "max", "bash --noprofile --norc"]);
+        tmuxRaw(["new-window", "-t", `=${session}`, "-n", "human", "bash --noprofile --norc"]); // a human split — UNMARKED
+        const [mainPane, maxPane, humanPane] = [pane("main"), pane("max"), pane("human")];
+        markPaneManaged(mainPane, fleetId);
+        markPaneManaged(maxPane, fleetId);
+        const mainPidBefore = pid(mainPane);
+        const humanPidBefore = pid(humanPane);
+
+        // Only `ensure` stubbed → REAL respawn-k teardown, no real agents.
+        const res = await resetFleet(spec, repoRoot, session, { dryRun: false, ensure: stubEnsure });
+        assert.equal(res.ok, true, `reset should succeed: ${res.error}`);
+        assert.equal(res.fleetId, fleetId);
+        assert.deepEqual(res.teardowns.map((t) => t.action), ["reset", "reset"]);
+
+        // Marked panes were respawned (new pid, back to a shell) with the marker kept.
+        assert.notEqual(pid(mainPane), mainPidBefore, "main pane respawned → new pid");
+        assert.equal(readPaneMarker(mainPane), fleetId, "marker preserved across respawn-k");
+        assert.match(
+          tmuxRaw(["display-message", "-p", "-t", mainPane, "#{pane_current_command}"]).trim(),
+          /sh$|bash|zsh/,
+          "reset pane is back to a shell",
+        );
+        // The UNMARKED human split is structurally untouched.
+        assert.equal(pid(humanPane), humanPidBefore, "human split never touched (still the same process)");
+        assert.equal(readPaneMarker(humanPane), null);
+        // Relaunch fired once per target, on the torn-down panes.
+        assert.deepEqual(relaunched.sort(), [`main@${mainPane}`, `max@${maxPane}`].sort());
+        // The session itself survives — kill-session is banned.
+        assert.deepEqual(windowNames(session), ["main", "max", "human"], "session + all windows intact");
       } finally {
         killSession(session);
       }
