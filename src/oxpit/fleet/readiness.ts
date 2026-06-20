@@ -26,11 +26,11 @@
 // forever) and the pure selection core (selectBoundArtifact) is unit-tested with
 // injected observations + a fake ppid→pane resolver.
 
-import { closeSync, openSync, readSync, realpathSync, statSync } from "node:fs";
+import { readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import { recentCodexDateDirs } from "../../detect/birthTimeMatchStrategy.js";
+import { readFirstFullLine } from "../../detect/firstline.js";
 import { listHookDrops } from "../../detect/hookDropStrategy.js";
 import { currentPaneForServerPid } from "../../registry.js";
 import type { AgentKind } from "./types.js";
@@ -75,44 +75,6 @@ function fileBirthMs(path: string): number {
     return s.birthtimeMs > 0 ? s.birthtimeMs : s.mtimeMs;
   } catch {
     return 0;
-  }
-}
-
-// Read the WHOLE first line of a file (until the first \n), capped for safety.
-// Unlike the 4KB-capped reader in birthTimeMatchStrategy, this tolerates the
-// large `session_meta` line current Codex writes (~13KB: it inlines the full
-// base_instructions text), whose cwd would otherwise be unreachable past the
-// cap. Scans for the 0x0A byte (unambiguous in UTF-8 — never a continuation
-// byte) so a multi-byte char straddling a read boundary can't corrupt the line.
-function readFirstFullLine(path: string, capBytes = 256 * 1024): string {
-  let fd: number;
-  try {
-    fd = openSync(path, "r");
-  } catch {
-    return "";
-  }
-  try {
-    const chunk = Buffer.alloc(64 * 1024);
-    const parts: Buffer[] = [];
-    let total = 0;
-    let pos = 0;
-    while (total < capBytes) {
-      const n = readSync(fd, chunk, 0, chunk.length, pos);
-      if (n <= 0) break;
-      pos += n;
-      const nl = chunk.subarray(0, n).indexOf(0x0a);
-      if (nl !== -1) {
-        parts.push(Buffer.from(chunk.subarray(0, nl)));
-        break;
-      }
-      parts.push(Buffer.from(chunk.subarray(0, n)));
-      total += n;
-    }
-    return Buffer.concat(parts).toString("utf8");
-  } catch {
-    return "";
-  } finally {
-    closeSync(fd);
   }
 }
 

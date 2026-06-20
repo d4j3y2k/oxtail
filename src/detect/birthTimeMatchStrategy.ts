@@ -1,6 +1,7 @@
-import { closeSync, existsSync, openSync, readSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { readFirstFullLine } from "./firstline.js";
 import type { DetectStrategy, StrategyAbstention } from "./types.js";
 
 const FIVE_MIN_MS = 5 * 60 * 1000;
@@ -61,30 +62,12 @@ export function listClaudeCandidates(cwd: string, base = homedir()): Candidate[]
   return out;
 }
 
-// Reads up to 4KB from the start of the file — enough to capture the first
-// JSONL line without slurping multi-MB transcripts.
-function readFirstLine(path: string, maxBytes = 4096): string {
-  let fd: number;
-  try {
-    fd = openSync(path, "r");
-  } catch {
-    return "";
-  }
-  try {
-    const buf = Buffer.alloc(maxBytes);
-    const n = readSync(fd, buf, 0, maxBytes, 0);
-    const text = buf.toString("utf8", 0, n);
-    const nl = text.indexOf("\n");
-    return nl === -1 ? text : text.slice(0, nl);
-  } catch {
-    return "";
-  } finally {
-    closeSync(fd);
-  }
-}
-
 function firstLineCwd(path: string): string | null {
-  const line = readFirstLine(path);
+  // Read the FULL first line: current Codex rollouts inline base_instructions
+  // (~13KB) into the session_meta line, so a small fixed cap would truncate it
+  // and silently lose `payload.cwd` → zero candidates. Shared with the readiness
+  // watch (detect/firstline.ts).
+  const line = readFirstFullLine(path);
   if (!line) return null;
   try {
     const obj = JSON.parse(line);
