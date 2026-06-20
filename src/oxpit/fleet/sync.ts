@@ -273,17 +273,26 @@ export async function syncFleet(
         added.push(abortedEnsure(window.name, `could not create window ${sessionName}:${window.name}`));
         continue;
       }
-      added.push(await ensure({ target: newPane, window, fleetId, cwd: repoRoot }, ensureDeps()));
+      // sessionName forwarded so a remoteControl window's /rc registers under the REAL
+      // session name, not the "<session>" placeholder (compile-sim HIGH; mirrors reset).
+      added.push(await ensure({ target: newPane, window, fleetId, cwd: repoRoot, sessionName }, ensureDeps()));
     }
     // KEEP: ensure_window — a healthy match no-ops; a dead/empty marked shell relaunches.
     for (const { window, pane } of plan.keep) {
-      kept.push(await ensure({ target: pane.pane, window, fleetId, cwd: repoRoot }, ensureDeps()));
+      kept.push(await ensure({ target: pane.pane, window, fleetId, cwd: repoRoot, sessionName }, ensureDeps()));
     }
     // DELETE last — but ONLY if every ADD + KEEP succeeded (codex MEDIUM): never tear
     // down a fleet member while a replacement is degraded (an ADD that failed to launch).
     // kill-window passes the live fleetId as the EXPECTED identity (codex HIGH) so a pane
     // re-marked since the plan is refused, not killed.
     const addKeepOk = added.every((a) => a.ok) && kept.every((k) => k.ok);
+    // Re-probe live identity NOW — AFTER the ADD/KEEP awaits — and re-validate each
+    // remove-target before its kill, mirroring resetFleet's teardownTarget (compile-sim
+    // HIGH): the DELETE loop runs after seconds of launch round-trips, so an operator
+    // rename during them could have turned a stray into a window the spec now WANTS. Kill
+    // only if the pane STILL has the (session, windowName) that classified it a stray; a
+    // drifted name (renamed-to-a-spec-window, a recycled pane-id, gone) is SKIPPED.
+    const liveByPane = new Map(sessionPanes(run, sessionName).map((p) => [p.pane, p]));
     for (const p of plan.remove) {
       if (!addKeepOk) {
         removed.push({
@@ -291,6 +300,16 @@ export async function syncFleet(
           window: p.windowName,
           ok: false,
           reason: "skipped — an ADD or KEEP failed; not deleting while the fleet is degraded (fix the launch, then re-run)",
+        });
+        continue;
+      }
+      const live = liveByPane.get(p.pane);
+      if (!live || live.windowName !== p.windowName || live.session !== p.session) {
+        removed.push({
+          pane: p.pane,
+          window: p.windowName,
+          ok: false,
+          reason: `skipped — pane drifted since the plan (now ${live ? `${live.session}:"${live.windowName}"` : "gone"}, expected ${p.session}:"${p.windowName}") — not deleting a window that changed identity`,
         });
         continue;
       }

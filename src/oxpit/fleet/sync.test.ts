@@ -265,3 +265,63 @@ test("syncFleet: a STALE preview fleetId (≠ the session's live fleet) is refus
     assert.equal(fx.seq.length, 0, "nothing mutated when the fleet identity is stale");
   });
 });
+
+test("syncFleet HIGH (compile-sim): every ensure receives the sessionName (so a remoteControl /rc gets the REAL name, not the placeholder)", async () => {
+  await withRepo(async (repoRoot) => {
+    const fx = fakeSync([row({ pane: "%1", windowName: "main" })]);
+    const seenSessions: (string | undefined)[] = [];
+    const recordingEnsure = async (o: { window: FleetWindowSpec; sessionName?: string }): Promise<EnsureWindowResult> => {
+      seenSessions.push(o.sessionName);
+      return { window: o.window.name, occupancy: "empty-shell", action: "launched", ok: true, sessionId: "x" };
+    };
+    // spec adds "test" (→ ADD ensure) and keeps "main" (→ KEEP ensure). BOTH must carry sessionName.
+    await syncFleet({ name: "oxtail", windows: [{ name: "main", agent: "claude" }, { name: "test", agent: "claude" }] }, repoRoot, "oxtail", {
+      dryRun: false,
+      run: fx.run,
+      ensure: recordingEnsure,
+      kill: fx.kill,
+    });
+    assert.ok(seenSessions.length >= 2, "ensure ran for ADD + KEEP");
+    assert.ok(seenSessions.every((s) => s === "oxtail"), `every ensure gets sessionName "oxtail" (got ${JSON.stringify(seenSessions)})`);
+  });
+});
+
+test("syncFleet HIGH (compile-sim): a remove-target RENAMED during the ADD/KEEP awaits is SKIPPED, not killed", async () => {
+  await withRepo(async (repoRoot) => {
+    // live: main(%1) + max(%2), both ours. spec keeps only main → %2 (max) is a remove-target.
+    const live = [row({ pane: "%1", windowName: "main" }), row({ pane: "%2", windowName: "max" })];
+    const seq: string[] = [];
+    const run = (args: string[]): string => {
+      if (args[0] === "list-panes") {
+        return `${live
+          .map((p) => [p.pane, p.session, p.windowIndex, p.windowName, p.panePid, p.currentCommand, p.managedBy ?? ""].join("\\037"))
+          .join("\n")}\n`;
+      }
+      return "";
+    };
+    // The KEEP ensure of main fires while an "operator" renames the remove-target %2 — so by
+    // the time the DELETE loop re-probes, %2's windowName no longer matches the plan.
+    const ensure = async (o: { window: FleetWindowSpec }): Promise<EnsureWindowResult> => {
+      seq.push(`ensure:${o.window.name}`);
+      const m = live.find((p) => p.pane === "%2");
+      if (m) m.windowName = "renamed-by-operator";
+      return { window: o.window.name, occupancy: "empty-shell", action: "launched", ok: true, sessionId: "x" };
+    };
+    const kill = (p: string) => {
+      seq.push(`kill:${p}`);
+      return { ok: true as const, fleetId: FID };
+    };
+    const res = await syncFleet({ name: "oxtail", windows: [{ name: "main", agent: "claude" }] }, repoRoot, "oxtail", {
+      dryRun: false,
+      run,
+      ensure,
+      kill,
+    });
+    assert.ok(!seq.includes("kill:%2"), "the renamed remove-target is NOT killed (windowName drifted)");
+    assert.ok(
+      res.removed.some((r) => r.pane === "%2" && !r.ok && /drifted/i.test(r.reason ?? "")),
+      `%2 skipped with a drift reason (got: ${JSON.stringify(res.removed)})`,
+    );
+    assert.equal(res.ok, false, "a skipped drift makes the sync not-ok (re-run converges)");
+  });
+});
