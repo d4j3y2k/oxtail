@@ -73,16 +73,18 @@ export function listPanesWithMarkers(run: TmuxRun = tmux): PaneInfo[] {
   //
   // CAVEAT (max P5): this is NOT collision-proof. tmux does NOT escape
   // backslashes, so a pane whose session/window NAME literally contains the 4
-  // chars "\037" renders identically to a separator here — and safeStr permits
-  // "\","0","3","7". We never SPAWN such a pane (we only target oxpit-named
-  // windows), but listPanesWithMarkers reads ALL panes, so a foreign name like
-  // that injects EXTRA fields. The EXACT-COUNT guard below is what makes that
-  // safe: tmux always emits exactly 7 fields per pane (empty when unset), so a
-  // healthy row splits to length 7 and any embedded separator makes it ≥8 → we
-  // SKIP the poisoned row (a foreign pane reads as unowned — the safe default for
-  // a teardown control) instead of mis-parsing by position, which would land a
-  // truthy field on `managedBy` and fabricate a PHANTOM fleetId (false ownership,
-  // the dangerous direction — a landmine for RESET).
+  // chars "\037" renders identically to a separator here. OUR OWN panes can't
+  // carry it — spec window names reject backslash (spec.ts windowNameStr) and
+  // session names are sanitized (tmuxSessionName), so nothing WE spawn is
+  // poisonable. But listPanesWithMarkers reads ALL panes, and a FOREIGN (human,
+  // un-spec'd) pane's name is arbitrary, so it can inject EXTRA fields. The
+  // EXACT-COUNT guard below is what makes that safe: tmux always emits exactly 7
+  // fields per pane (empty when unset), so a healthy row splits to length 7 and
+  // any embedded separator makes it ≥8 → we SKIP the poisoned row (a foreign pane
+  // reads as unowned — the safe default for a teardown control) instead of mis-
+  // parsing by position, which would land a truthy field on `managedBy` and
+  // fabricate a PHANTOM fleetId (false ownership, the dangerous direction — a
+  // landmine for RESET).
   const normalized = out.replace(/\\037/g, FS);
   const rows: PaneInfo[] = [];
   for (const line of normalized.split("\n")) {
