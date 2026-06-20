@@ -42,8 +42,27 @@ const effortStr = z
     "effort must be a lowercase level token (e.g. low, medium, high, xhigh, max)",
   );
 
+// A window name is the ONE spec field used RAW in tmux target syntax —
+// `${session}:${windowName}` (spawn.ts paneForWindow, ensure-window probes) and
+// `new-window -n <name>` — AND it flows through ownership.ts's `-F` listing. So,
+// unlike the fleet `name` (which tmuxSessionName SANITIZES at use), it must be
+// both TMUX-TARGET-safe (no `:`/`.` — the session:window / window.pane
+// separators; no leading `@`/`%`/`=` target-id prefixes) and SENTINEL-safe (no
+// `\` — a literal "\037" would be mis-read as the normalized 0x1F field
+// separator). Constrain to a conservative label charset and REJECT (not
+// sanitize), so two distinct specs can't silently collapse to one tmux window.
+// This is what makes arbitrary custom .oxtail/fleet.json specs live-spawn-safe
+// (codex P5 review). Note: the ownership PARSER stays space/`:`-tolerant for
+// reading a HUMAN's arbitrarily-named panes — only the panes WE spawn are bounded.
+const windowNameStr = z
+  .string()
+  .regex(
+    /^[A-Za-z0-9_][A-Za-z0-9_-]{0,39}$/,
+    "window name must be a tmux-safe label: start with a letter/digit/_, then letters/digits/_/- only (no :/./backslash/spaces)",
+  );
+
 const WindowSchema = z.object({
-  name: safeStr,
+  name: windowNameStr,
   agent: z.enum(["claude", "codex"]),
   model: safeStr.optional(),
   effort: effortStr.optional(),

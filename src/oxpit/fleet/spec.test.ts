@@ -147,7 +147,33 @@ test("a control character in a window name is rejected (FS-separator safety)", (
     writeConfig(repoRoot, JSON.stringify({ name: "x", windows: [{ name: badName, agent: "claude" }] }));
     const r = loadFleetConfig(repoRoot, { home });
     assert.equal(r.ok, false);
-    if (!r.ok) assert.match(r.error, /control characters/);
+    if (!r.ok) assert.match(r.error, /tmux-safe label/);
+  });
+});
+
+test("a tmux-UNSAFE window name is rejected (target + sentinel safety, codex P5)", () => {
+  withDirs((repoRoot, home) => {
+    // `:`/`.` break `${session}:${window}` and window.pane targets; `\` could form a
+    // literal "\037" the ownership parser would mis-read as the field separator;
+    // leading @/%/= are tmux target-id prefixes; spaces/punct aren't label-safe; a
+    // window name is used RAW (unlike the sanitized fleet `name`).
+    const bad = ["ma:in", "ma.in", "ma\\in", "@main", "%0", "=main", "my window", "-main", "main!", ""];
+    for (const name of bad) {
+      writeConfig(repoRoot, JSON.stringify({ name: "x", windows: [{ name, agent: "claude" }] }));
+      const r = loadFleetConfig(repoRoot, { home });
+      assert.equal(r.ok, false, `window name ${JSON.stringify(name)} should be rejected`);
+      if (!r.ok) assert.match(r.error, /invalid fleet spec/);
+    }
+  });
+});
+
+test("valid tmux-safe window names are accepted", () => {
+  withDirs((repoRoot, home) => {
+    for (const name of ["main", "max", "codex", "code_review", "agent-1", "M2"]) {
+      writeConfig(repoRoot, JSON.stringify({ name: "x", windows: [{ name, agent: "claude" }] }));
+      const r = loadFleetConfig(repoRoot, { home });
+      assert.equal(r.ok, true, `window name ${name} should be accepted`);
+    }
   });
 });
 
