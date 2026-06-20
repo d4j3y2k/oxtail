@@ -217,3 +217,32 @@ test("a hostile effort value is rejected — no Codex `-c` TOML/shell injection"
     }
   });
 });
+
+// ── remoteControl (Claude-only /rc toggle) ───────────────────────────────────────
+
+test("remoteControl is accepted on a claude window, rejected on a codex window", () => {
+  withDirs((repoRoot, home) => {
+    writeConfig(
+      repoRoot,
+      JSON.stringify({ name: "x", windows: [{ name: "main", agent: "claude", remoteControl: true }] }),
+    );
+    const okR = loadFleetConfig(repoRoot, { home });
+    assert.equal(okR.ok, true, "claude + remoteControl is valid");
+
+    writeConfig(
+      repoRoot,
+      JSON.stringify({ name: "x", windows: [{ name: "codex", agent: "codex", remoteControl: true }] }),
+    );
+    const badR = loadFleetConfig(repoRoot, { home });
+    assert.equal(badR.ok, false, "codex + remoteControl must be rejected (no /rc for codex)");
+    if (!badR.ok) assert.match(badR.error, /Claude-only/);
+  });
+});
+
+test("defaultFleet enables remoteControl on the claude windows, not codex", () => {
+  const f = defaultFleet("/Users/dev/myrepo");
+  const byName = Object.fromEntries(f.windows.map((w) => [w.name, w]));
+  assert.equal(byName.main.remoteControl, true, "main (claude) has rc on — part of the ceremony");
+  assert.equal(byName.max.remoteControl, true, "max (claude) has rc on");
+  assert.notEqual(byName.codex.remoteControl, true, "codex has no /rc");
+});

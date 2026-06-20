@@ -287,7 +287,7 @@ export async function resetFleet(
         relaunches.push(abortedRelaunch(window.name, `relaunch skipped — teardown did not succeed (${td?.reason ?? "?"})`));
         continue;
       }
-      relaunches.push(await ensure({ target: pane.pane, window, fleetId, cwd: repoRoot }, ensureDeps()));
+      relaunches.push(await ensure({ target: pane.pane, window, fleetId, cwd: repoRoot, sessionName }, ensureDeps()));
     }
     for (const window of plan.missing) {
       const newPane = createWindow(run, sessionName, window.name, repoRoot);
@@ -295,7 +295,7 @@ export async function resetFleet(
         relaunches.push(abortedRelaunch(window.name, `could not create window ${sessionName}:${window.name}`));
         continue;
       }
-      relaunches.push(await ensure({ target: newPane, window, fleetId, cwd: repoRoot }, ensureDeps()));
+      relaunches.push(await ensure({ target: newPane, window, fleetId, cwd: repoRoot, sessionName }, ensureDeps()));
     }
 
     const ok = teardowns.every((t) => t.ok) && relaunches.every((r) => r.ok);

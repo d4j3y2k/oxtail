@@ -61,13 +61,21 @@ const windowNameStr = z
     "window name must be a tmux-safe label: start with a letter/digit/_, then letters/digits/_/- only (no :/./backslash/spaces)",
   );
 
-const WindowSchema = z.object({
-  name: windowNameStr,
-  agent: z.enum(["claude", "codex"]),
-  model: safeStr.optional(),
-  effort: effortStr.optional(),
-  role: safeStr.optional(),
-});
+const WindowSchema = z
+  .object({
+    name: windowNameStr,
+    agent: z.enum(["claude", "codex"]),
+    model: safeStr.optional(),
+    effort: effortStr.optional(),
+    role: safeStr.optional(),
+    // CLAUDE-ONLY remote-control toggle (the /rc slash command). Rejected on codex
+    // below — /rc is a Claude Code command.
+    remoteControl: z.boolean().optional(),
+  })
+  // Fail fast on a meaningless config rather than silently ignoring it.
+  .refine((w) => !(w.remoteControl && w.agent !== "claude"), {
+    message: "remoteControl is Claude-only (the /rc command doesn't exist for codex)",
+  });
 
 const FleetSchema = z
   .object({
@@ -96,9 +104,15 @@ const FleetSchema = z
 // fleet's actual config (latest Opus + 1M context, version-robust); the `[1m]` is
 // why buildLaunchCommand shell-quotes the model (the brackets are shell globs).
 // Codex's `--model gpt-5.5` is the full model name it accepts.
+//
+// remoteControl is ON for the claude windows because it's part of the standing
+// ceremony oxpit automates away ("…effort + remote-control + oxtail-join"): each
+// spawned claude fires `/rc "<session>-<window>"` so David can reach it from his
+// phone. Codex has no /rc, so it's omitted there. It's shown in the SPAWN plan and
+// overridable per-window (set false in a .oxtail/fleet.json).
 const DEFAULT_WINDOWS: FleetSpec["windows"] = [
-  { name: "main", agent: "claude", model: "opus[1m]", effort: "xhigh", role: "captain" },
-  { name: "max", agent: "claude", model: "opus[1m]", effort: "max" },
+  { name: "main", agent: "claude", model: "opus[1m]", effort: "xhigh", role: "captain", remoteControl: true },
+  { name: "max", agent: "claude", model: "opus[1m]", effort: "max", remoteControl: true },
   { name: "codex", agent: "codex", model: "gpt-5.5" },
 ];
 

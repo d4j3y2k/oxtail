@@ -85,7 +85,9 @@ export function planSpawn(spec: FleetSpec, sessionName: string): SpawnWindowPlan
   return spec.windows.map((window) => ({
     window,
     paneTarget: `${sessionName}:${window.name}`,
-    recipe: renderRecipe(buildRecipe(window)),
+    // sessionName flows into buildRecipe so the remote-control step renders the exact
+    // /rc "<session>-<window>" the launch will fire.
+    recipe: renderRecipe(buildRecipe(window, { sessionName })),
   }));
 }
 
@@ -98,7 +100,7 @@ export function renderSpawnPlan(spec: FleetSpec, fleetId: string, sessionName: s
   }
   lines.push(`  then, sequentially, ensure_window over each (tagging @oxpit_managed=${fleetId}):`);
   for (const p of planSpawn(spec, sessionName)) {
-    lines.push(...renderRecipe(buildRecipe(p.window)).split("\n").map((l) => `    ${l}`));
+    lines.push(...renderRecipe(buildRecipe(p.window, { sessionName })).split("\n").map((l) => `    ${l}`));
   }
   return lines.join("\n");
 }
@@ -168,7 +170,7 @@ export async function spawnFleet(
         continue; // keep going so the operator sees every window's outcome
       }
       const res = await ensure(
-        { target: pane, window, fleetId, cwd: repoRoot },
+        { target: pane, window, fleetId, cwd: repoRoot, sessionName },
         { run, now: opts.now, log: opts.log, ...opts.ensureDeps },
       );
       results.push(res);

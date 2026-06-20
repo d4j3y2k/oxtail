@@ -46,6 +46,12 @@ export type RecipeStep =
   // External confirmation that the bound session is now resolvable in oxtail's
   // registry (adoption landed) — not a pane-text check.
   | { op: "claimCheck"; note?: string }
+  // CLAUDE-ONLY remote control: after the agent is up + claimed, type the Claude
+  // Code `/rc "<rcSession>"` slash command (phone/web access). rcSession is
+  // `<tmux-session>-<window>`, baked at build time so the dry-run shows the exact
+  // command. Best-effort (a post-success convenience), runs AFTER claimCheck so the
+  // TUI is ready for the slash command.
+  | { op: "remoteControl"; rcSession: string; note?: string }
   // Explicit loud abort.
   | { op: "abort"; reason: string };
 
@@ -125,6 +131,21 @@ export function buildSelfJoinInstruction(): string {
   ].join(" ");
 }
 
+// The remote-control session name: <tmux-session>-<window>. Both halves are
+// already constrained (tmuxSessionName sanitizes the session; windowNameStr bounds
+// the window to [A-Za-z0-9_-]), so the result is a clean token — no quoting/
+// injection concern when it's typed into the Claude `/rc "<name>"` slash command.
+export function buildRcSession(sessionName: string, windowName: string): string {
+  return `${sessionName}-${windowName}`;
+}
+
+// The Claude Code slash command that enables remote control for a session. Typed
+// INTO the TUI (not a shell), so the double-quotes are literal /rc syntax (David's
+// exact form: `/rc "session name"`), not shell quoting.
+export function buildRcCommand(rcSession: string): string {
+  return `/rc "${rcSession}"`;
+}
+
 // The SPAWN/RESET recipe per window. The two clients have FUNDAMENTALLY DIFFERENT
 // readiness shapes (live-verified):
 //   • Claude — SessionStart drop is a LAUNCH-TIME artifact + the hook auto-joins, so:
@@ -137,7 +158,12 @@ export function buildSelfJoinInstruction(): string {
 // selfJoinClaim absorbs Codex's readiness (no separate waitExternal): the join IS the
 // stimulus and the rollout it produces IS the bound-id proof. claimCheck stays the
 // final registry truth for both.
-export function buildRecipe(window: FleetWindowSpec): Recipe {
+//
+// remoteControl (Claude-only) appends an `/rc "<session>-<window>"` step AFTER
+// claimCheck (so the TUI is up). sessionName is needed to bake the exact rc name
+// into the step (for the dry-run + the effect); absent it (a bare buildRecipe call),
+// a "<session>" placeholder is used — real SPAWN/RESET always pass it.
+export function buildRecipe(window: FleetWindowSpec, opts: { sessionName?: string } = {}): Recipe {
   const launchCommand = buildLaunchCommand(window);
   const steps: RecipeStep[] = [
     { op: "sendLiteral", text: launchCommand, note: "launch into the empty shell" },
@@ -148,6 +174,10 @@ export function buildRecipe(window: FleetWindowSpec): Recipe {
     steps.push({ op: "waitExternal", artifact: window.agent, note: "bind session via launch artifact" });
   }
   steps.push({ op: "claimCheck", note: "confirm the bound session is registry-resolvable" });
+  if (window.remoteControl && window.agent === "claude") {
+    const rcSession = buildRcSession(opts.sessionName ?? "<session>", window.name);
+    steps.push({ op: "remoteControl", rcSession, note: "enable remote control (phone/web access)" });
+  }
   return {
     client: window.agent,
     label: window.role ? `${window.name} (${window.role})` : window.name,
@@ -157,9 +187,13 @@ export function buildRecipe(window: FleetWindowSpec): Recipe {
 }
 
 // Map a whole fleet spec to per-window recipes (SPAWN runs ensure_window over
-// these in order). Pure — for dry-run and SPAWN planning.
-export function recipesForFleet(spec: { windows: FleetWindowSpec[] }): Recipe[] {
-  return spec.windows.map(buildRecipe);
+// these in order). Pure — for dry-run and SPAWN planning. (Wrap buildRecipe in an
+// arrow — a bare `.map(buildRecipe)` would pass the array INDEX as opts.)
+export function recipesForFleet(
+  spec: { windows: FleetWindowSpec[] },
+  opts: { sessionName?: string } = {},
+): Recipe[] {
+  return spec.windows.map((w) => buildRecipe(w, opts));
 }
 
 function renderStep(s: RecipeStep): string {
@@ -176,6 +210,8 @@ function renderStep(s: RecipeStep): string {
       return `selfJoinClaim (Codex: fire join-turn → bind id from the rollout it creates, accelerator-gated + bounded re-send)`;
     case "claimCheck":
       return `claimCheck`;
+    case "remoteControl":
+      return `remoteControl ${buildRcCommand(s.rcSession)} (best-effort)`;
     case "abort":
       return `abort: ${s.reason}`;
   }
@@ -218,6 +254,9 @@ export interface RecipeEffects {
   // also accepted (tests). MUST be pane-bound, not bare sid presence — see
   // ensure-window.ts isClaimPaneBound (codex P2 BLOCK #2).
   claimCheck: (sessionId: string) => boolean | Promise<boolean>;
+  // Fire the Claude `/rc "<rcSession>"` slash command (remoteControl step). Claude-
+  // only; best-effort (see executeRecipe). ensure-window wires it to fireKeystrokes.
+  remoteControl?: (rcSession: string) => Promise<void>;
   log?: (msg: string) => void;
 }
 
@@ -310,6 +349,19 @@ export async function executeRecipe(recipe: Recipe, fx: RecipeEffects): Promise<
           };
         }
         log(`claim confirmed for ${sessionId}`);
+        break;
+      }
+      case "remoteControl": {
+        // BEST-EFFORT: the agent is already up + claimed (the launch SUCCEEDED), so a
+        // remote-control hiccup must NOT fail the recipe — it's a phone-access
+        // convenience that's not externally verifiable. Fire and continue; log a
+        // warning on a send error so it's visible without aborting a good launch.
+        try {
+          await fx.remoteControl?.(step.rcSession);
+          log(`remote control enabled: ${buildRcCommand(step.rcSession)}`);
+        } catch (e) {
+          log(`remote control send failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+        }
         break;
       }
       case "abort":

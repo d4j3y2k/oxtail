@@ -3,6 +3,8 @@ import { test } from "node:test";
 import type { PaneClassification } from "./classify.js";
 import {
   buildLaunchCommand,
+  buildRcCommand,
+  buildRcSession,
   buildRecipe,
   buildSelfJoinInstruction,
   clientTypeFor,
@@ -131,6 +133,9 @@ function fx(over: Partial<RecipeEffects> = {}): { fx: RecipeEffects; sent: strin
       return { ok: true, sessionId: "sid-codex" };
     },
     claimCheck: () => true,
+    remoteControl: async (rc) => {
+      sent.push(`<rc:${rc}>`);
+    },
   };
   return { fx: { ...base, ...over }, sent };
 }
@@ -253,4 +258,48 @@ test("an explicit abort step stops with its reason", async () => {
   const res = await executeRecipe(recipe, fx().fx);
   assert.equal(res.ok, false);
   if (!res.ok) assert.match(res.reason, /half-up pane/);
+});
+
+// ── remoteControl (Claude /rc) ──────────────────────────────────────────────────
+
+test("buildRcSession + buildRcCommand: <session>-<window> and /rc \"…\"", () => {
+  assert.equal(buildRcSession("strudel", "main"), "strudel-main");
+  assert.equal(buildRcCommand("strudel-main"), '/rc "strudel-main"');
+});
+
+test("buildRecipe: claude + remoteControl appends /rc AFTER claimCheck with the baked session name", () => {
+  const w = { name: "main", agent: "claude" as const, model: "opus[1m]", effort: "xhigh", remoteControl: true };
+  const r = buildRecipe(w, { sessionName: "strudel" });
+  assert.deepEqual(r.steps.map((s) => s.op), ["sendLiteral", "waitExternal", "claimCheck", "remoteControl"]);
+  const rc = r.steps.find((s) => s.op === "remoteControl");
+  assert.equal(rc && rc.op === "remoteControl" && rc.rcSession, "strudel-main");
+  assert.match(renderRecipe(r), /remoteControl \/rc "strudel-main"/);
+});
+
+test("buildRecipe: no remoteControl → no rc step; codex never gets one", () => {
+  const noRc = buildRecipe({ name: "main", agent: "claude", remoteControl: false }, { sessionName: "s" });
+  assert.ok(!noRc.steps.some((s) => s.op === "remoteControl"));
+  // a (rejected-at-spec, but defensively guarded) codex+rc still yields NO rc step.
+  const codexRc = buildRecipe({ name: "codex", agent: "codex", remoteControl: true }, { sessionName: "s" });
+  assert.ok(!codexRc.steps.some((s) => s.op === "remoteControl"), "codex never gets /rc");
+});
+
+test("executor: remoteControl fires /rc after the claim (happy path)", async () => {
+  const w = { name: "main", agent: "claude" as const, model: "opus[1m]", remoteControl: true };
+  const { fx: effects, sent } = fx();
+  const res = await executeRecipe(buildRecipe(w, { sessionName: "strudel" }), effects);
+  assert.equal(res.ok, true);
+  assert.deepEqual(sent, ["claude --model 'opus[1m]'", "<rc:strudel-main>"]);
+});
+
+test("executor: a remoteControl send FAILURE is non-fatal (launch already succeeded)", async () => {
+  const w = { name: "main", agent: "claude" as const, remoteControl: true };
+  const { fx: effects } = fx({
+    remoteControl: async () => {
+      throw new Error("send-keys exploded");
+    },
+  });
+  const res = await executeRecipe(buildRecipe(w, { sessionName: "s" }), effects);
+  assert.equal(res.ok, true, "rc is best-effort — a good launch must not fail on it");
+  if (res.ok) assert.equal(res.sessionId, "sid-xyz");
 });

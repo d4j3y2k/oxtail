@@ -15,6 +15,11 @@ export interface FleetWindowSpec {
   model?: string; // a value the client's --model accepts, e.g. "opus[1m]" / "sonnet" / "gpt-5.5"
   effort?: string; // e.g. "xhigh" | "max"
   role?: string; // informational, e.g. "captain"
+  // CLAUDE-ONLY: after the agent is up + claimed, fire the Claude Code `/rc
+  // "<tmux-session>-<window>"` slash command to enable remote control (phone/web
+  // access to the session). Rejected on codex windows (no /rc there). Best-effort
+  // convenience layered on top of a successful launch.
+  remoteControl?: boolean;
 }
 
 export interface FleetSpec {

@@ -43,6 +43,7 @@ import { classifyPaneReadiness } from "./classify.js";
 import { listPanesWithMarkers, markPaneManaged, type PaneInfo, type TmuxRun } from "./ownership.js";
 import { awaitLaunchArtifact, snapshotBaseline } from "./readiness.js";
 import {
+  buildRcCommand,
   buildRecipe,
   buildSelfJoinInstruction,
   clientTypeFor,
@@ -435,6 +436,10 @@ async function defaultLaunch(
       deps.claimResolver
         ? deps.claimResolver(sid)
         : pollClaimPaneBound(sid, { target, agent: window.agent, cwd }, claimTimeoutMs, now),
+    // Claude-only remote control (/rc) — type it into the now-ready TUI. The rcSession
+    // is baked into the step by buildRecipe; best-effort per executeRecipe (a good
+    // launch never fails on this).
+    remoteControl: (rcSession) => fireKeystrokes(target, clientType, buildRcCommand(rcSession)),
     log: deps.log,
   };
   return executeRecipe(recipe, effects);
@@ -443,7 +448,9 @@ async function defaultLaunch(
 // Bring one window to a ready agent. Probe → classify → dispatch. On a launch
 // failure, the pane buffer is dumped into the result for a loud abort.
 export async function ensureWindow(
-  opts: { target: string; window: FleetWindowSpec; fleetId: string; cwd: string },
+  // sessionName is the tmux session — needed to bake the remote-control name
+  // (<session>-<window>) into the recipe. SPAWN/RESET always pass it.
+  opts: { target: string; window: FleetWindowSpec; fleetId: string; cwd: string; sessionName?: string },
   deps: EnsureWindowDeps = {},
 ): Promise<EnsureWindowResult> {
   const { target, window, fleetId, cwd } = opts;
@@ -489,7 +496,7 @@ export async function ensureWindow(
           `otherwise use RESET/--force (P6) to reconfigure.`,
       };
     case "empty-shell": {
-      const recipe = buildRecipe(window);
+      const recipe = buildRecipe(window, { sessionName: opts.sessionName });
       const launch = deps.launch ?? ((r, ctx) => defaultLaunch(r, ctx, deps));
       const res = await launch(recipe, { target, window, cwd });
       if (res.ok) {
