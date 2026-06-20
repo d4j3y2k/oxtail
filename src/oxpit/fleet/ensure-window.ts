@@ -43,8 +43,8 @@ import { classifyPaneReadiness } from "./classify.js";
 import { listPanesWithMarkers, markPaneManaged, type PaneInfo, type TmuxRun } from "./ownership.js";
 import { awaitLaunchArtifact, snapshotBaseline } from "./readiness.js";
 import {
-  buildJoinInstruction,
   buildRecipe,
+  buildSelfJoinInstruction,
   clientTypeFor,
   executeRecipe,
   type Recipe,
@@ -228,6 +228,13 @@ export interface EnsureWindowDeps {
   home?: string;
   readinessTimeoutMs?: number;
   claimTimeoutMs?: number;
+  // Codex self-join tuning (selfJoinClaim). settle = how long to wait before firing
+  // when the classifier hasn't confirmed tui-ready (version-robust fallback);
+  // maxSends = bounded re-sends if a keystroke missed; rolloutBudget = per-send wait
+  // for the join-created rollout to appear.
+  selfJoinSettleMs?: number;
+  selfJoinMaxSends?: number;
+  selfJoinRolloutBudgetMs?: number;
   // Seams (all overridable in tests so the dispatch is exercised without tmux):
   probe?: (pane: string) => OccupancyProbe | null;
   launch?: (recipe: Recipe, ctx: LaunchCtx) => Promise<RecipeResult>;
@@ -249,6 +256,96 @@ export interface EnsureWindowResult {
   sessionId: string | null;
   reason?: string;
   paneDump?: string;
+}
+
+// The Codex self-join bring-up (selfJoinClaim effect). For a lazy-artifact client
+// readiness is STIMULUS→PROOF, not a passive watch: the join turn is what both runs
+// the claim AND creates the rollout we bind the id from. So this:
+//   1. waits until the pane is acceptable to type into — the classifier is an
+//      ACCELERATOR (tui-ready → fire immediately); otherwise it fires after a short
+//      SETTLE (so a stale/broken classifier just costs a wait, never an abort — max);
+//      busy → keep waiting (don't interleave a keystroke into a mid-turn Codex);
+//      blocked-interstitial (trust/login) → abort loudly (retrying won't clear it),
+//   2. fires the self-resolve join (echo $CODEX_THREAD_ID + claim_session),
+//   3. polls for the rollout that the turn creates, bound to THIS pane — the
+//      proof-of-accept (max's PROOF-1; claimCheck downstream is PROOF-2),
+//   4. bounded RE-SEND if no rollout (the keystroke may have missed) — claim_session
+//      is idempotent, so a double-send is harmless.
+// classifyPaneReadiness runs against an injected capture() so the loop is unit-
+// testable against canned pane buffers without real tmux.
+export interface CodexSelfJoinDeps {
+  capture: () => string;
+  fire: () => Promise<void>;
+  bindRollout: (
+    timeoutMs: number,
+  ) => Promise<{ ok: true; sessionId: string } | { ok: false; reason: string }>;
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  settleMs?: number;
+  maxSends?: number;
+  rolloutBudgetMs?: number;
+  readyWaitMs?: number;
+  pollMs?: number;
+  log?: (m: string) => void;
+}
+
+export async function codexSelfJoin(
+  d: CodexSelfJoinDeps,
+): Promise<{ ok: true; sessionId: string } | { ok: false; reason: string; dump?: string }> {
+  const settleMs = d.settleMs ?? 2_000;
+  const maxSends = d.maxSends ?? 3;
+  const rolloutBudgetMs = d.rolloutBudgetMs ?? 15_000;
+  const readyWaitMs = d.readyWaitMs ?? 30_000;
+  const pollMs = d.pollMs ?? 400;
+  const log = (m: string) => d.log?.(m);
+
+  for (let send = 1; send <= maxSends; send++) {
+    // Gate: wait for the pane to be acceptable to type into.
+    const gateStart = d.now();
+    for (;;) {
+      const c = classifyPaneReadiness(d.capture(), "codex");
+      if (c.readiness === "blocked-interstitial") {
+        return {
+          ok: false,
+          reason: `Codex blocked on a startup prompt (${c.reason ?? "?"}) — cannot self-join`,
+          dump: d.capture(),
+        };
+      }
+      const elapsed = d.now() - gateStart;
+      if (c.readiness === "tui-ready") {
+        log(`codex ready (accelerated) — firing self-join (send ${send}/${maxSends})`);
+        break;
+      }
+      // Version-robust fallback: once the settle has elapsed and the pane isn't busy,
+      // fire even on unknown/shell-ready — a missed/early send self-corrects via the
+      // rollout-proof + re-send below; a stale classifier never aborts the launch.
+      if (c.readiness !== "busy" && elapsed >= settleMs) {
+        log(`codex settle elapsed ("${c.readiness}") — firing self-join (send ${send}/${maxSends})`);
+        break;
+      }
+      if (elapsed >= readyWaitMs) {
+        return {
+          ok: false,
+          reason: `Codex never became ready to accept input within ${readyWaitMs}ms (stuck "${c.readiness}")`,
+          dump: d.capture(),
+        };
+      }
+      await d.sleep(pollMs);
+    }
+
+    await d.fire();
+    const r = await d.bindRollout(rolloutBudgetMs);
+    if (r.ok) {
+      log(`codex self-join bound session ${r.sessionId} (proof-of-accept: rollout)`);
+      return { ok: true, sessionId: r.sessionId };
+    }
+    log(`no rollout after send ${send}/${maxSends} (${r.reason}) — ${send < maxSends ? "re-sending" : "giving up"}`);
+  }
+  return {
+    ok: false,
+    reason: `Codex self-join produced no rollout after ${maxSends} sends — the agent did not accept the join turn`,
+    dump: d.capture(),
+  };
 }
 
 // Wire the real effects (tmux keystrokes + fs readiness + registry claim) and
@@ -290,11 +387,32 @@ async function defaultLaunch(
         : "";
       return { ok: false, reason: `${r.reason}${extra}` };
     },
-    // Type the cooperative self-claim into the pane (Codex only — Claude recipes
-    // never reach this step). The agent runs claim_session with the id oxpit read
-    // from the rollout; confirmation is the registry (claimCheck below), NOT the
-    // agent's reply text (external-state-as-truth).
-    cooperativeJoin: (sid) => fireKeystrokes(target, clientType, buildJoinInstruction(sid)),
+    // Codex-only self-join bring-up (Claude recipes never reach it). The join turn
+    // creates the rollout we bind the id from; classifier accelerates but never gates
+    // (artifact-proof + bounded re-send is the robustness). Confirmation truth is the
+    // registry (claimCheck below), never pane text.
+    selfJoinClaim: () =>
+      codexSelfJoin({
+        capture: () => capturePane(target),
+        fire: () => fireKeystrokes(target, clientType, buildSelfJoinInstruction()),
+        bindRollout: async (timeoutMs) => {
+          const r = await awaitLaunchArtifact("codex", {
+            launchedPane: target,
+            cwd,
+            baseline,
+            launchInstantMs,
+            base: home,
+            timeoutMs,
+          });
+          return r.ok ? { ok: true, sessionId: r.sessionId } : { ok: false, reason: r.reason };
+        },
+        now,
+        sleep: napMs,
+        settleMs: deps.selfJoinSettleMs,
+        maxSends: deps.selfJoinMaxSends,
+        rolloutBudgetMs: deps.selfJoinRolloutBudgetMs ?? deps.readinessTimeoutMs,
+        log: deps.log,
+      }),
     // POLL for pane-bound adoption — registry adoption (Claude's hook reading the
     // SessionStart drop on a separate detection pass; Codex's cooperative join)
     // lands LATER than waitExternal (which returns the instant the artifact

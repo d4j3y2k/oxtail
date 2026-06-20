@@ -3,21 +3,27 @@
 // WITHOUT scraping a confirmation string out of a TUI (a model can emit that
 // string itself; external filesystem state cannot be spoofed by the agent).
 //
-// Both clients drop a launch-time artifact we can baseline-snapshot BEFORE the
-// launch and poll-diff for a NEW entry afterwards:
-//   • Claude → the SessionStart hook drop ~/.oxtail/session-starts/<file>
-//     (written ~at session spin-up; carries session_id + cwd + the host Claude
-//     pid `ppid` + that pid's start-time sig). Because the drop records the host
-//     Claude process pid, we bind it EXACTLY to the pane we launched into:
-//     drop.ppid must currently resolve (via process-tree ancestry) to OUR pane.
+// The two clients have FUNDAMENTALLY DIFFERENT artifact TIMING (live-verified —
+// a readiness artifact's launch-vs-first-interaction timing is a PER-CLIENT
+// property that must be checked on a FRESH, never-interacted instance):
+//   • Claude → the SessionStart hook drop ~/.oxtail/session-starts/<file> is a
+//     LAUNCH-TIME artifact (written ~at session spin-up; carries session_id + cwd
+//     + the host Claude pid `ppid` + that pid's start-time sig). Because the drop
+//     records the host Claude process pid, we bind it EXACTLY to the pane we
+//     launched into: drop.ppid must currently resolve (via process-tree ancestry)
+//     to OUR pane. So Claude readiness is a passive launch→watch (waitExternal).
 //   • Codex → the rollout file ~/.codex/sessions/<Y>/<M>/<D>/rollout-*-<uuid>.jsonl
-//     (filename UUID = thread-id; first `session_meta` line carries cwd). The
-//     rollout records NO process pid (verified against a live 0.141.0 rollout),
-//     so Codex CANNOT be ppid-bound the way Claude is. Its binding is new-file
-//     identity + cwd-match + an mtime floor, which is exact ENOUGH because the
-//     executor launches sequentially under the fleet lock (one Codex into one
-//     cwd at a time) — so a fresh post-launch rollout in our cwd is ours. Two
-//     fresh matches ⇒ ambiguous ⇒ we abstain rather than guess.
+//     (filename UUID = thread-id; first `session_meta` line carries cwd) is NOT a
+//     launch-time artifact — a fresh idle Codex (v0.141.0) writes NO rollout until
+//     its FIRST TURN (live-verified 2026-06-20; the earlier "launch signal" read
+//     came from a spike on an already-interacted Codex). So Codex readiness is NOT
+//     a passive watch — it INVERTS to stimulus→proof: the self-join TURN
+//     (ensure-window codexSelfJoin) is what creates the rollout, and this binder
+//     runs AFTER it as the PROOF-of-accept. The rollout records NO process pid, so
+//     Codex CANNOT be ppid-bound; its binding is new-file identity + cwd-match + an
+//     mtime floor, exact ENOUGH because the executor launches sequentially under
+//     the fleet lock (one Codex into one cwd at a time) — a fresh post-stimulus
+//     rollout in our cwd is ours. Two fresh matches ⇒ ambiguous ⇒ abstain.
 //
 // macOS FSEvents are lossy and coalescing, so polling is the source of truth;
 // any fs.watch would only be an accelerator (not wired here — the launch path

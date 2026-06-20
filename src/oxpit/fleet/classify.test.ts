@@ -64,3 +64,35 @@ test("shortcut chrome in deep scrollback (not the bottom region) is NOT tui-read
   const buf = ["? for shortcuts", ...Array(8).fill("build log line"), "compiling module x"].join("\n");
   assert.equal(classifyPaneReadiness(buf, "claude-code").readiness, "unknown");
 });
+
+// ── Codex STRUCTURAL ready signal (v0.141.0; replaces the dead "? for shortcuts"
+//    string) — composer `›` + footer `<model> <effort> · <cwd>` as the LAST line ──
+
+test("codex tui-ready: real v0.141.0 ready prompt (composer + footer-as-last-line)", () => {
+  const ready = [
+    "│ >_ OpenAI Codex (v0.141.0) │",
+    "› Find and fix a bug in @filename",
+    "  gpt-5.5 xhigh · ~/dev/oxtail",
+  ].join("\n");
+  assert.equal(classifyPaneReadiness(ready, "codex").readiness, "tui-ready");
+  // absolute-path cwd + empty composer placeholder also reads ready
+  const absReady = ["› ", "  gpt-5.5 xhigh · /Users/dev/oxtail"].join("\n");
+  assert.equal(classifyPaneReadiness(absReady, "codex").readiness, "tui-ready");
+});
+
+test("codex: busy (mid-turn) wins over the ready chrome", () => {
+  const busy = ["› Find and fix a bug in @filename", "  gpt-5.5 xhigh · ~/dev/oxtail", "• Working (esc to interrupt)"].join("\n");
+  assert.equal(classifyPaneReadiness(busy, "codex").readiness, "busy");
+});
+
+test("codex: a STALE composer/footer above a shell prompt is NOT tui-ready (exited to shell)", () => {
+  // The footer must be the LAST line; here the live bottom is a shell prompt, so the
+  // scrollback composer/footer must NOT yield a false ready (max's false-positive).
+  const stale = ["› old prompt from a previous codex", "  gpt-5.5 xhigh · ~/dev/oxtail", "davidkim@host oxtail % "].join("\n");
+  assert.notEqual(classifyPaneReadiness(stale, "codex").readiness, "tui-ready");
+});
+
+test("codex: composer present but NO footer (mid-scroll) is NOT tui-ready", () => {
+  const noFooter = ["› typing something", "  (some output, no model·cwd footer)"].join("\n");
+  assert.notEqual(classifyPaneReadiness(noFooter, "codex").readiness, "tui-ready");
+});

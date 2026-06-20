@@ -2,6 +2,7 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import {
   classifyOccupancy,
+  codexSelfJoin,
   ensureWindow,
   isAgentLiveInPane,
   isClaimPaneBound,
@@ -273,4 +274,108 @@ test("claim fails closed on an entry with no cwd (malformed/passive)", () => {
       resolvePane: () => "%5",
     }),
   );
+});
+
+// ── codexSelfJoin (the lazy-rollout STIMULUS→PROOF bring-up) ──────────────────
+
+// A deterministic virtual clock: sleep() advances now() so settle/readyWait windows
+// elapse by poll-count, no real time. classifyPaneReadiness runs FOR REAL against the
+// canned capture buffers, so these exercise the real classifier + the loop together.
+function clock() {
+  let t = 0;
+  return { now: () => t, sleep: async (ms: number) => { t += ms; } };
+}
+const CODEX_READY = "› Find and fix a bug in @filename\n  gpt-5.5 xhigh · ~/dev/oxtail";
+const CODEX_BUSY = CODEX_READY + "\n• Working (esc to interrupt)";
+const CODEX_TRUST = "│ Do you trust the files in this folder? │\n› \n  gpt-5.5 · ~/dev/oxtail";
+
+test("codexSelfJoin: ready-prompt accelerates → fires once → binds the rollout id", async () => {
+  let fires = 0;
+  const c = clock();
+  const r = await codexSelfJoin({
+    capture: () => CODEX_READY,
+    fire: async () => { fires++; },
+    bindRollout: async () => ({ ok: true, sessionId: "codex-thread-1" }),
+    now: c.now, sleep: c.sleep,
+  });
+  assert.equal(r.ok, true);
+  if (r.ok) assert.equal(r.sessionId, "codex-thread-1");
+  assert.equal(fires, 1, "tui-ready fires immediately, no settle wait");
+});
+
+test("codexSelfJoin: a missed keystroke (no rollout) RE-SENDS, second send binds", async () => {
+  let fires = 0;
+  const c = clock();
+  const r = await codexSelfJoin({
+    capture: () => CODEX_READY,
+    fire: async () => { fires++; },
+    // first send: no rollout (keystroke missed); second: binds.
+    bindRollout: async () => (fires >= 2 ? { ok: true, sessionId: "t2" } : { ok: false, reason: "no rollout" }),
+    now: c.now, sleep: c.sleep,
+  });
+  assert.equal(r.ok, true);
+  if (r.ok) assert.equal(r.sessionId, "t2");
+  assert.equal(fires, 2, "re-sent once after the first send produced no rollout");
+});
+
+test("codexSelfJoin: exhausts bounded re-sends → fails loudly with a pane dump", async () => {
+  let fires = 0;
+  const c = clock();
+  const r = await codexSelfJoin({
+    capture: () => CODEX_READY,
+    fire: async () => { fires++; },
+    bindRollout: async () => ({ ok: false, reason: "no rollout" }),
+    now: c.now, sleep: c.sleep, maxSends: 3,
+  });
+  assert.equal(r.ok, false);
+  assert.equal(fires, 3, "exactly maxSends attempts");
+  if (!r.ok) {
+    assert.match(r.reason, /no rollout after 3 sends/);
+    assert.ok(r.dump, "carries a pane dump for the loud abort");
+  }
+});
+
+test("codexSelfJoin: a startup interstitial ABORTS before firing (retrying won't clear a trust prompt)", async () => {
+  let fires = 0;
+  const c = clock();
+  const r = await codexSelfJoin({
+    capture: () => CODEX_TRUST,
+    fire: async () => { fires++; },
+    bindRollout: async () => ({ ok: true, sessionId: "x" }),
+    now: c.now, sleep: c.sleep,
+  });
+  assert.equal(r.ok, false);
+  assert.equal(fires, 0, "never types the join into a blocked Codex");
+  if (!r.ok) assert.match(r.reason, /blocked on a startup prompt.*trust/i);
+});
+
+test("codexSelfJoin: a STALE/unknown classifier still fires after the settle (version-robust, never aborts)", async () => {
+  let fires = 0;
+  const c = clock();
+  // capture() returns text the classifier can't read as ready (simulates a future
+  // Codex re-skin that breaks the string) — must fall back to settle+fire, not abort.
+  const r = await codexSelfJoin({
+    capture: () => "some unrecognized codex chrome the classifier doesn't match",
+    fire: async () => { fires++; },
+    bindRollout: async () => ({ ok: true, sessionId: "robust" }),
+    now: c.now, sleep: c.sleep, settleMs: 2000, pollMs: 400,
+  });
+  assert.equal(r.ok, true, "a broken classifier degrades to slower, never aborts");
+  if (r.ok) assert.equal(r.sessionId, "robust");
+  assert.equal(fires, 1);
+});
+
+test("codexSelfJoin: BUSY (mid-turn) is not typed into — waits, then fires when it clears", async () => {
+  let fires = 0;
+  let calls = 0;
+  const c = clock();
+  const r = await codexSelfJoin({
+    capture: () => (++calls <= 3 ? CODEX_BUSY : CODEX_READY), // busy for the first 3 polls, then ready
+    fire: async () => { fires++; },
+    bindRollout: async () => ({ ok: true, sessionId: "after-busy" }),
+    now: c.now, sleep: c.sleep,
+  });
+  assert.equal(r.ok, true);
+  assert.equal(fires, 1, "fired exactly once, only after busy cleared");
+  assert.ok(calls > 3, "kept polling through the busy window");
 });

@@ -32,12 +32,17 @@ export type RecipeStep =
   | { op: "waitExternal"; artifact: AgentKind; note?: string }
   // Gate: the pane must currently classify into one of `expect`, else abort.
   | { op: "classifyPane"; expect: PaneReadiness[]; note?: string }
-  // Cooperative self-claim: type a one-line instruction into the pane telling
-  // the agent to register the just-bound session in oxtail's registry. Needed
-  // ONLY for clients with no auto-join (Codex — CODEX_THREAD_ID is stripped from
-  // its MCP child); Claude's SessionStart hook auto-joins, so its recipe omits
-  // this step. Runs AFTER waitExternal (uses the bound session id).
-  | { op: "joinClaim"; note?: string }
+  // Codex STIMULUS→PROOF self-join (binds the session id). Unlike Claude — whose
+  // SessionStart drop is a LAUNCH-TIME artifact (so its recipe is launch →
+  // waitExternal → claimCheck) — a fresh Codex writes NO rollout until its FIRST
+  // TURN (live-verified v0.141.0). So readiness can't be a passive watch: the join
+  // turn is BOTH the stimulus and the thing that creates the rollout. This step
+  // encapsulates the whole bring-up — (optional classifier-accelerated) fire of the
+  // self-resolve join (echo $CODEX_THREAD_ID + claim_session), then bind the session
+  // id from the rollout that the turn creates (load-bearing: the rollout's
+  // new-file+cwd+mtime binding is what ties the claimed thread-id to THIS pane), with
+  // bounded re-send if the keystroke missed. Codex-only; Claude never reaches it.
+  | { op: "selfJoinClaim"; note?: string }
   // External confirmation that the bound session is now resolvable in oxtail's
   // registry (adoption landed) — not a pane-text check.
   | { op: "claimCheck"; note?: string }
@@ -100,23 +105,24 @@ export function buildLaunchCommand(window: FleetWindowSpec): string {
   return parts.join(" ");
 }
 
-// The one-line instruction oxpit types into a freshly-spawned Codex to make it
-// register the just-bound session. EXPLICIT-id form: oxpit already read the
-// thread-id from the rollout, so it tells Codex exactly what to claim rather than
-// trusting Codex to self-resolve $CODEX_THREAD_ID (same value, but explicit
-// removes the env dependency and gives an exact, confirmable target).
-//
-// Phrasing per the live Codex peer (it knows its own first-turn ergonomics): a
-// single direct MCP tool-call instruction is the most reliable thing for a fresh
-// Codex to execute — NO leading slash, code fences, shell syntax, or multi-step
-// prose, and claim_session (not register_my_session) for the compact verify. The
-// "reply Registered" tail is a human/diagnostic signal only — oxpit's truth is
-// the registry (claimCheck/isClaimPaneBound), never this pane text.
-export function buildJoinInstruction(sessionId: string): string {
-  return (
-    `Call the oxtail MCP tool claim_session with session_id "${sessionId}" now. ` +
-    `If it succeeds, reply exactly: Registered: ${sessionId}`
-  );
+// The instruction oxpit types into a freshly-spawned Codex as its FIRST TURN to
+// make it register itself. SELF-RESOLVE form (not the old explicit-id form): oxpit
+// can't read the thread-id before the rollout exists, and the rollout doesn't exist
+// until this very turn runs — so Codex supplies its own id. $CODEX_THREAD_ID is
+// stripped from the MCP child but PRESENT in a Bash subshell (exactly how the
+// /oxtail-join skill works), so the instruction routes through Bash. Phrasing per
+// the live Codex peer: terse, do-only-this, no file/edit work, printf the id then
+// claim_session with it. The "Registered:" reply is a human/diagnostic tail only —
+// oxpit's truth is the registry (claimCheck), never this pane text. Prefer
+// CODEX_THREAD_ID; fall back to CODEX_COMPANION_SESSION_ID only if empty.
+export function buildSelfJoinInstruction(): string {
+  return [
+    "oxtail join: do only this. Use Bash to run:",
+    `id="$CODEX_THREAD_ID"; [ -n "$id" ] || id="$CODEX_COMPANION_SESSION_ID"; printf '%s\\n' "$id"`,
+    "Then call the oxtail MCP tool claim_session with that exact value as session_id.",
+    "Do not inspect files or edit code. When claim_session succeeds, reply exactly:",
+    "Registered: <session_id>",
+  ].join(" ");
 }
 
 // The SPAWN recipe: launch into the empty shell, wait for the launch artifact to
@@ -124,18 +130,26 @@ export function buildJoinInstruction(sessionId: string): string {
 // registry adoption. Effort chords + classifyPane gates are layered in as P3
 // finalizes (the DSL supports them).
 //
-// PHASING (max Q4): Claude auto-joins via its SessionStart hook, so its recipe is
-// launch → waitExternal → claimCheck. Codex has no auto-join, so it gets an extra
-// joinClaim step BEFORE claimCheck; without it a fresh Codex could never satisfy
-// the pane-bound claimCheck.
+// The two clients have FUNDAMENTALLY DIFFERENT readiness shapes (live-verified):
+//   • Claude — SessionStart drop is a LAUNCH-TIME artifact + the hook auto-joins, so:
+//       launch → waitExternal(drop binds id) → claimCheck.
+//   • Codex — writes NO rollout until its first turn, and has no auto-join, so a
+//     passive waitExternal would deadlock (the rollout it waits for is created by the
+//     join it hasn't sent yet). Its recipe inverts to stimulus→proof:
+//       launch → selfJoinClaim(fire the join turn → bind id from the rollout it
+//       creates) → claimCheck.
+// selfJoinClaim absorbs Codex's readiness (no separate waitExternal): the join IS the
+// stimulus and the rollout it produces IS the bound-id proof. claimCheck stays the
+// final registry truth for both.
 export function buildRecipe(window: FleetWindowSpec): Recipe {
   const launchCommand = buildLaunchCommand(window);
   const steps: RecipeStep[] = [
     { op: "sendLiteral", text: launchCommand, note: "launch into the empty shell" },
-    { op: "waitExternal", artifact: window.agent, note: "bind session via launch artifact" },
   ];
   if (window.agent === "codex") {
-    steps.push({ op: "joinClaim", note: "cooperative self-claim (Codex has no auto-join)" });
+    steps.push({ op: "selfJoinClaim", note: "fire the join turn; bind id from the rollout it creates" });
+  } else {
+    steps.push({ op: "waitExternal", artifact: window.agent, note: "bind session via launch artifact" });
   }
   steps.push({ op: "claimCheck", note: "confirm the bound session is registry-resolvable" });
   return {
@@ -162,8 +176,8 @@ function renderStep(s: RecipeStep): string {
       return `waitExternal ${s.artifact} (${s.artifact === "claude" ? "SessionStart drop, ppid→pane" : "rollout file, new-file+cwd"})`;
     case "classifyPane":
       return `classifyPane expect [${s.expect.join(", ")}]`;
-    case "joinClaim":
-      return `joinClaim (cooperative self-claim, Codex)`;
+    case "selfJoinClaim":
+      return `selfJoinClaim (Codex: fire join-turn → bind id from the rollout it creates, accelerator-gated + bounded re-send)`;
     case "claimCheck":
       return `claimCheck`;
     case "abort":
@@ -195,10 +209,14 @@ export interface RecipeEffects {
   waitExternal: (
     artifact: AgentKind,
   ) => Promise<{ ok: true; sessionId: string } | { ok: false; reason: string }>;
-  // Fire the cooperative self-claim instruction (joinClaim step) into the pane,
-  // built from the bound session id. ensure-window wires this to fireKeystrokes
-  // of buildJoinInstruction; Claude recipes never invoke it.
-  cooperativeJoin: (sessionId: string) => Promise<void>;
+  // Run the whole Codex self-join bring-up and BIND the session id (selfJoinClaim
+  // step). ensure-window wires this to: (optional classifier-accelerated) fire of
+  // buildSelfJoinInstruction → poll the rollout the turn creates, bound to this pane
+  // → bounded re-send if it didn't land → return the rollout-derived session id.
+  // Claude recipes never invoke it. Returns a pane dump on failure for a loud abort.
+  selfJoinClaim: () => Promise<
+    { ok: true; sessionId: string } | { ok: false; reason: string; dump?: string }
+  >;
   // External confirmation the bound session is now addressable. May poll (it
   // waits out registry-adoption lag), so it returns a promise; a sync boolean is
   // also accepted (tests). MUST be pane-bound, not bare sid presence — see
@@ -209,7 +227,7 @@ export interface RecipeEffects {
 
 export type RecipeResult =
   | { ok: true; sessionId: string | null }
-  | { ok: false; failed: RecipeStep; reason: string; sessionId: string | null };
+  | { ok: false; failed: RecipeStep; reason: string; sessionId: string | null; dump?: string };
 
 // Interpret the recipe step-by-step against the effects. The bound session id
 // (from waitExternal) flows to claimCheck. ANY gate/await/confirm failure stops
@@ -265,17 +283,17 @@ export async function executeRecipe(recipe: Recipe, fx: RecipeEffects): Promise<
         }
         break;
       }
-      case "joinClaim": {
-        if (!sessionId) {
-          return {
-            ok: false,
-            failed: step,
-            reason: "joinClaim reached before waitExternal bound a session",
-            sessionId,
-          };
+      case "selfJoinClaim": {
+        // BINDS the session — the join turn both runs the claim AND creates the
+        // rollout we read the id from (so, unlike Claude's waitExternal, there is no
+        // pre-bound session to require here; this step is what produces it).
+        log("firing Codex self-join turn; binding session from the rollout it creates");
+        const r = await fx.selfJoinClaim();
+        if (!r.ok) {
+          return { ok: false, failed: step, reason: r.reason, sessionId, dump: r.dump };
         }
-        log(`firing cooperative self-claim for ${sessionId}`);
-        await fx.cooperativeJoin(sessionId);
+        sessionId = r.sessionId;
+        log(`bound session ${sessionId}`);
         break;
       }
       case "claimCheck": {

@@ -2,9 +2,9 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import type { PaneClassification } from "./classify.js";
 import {
-  buildJoinInstruction,
   buildLaunchCommand,
   buildRecipe,
+  buildSelfJoinInstruction,
   clientTypeFor,
   executeRecipe,
   type Recipe,
@@ -80,16 +80,22 @@ test("buildRecipe: Claude omits joinClaim (hook auto-joins)", () => {
   assert.equal(r.steps[1].op === "waitExternal" && r.steps[1].artifact, "claude");
 });
 
-test("buildRecipe: Codex inserts joinClaim BEFORE claimCheck (no auto-join)", () => {
+test("buildRecipe: Codex uses selfJoinClaim and has NO passive waitExternal (lazy rollout)", () => {
+  // The join IS the readiness stimulus (it creates the rollout), so there's no
+  // separate waitExternal — selfJoinClaim binds the id, then claimCheck confirms.
   const r = buildRecipe(codexWin);
-  assert.deepEqual(r.steps.map((s) => s.op), ["sendLiteral", "waitExternal", "joinClaim", "claimCheck"]);
+  assert.deepEqual(r.steps.map((s) => s.op), ["sendLiteral", "selfJoinClaim", "claimCheck"]);
+  assert.ok(!r.steps.some((s) => s.op === "waitExternal"), "Codex must not passively waitExternal");
 });
 
-test("buildJoinInstruction is a single direct claim_session call with the id (codex live phrasing)", () => {
-  const s = buildJoinInstruction("019ee2db-thread");
-  assert.match(s, /^Call the oxtail MCP tool claim_session with session_id "019ee2db-thread" now\./);
+test("buildSelfJoinInstruction is a self-resolve join (Bash $CODEX_THREAD_ID → claim_session)", () => {
+  const s = buildSelfJoinInstruction();
+  assert.match(s, /CODEX_THREAD_ID/);
+  assert.match(s, /CODEX_COMPANION_SESSION_ID/); // documented fallback
+  assert.match(s, /claim_session/);
   assert.ok(!s.startsWith("/"), "no leading slash command");
-  assert.ok(!/```|\$\(|;/.test(s), "no code fences / shell syntax");
+  assert.ok(!/```/.test(s), "no code fences");
+  assert.ok(!/"019|session_id "/.test(s), "no pre-baked explicit id — Codex supplies its own");
 });
 
 test("recipesForFleet maps each window to a recipe", () => {
@@ -120,8 +126,9 @@ function fx(over: Partial<RecipeEffects> = {}): { fx: RecipeEffects; sent: strin
     confirmLine: async () => true,
     classify: (): PaneClassification => ({ readiness: "tui-ready" }),
     waitExternal: async () => ({ ok: true, sessionId: "sid-xyz" }),
-    cooperativeJoin: async (sid) => {
-      sent.push(`<join:${sid}>`);
+    selfJoinClaim: async () => {
+      sent.push("<selfJoin>");
+      return { ok: true, sessionId: "sid-codex" };
     },
     claimCheck: () => true,
   };
@@ -136,36 +143,53 @@ test("happy path: binds the session and confirms the claim", async () => {
   assert.deepEqual(sent, ["claude --model 'opus-4.8' --effort 'xhigh'"]);
 });
 
-test("Codex happy path fires cooperativeJoin with the bound id, then confirms", async () => {
+test("Codex happy path: selfJoinClaim BINDS the session (no pre-bound waitExternal), then confirms", async () => {
   const { fx: effects, sent } = fx();
   const res = await executeRecipe(buildRecipe(codexWin), effects);
   assert.equal(res.ok, true);
-  if (res.ok) assert.equal(res.sessionId, "sid-xyz");
-  // launch command, then the join fired with the bound session id
-  assert.deepEqual(sent, ["codex --model 'gpt-5.5'", "<join:sid-xyz>"]);
+  // the session id comes from selfJoinClaim (the rollout the join creates), NOT a
+  // passive waitExternal.
+  if (res.ok) assert.equal(res.sessionId, "sid-codex");
+  assert.deepEqual(sent, ["codex --model 'gpt-5.5'", "<selfJoin>"]);
 });
 
-test("joinClaim before a bound session is a hard error", async () => {
-  const recipe: Recipe = {
-    client: "codex",
-    label: "codex",
-    launchCommand: "codex",
-    steps: [{ op: "joinClaim" }],
-  };
-  const res = await executeRecipe(recipe, fx().fx);
-  assert.equal(res.ok, false);
-  if (!res.ok) assert.match(res.reason, /joinClaim reached before/);
-});
-
-test("waitExternal failure stops the recipe with that reason", async () => {
+test("selfJoinClaim failure stops the recipe with its reason + dump", async () => {
   const { fx: effects } = fx({
-    waitExternal: async () => ({ ok: false, reason: "rollout never appeared" }),
+    selfJoinClaim: async () => ({ ok: false, reason: "no rollout after 3 sends", dump: "PANE TEXT" }),
   });
   const res = await executeRecipe(buildRecipe(codexWin), effects);
   assert.equal(res.ok, false);
   if (!res.ok) {
+    assert.equal(res.failed.op, "selfJoinClaim");
+    assert.match(res.reason, /no rollout after 3 sends/);
+    assert.equal(res.dump, "PANE TEXT");
+  }
+});
+
+test("a free-standing joinClaim-style step type no longer exists — selfJoinClaim is the binder", async () => {
+  // selfJoinClaim doesn't require a pre-bound session (it PRODUCES one), so the old
+  // "join before a bound session" hard-error is gone by construction.
+  const recipe: Recipe = {
+    client: "codex",
+    label: "codex",
+    launchCommand: "codex",
+    steps: [{ op: "selfJoinClaim" }, { op: "claimCheck" }],
+  };
+  const res = await executeRecipe(recipe, fx().fx);
+  assert.equal(res.ok, true);
+  if (res.ok) assert.equal(res.sessionId, "sid-codex");
+});
+
+test("waitExternal failure stops the recipe with that reason (Claude path)", async () => {
+  // waitExternal is now the CLAUDE readiness step (Codex binds via selfJoinClaim).
+  const { fx: effects } = fx({
+    waitExternal: async () => ({ ok: false, reason: "drop never appeared" }),
+  });
+  const res = await executeRecipe(buildRecipe(main), effects);
+  assert.equal(res.ok, false);
+  if (!res.ok) {
     assert.equal(res.failed.op, "waitExternal");
-    assert.match(res.reason, /rollout never appeared/);
+    assert.match(res.reason, /drop never appeared/);
   }
 });
 

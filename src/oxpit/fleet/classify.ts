@@ -52,14 +52,33 @@ function tailLines(lines: string[], n: number): string[] {
 }
 
 function tuiReady(lines: string[], clientType: ClientType): boolean {
-  // Best-effort idle-TUI affordance, anchored on bottom-region footer chrome.
-  // Dropped the over-broad /ctrl\+./ (matched any "ctrl+c" in logs). Still
-  // build-dependent → a miss falls to shell/unknown, never a false ready. The
-  // exact footer strings are confirmed against live agents at the P3 gate, where
-  // the first classifyPane step actually consumes this.
-  const tail = tailLines(lines, 6).join("\n");
-  if (clientType === "claude-code") return /\? for shortcuts/i.test(tail);
-  if (clientType === "codex") return /\? for shortcuts|\/ for commands/i.test(tail);
+  // Best-effort idle-TUI affordance, anchored on bottom-region chrome (so stale
+  // scrollback can't false-positive). For CODEX this is an ACCELERATOR ONLY, never
+  // a hard go/no-go: the Codex join's proof-of-accept is the rollout ARTIFACT, so a
+  // miss here just falls back to settle+retry (max's robustness fix). That's
+  // deliberate — the old codex string ("? for shortcuts | / for commands") was never
+  // live-wired and broke on v0.141.0; betting SPAWN go/no-go on a per-version pane
+  // string violates the "pane text is evidence, not truth" pillar.
+  const tail = tailLines(lines, 8);
+  if (clientType === "claude-code") return tail.some((l) => /\? for shortcuts/i.test(l));
+  if (clientType === "codex") {
+    // STRUCTURAL signal for a fresh, idle Codex composer (codex's spec, verified vs a
+    // real v0.141.0 capture): require BOTH the focused composer prompt (a tail line
+    // starting with the `›` glyph) AND the status footer (a `·`-class separator
+    // followed by a cwd-ish path, e.g. "gpt-5.5 xhigh · ~/dev/oxtail"). The startup
+    // box ("OpenAI Codex (vX)", "/model to change") is intentionally NOT used — it
+    // survives in scrollback after state changes. busy (mid-turn) is rejected upstream
+    // in classifyPaneReadiness, so this only fires for a genuinely idle composer.
+    // The footer must be the BOTTOM-MOST line (tail[0] = last non-empty line). A live
+    // idle Codex ends in its `<model> <effort> · <cwd>` footer; a Codex that EXITED
+    // back to a shell has the shell prompt as the last line with only a STALE footer
+    // in scrollback — so anchoring on the last line rejects that false-positive (max).
+    // Conservative by design: as an accelerator, a missed-ready just falls back to
+    // settle+retry, so we'd rather under-fire than fire the join into an exited pane.
+    const hasFooterLast = /[·•∙⋅]\s.*(?:~\/|\/)/.test(tail[0] ?? "");
+    const hasComposer = tail.slice(0, 5).some((l) => /^\s*›/.test(l));
+    return hasComposer && hasFooterLast;
+  }
   return false;
 }
 

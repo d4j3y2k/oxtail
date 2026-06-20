@@ -38,7 +38,7 @@ test("tmuxSessionName strips chars unsafe in tmux target syntax (: and .)", () =
 test("planSpawn maps each window to a target + rendered recipe (no tmux)", () => {
   const plan = planSpawn(spec, "demo-fleet");
   assert.deepEqual(plan.map((p) => p.paneTarget), ["demo-fleet:main", "demo-fleet:codex"]);
-  assert.match(plan[1].recipe, /joinClaim/); // codex recipe carries the join step
+  assert.match(plan[1].recipe, /selfJoinClaim/); // codex recipe carries the self-join step
 });
 
 test("renderSpawnPlan shows the new-session + new-window + per-window steps", () => {
