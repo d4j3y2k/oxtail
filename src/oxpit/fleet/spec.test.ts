@@ -24,7 +24,7 @@ function writeConfig(root: string, contents: string): void {
 const VALID = JSON.stringify({
   name: "demo",
   windows: [
-    { name: "main", agent: "claude", model: "opus-4.8", effort: "xhigh", role: "captain" },
+    { name: "main", agent: "claude", model: "opus[1m]", effort: "xhigh", role: "captain" },
     { name: "codex", agent: "codex", model: "gpt-5.5" },
   ],
 });

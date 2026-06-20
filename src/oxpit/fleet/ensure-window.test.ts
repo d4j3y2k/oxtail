@@ -15,7 +15,7 @@ import type { RecipeResult } from "./recipes.js";
 import type { FleetWindowSpec } from "./types.js";
 
 const FLEET = "oxtail-abcd1234";
-const main: FleetWindowSpec = { name: "main", agent: "claude", model: "opus-4.8", role: "captain" };
+const main: FleetWindowSpec = { name: "main", agent: "claude", model: "opus[1m]", role: "captain" };
 
 function probe(over: Partial<OccupancyProbe>): OccupancyProbe {
   return { pane: "%5", currentCommand: "zsh", panePid: 1234, managedBy: null, ...over };

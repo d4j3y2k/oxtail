@@ -19,7 +19,7 @@ import type { FleetWindowSpec } from "./types.js";
 const main: FleetWindowSpec = {
   name: "main",
   agent: "claude",
-  model: "opus-4.8",
+  model: "opus[1m]",
   effort: "xhigh",
   role: "captain",
 };
@@ -31,7 +31,7 @@ test("clientTypeFor maps the AgentKind to oxtail's ClientType", () => {
 });
 
 test("buildLaunchCommand shell-quotes the spec model into --model", () => {
-  assert.equal(buildLaunchCommand(main), "claude --model 'opus-4.8' --effort 'xhigh'");
+  assert.equal(buildLaunchCommand(main), "claude --model 'opus[1m]' --effort 'xhigh'");
   assert.equal(buildLaunchCommand(codexWin), "codex --model 'gpt-5.5'");
   assert.equal(buildLaunchCommand({ name: "x", agent: "claude" }), "claude");
 });
@@ -39,8 +39,8 @@ test("buildLaunchCommand shell-quotes the spec model into --model", () => {
 test("buildLaunchCommand applies effort as a launch flag per client", () => {
   // Claude: first-class --effort flag (verified in `claude --help`).
   assert.equal(
-    buildLaunchCommand({ name: "max", agent: "claude", model: "opus-4.8", effort: "max" }),
-    "claude --model 'opus-4.8' --effort 'max'",
+    buildLaunchCommand({ name: "max", agent: "claude", model: "opus[1m]", effort: "max" }),
+    "claude --model 'opus[1m]' --effort 'max'",
   );
   assert.equal(
     buildLaunchCommand({ name: "main", agent: "claude", effort: "xhigh" }),
@@ -75,7 +75,7 @@ test("buildRecipe: Claude omits joinClaim (hook auto-joins)", () => {
   assert.deepEqual(r.steps.map((s) => s.op), ["sendLiteral", "waitExternal", "claimCheck"]);
   assert.equal(
     r.steps[0].op === "sendLiteral" && r.steps[0].text,
-    "claude --model 'opus-4.8' --effort 'xhigh'",
+    "claude --model 'opus[1m]' --effort 'xhigh'",
   );
   assert.equal(r.steps[1].op === "waitExternal" && r.steps[1].artifact, "claude");
 });
@@ -106,8 +106,8 @@ test("recipesForFleet maps each window to a recipe", () => {
 test("renderRecipe prints exact, reviewable dry-run steps", () => {
   const out = renderRecipe(buildRecipe(main));
   assert.match(out, /recipe: claude "main \(captain\)"/);
-  assert.match(out, /launch: claude --model 'opus-4\.8' --effort 'xhigh'/);
-  assert.match(out, /1\. sendLiteral "claude --model 'opus-4\.8' --effort 'xhigh'"/);
+  assert.match(out, /launch: claude --model 'opus\[1m\]' --effort 'xhigh'/);
+  assert.match(out, /1\. sendLiteral "claude --model 'opus\[1m\]' --effort 'xhigh'"/);
   assert.match(out, /2\. waitExternal claude/);
   assert.match(out, /3\. claimCheck/);
 });
@@ -140,7 +140,7 @@ test("happy path: binds the session and confirms the claim", async () => {
   const res = await executeRecipe(buildRecipe(main), effects);
   assert.equal(res.ok, true);
   if (res.ok) assert.equal(res.sessionId, "sid-xyz");
-  assert.deepEqual(sent, ["claude --model 'opus-4.8' --effort 'xhigh'"]);
+  assert.deepEqual(sent, ["claude --model 'opus[1m]' --effort 'xhigh'"]);
 });
 
 test("Codex happy path: selfJoinClaim BINDS the session (no pre-bound waitExternal), then confirms", async () => {

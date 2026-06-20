@@ -75,8 +75,8 @@ function withTempRepo(fn: (repoRoot: string) => Promise<void>): Promise<void> {
 const spec: FleetSpec = {
   name: "oxspike",
   windows: [
-    { name: "main", agent: "claude", model: "opus-4.8", effort: "xhigh", role: "captain" },
-    { name: "max", agent: "claude", model: "opus-4.8", effort: "max" },
+    { name: "main", agent: "claude", model: "opus[1m]", effort: "xhigh", role: "captain" },
+    { name: "max", agent: "claude", model: "opus[1m]", effort: "max" },
     { name: "codex", agent: "codex", model: "gpt-5.5" },
   ],
 };
@@ -192,7 +192,7 @@ test(
         launched.push(ctx.window.name);
         return { ok: true as const, sessionId: `stub-${ctx.window.name}` };
       };
-      const win = (name: string) => ({ name, agent: "claude" as const, model: "opus-4.8" });
+      const win = (name: string) => ({ name, agent: "claude" as const, model: "opus[1m]" });
       const pane = (w: string) =>
         tmuxRaw(["list-panes", "-t", `=${session}:${w}`, "-F", "#{pane_id}"]).trim();
       try {
@@ -254,8 +254,8 @@ test(
     const spec: FleetSpec = {
       name: "oxspike",
       windows: [
-        { name: "main", agent: "claude", model: "opus-4.8" },
-        { name: "max", agent: "claude", model: "opus-4.8" },
+        { name: "main", agent: "claude", model: "opus[1m]" },
+        { name: "max", agent: "claude", model: "opus[1m]" },
       ],
     };
     await withTempRepo(async (repoRoot) => {

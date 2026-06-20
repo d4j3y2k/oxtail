@@ -10,7 +10,7 @@ import type { FleetSpec } from "./types.js";
 const spec: FleetSpec = {
   name: "demo.fleet",
   windows: [
-    { name: "main", agent: "claude", model: "opus-4.8", role: "captain" },
+    { name: "main", agent: "claude", model: "opus[1m]", role: "captain" },
     { name: "codex", agent: "codex", model: "gpt-5.5" },
   ],
 };

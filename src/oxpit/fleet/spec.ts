@@ -90,9 +90,15 @@ const FleetSchema = z
 // ~/.codex/config.toml level (this fleet's box happens to be xhigh there).
 // Injecting `-c model_reasoning_effort` by default would shadow the user's own
 // config — surprising — so "your codex, your config.toml" is the default.
+// model values MUST be what each client's `--model` flag accepts (LIVE-verified):
+// Claude wants an ALIAS ('opus'/'sonnet'/…) or a full id, NOT a "opus-4.8"-style
+// label (that errors "issue with the selected model"). `opus[1m]` = the standing
+// fleet's actual config (latest Opus + 1M context, version-robust); the `[1m]` is
+// why buildLaunchCommand shell-quotes the model (the brackets are shell globs).
+// Codex's `--model gpt-5.5` is the full model name it accepts.
 const DEFAULT_WINDOWS: FleetSpec["windows"] = [
-  { name: "main", agent: "claude", model: "opus-4.8", effort: "xhigh", role: "captain" },
-  { name: "max", agent: "claude", model: "opus-4.8", effort: "max" },
+  { name: "main", agent: "claude", model: "opus[1m]", effort: "xhigh", role: "captain" },
+  { name: "max", agent: "claude", model: "opus[1m]", effort: "max" },
   { name: "codex", agent: "codex", model: "gpt-5.5" },
 ];
 

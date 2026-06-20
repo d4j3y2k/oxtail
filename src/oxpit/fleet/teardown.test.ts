@@ -7,8 +7,8 @@ import type { FleetSpec } from "./types.js";
 const spec: FleetSpec = {
   name: "oxtail",
   windows: [
-    { name: "main", agent: "claude", model: "opus-4.8", effort: "xhigh", role: "captain" },
-    { name: "max", agent: "claude", model: "opus-4.8", effort: "max" },
+    { name: "main", agent: "claude", model: "opus[1m]", effort: "xhigh", role: "captain" },
+    { name: "max", agent: "claude", model: "opus[1m]", effort: "max" },
     { name: "codex", agent: "codex" },
   ],
 };

@@ -12,7 +12,7 @@ export type AgentKind = "claude" | "codex";
 export interface FleetWindowSpec {
   name: string; // tmux window name + role label, e.g. "main" | "max" | "codex"
   agent: AgentKind;
-  model?: string; // e.g. "opus-4.8" — applied as a launch flag where supported
+  model?: string; // a value the client's --model accepts, e.g. "opus[1m]" / "sonnet" / "gpt-5.5"
   effort?: string; // e.g. "xhigh" | "max"
   role?: string; // informational, e.g. "captain"
 }
