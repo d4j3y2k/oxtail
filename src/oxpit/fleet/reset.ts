@@ -25,7 +25,7 @@ import {
   type EnsureWindowResult,
 } from "./ensure-window.js";
 import { withFleetLock } from "./lock.js";
-import { listPanesWithMarkers, markersInSession, type TmuxRun } from "./ownership.js";
+import { listPanesWithMarkers, markersInSession, type PaneInfo, type TmuxRun } from "./ownership.js";
 import { computeTeardownPlan, renderTeardownPlan, type TeardownPlan } from "./teardown.js";
 import type { FleetSpec } from "./types.js";
 
@@ -41,6 +41,12 @@ export interface ResetOptions {
   dryRun?: boolean; // default TRUE — print the plan, mutate nothing
   run?: TmuxRun;
   fleetId?: string; // usually discovered from the session's markers
+  // CONFIRM-FIDELITY (max): the pane-ids / window-names the operator CONFIRMED from
+  // the dry-run preview. When set, the live mutating run acts on ONLY the
+  // intersection with its fresh-locked plan — so a pane that appeared AFTER the
+  // confirm is never torn down UNSEEN. Unset (CLI direct) → act on the fresh plan.
+  confirmedTargets?: string[]; // pane-ids confirmed for teardown
+  confirmedMissing?: string[]; // window-names confirmed for fresh launch
   ensure?: typeof realEnsureWindow; // injectable for tests
   ensureDeps?: EnsureWindowDeps;
   now?: () => number;
@@ -60,8 +66,15 @@ export interface ResetResult {
   sessionName: string;
   dryRun: boolean;
   plan: TeardownPlan | null;
+  // The session's NON-fleet panes (unmarked human splits / foreign-marked) — never
+  // touched. Surfaced so the operator SEES the additive-allowlist guarantee, not
+  // just the panes that die (max).
+  survivors: PaneInfo[];
   teardowns: TeardownResult[];
   relaunches: EnsureWindowResult[];
+  // Fresh-locked-plan items the operator did NOT confirm (appeared since the
+  // preview) — NOT acted on, surfaced so a re-run can pick them up (confirm-fidelity).
+  unconfirmed?: { targets: string[]; missing: string[] };
   ok: boolean;
   error?: string;
 }
@@ -106,14 +119,25 @@ export function renderResetPlan(
   fleetId: string,
   sessionName: string,
   plan: TeardownPlan,
+  survivors: PaneInfo[] = [],
 ): string {
-  return [
+  const lines = [
     `RESET (dry-run): fleet "${spec.name}" in tmux session "${sessionName}" [${fleetId}]`,
     `  teardown = per-pane respawn-pane -k (NEVER kill-session) → ensure_window relaunch`,
     ...renderTeardownPlan(plan)
       .split("\n")
       .map((l) => `  ${l}`),
-  ].join("\n");
+  ];
+  // Show the FULL partition — what dies AND what survives — so the additive-allowlist
+  // guarantee is something the operator SEES before the trigger, and a "why is my
+  // editor in this session" surprise surfaces here, not after (max).
+  if (survivors.length) {
+    lines.push(`  UNTOUCHED (not ours — survive the reset): ${survivors.length}`);
+    for (const p of survivors) {
+      lines.push(`    = ${p.pane} ${p.session}:${p.windowIndex} "${p.windowName}" (${p.currentCommand})`);
+    }
+  }
+  return lines.join("\n");
 }
 
 // Reset ONE target pane to a clean shell. The DESTRUCTIVE primitive, gated by an
@@ -183,16 +207,22 @@ export async function resetFleet(
   const run = opts.run ?? defaultRun;
   const discover = () =>
     opts.fleetId ? ({ ok: true, fleetId: opts.fleetId } as const) : discoverFleetId(sessionName, run);
+  const errResult = (dry: boolean, reason: string): ResetResult => ({
+    fleetId: null, sessionName, dryRun: dry, plan: null, survivors: [], teardowns: [], relaunches: [], ok: false, error: reason,
+  });
+  // The session panes NOT carrying our fleetId — unmarked human splits + foreign —
+  // are NEVER touched; surfaced so the operator sees the survivors, not just the dead.
+  const survivorsOf = (panes: PaneInfo[], fleetId: string) => panes.filter((p) => p.managedBy !== fleetId);
 
-  // DRY-RUN preview: discover + plan OUTSIDE the lock (read-only, mutates nothing).
+  // DRY-RUN preview: discover + plan + survivors OUTSIDE the lock (read-only).
   if (dryRun) {
     const disc = discover();
-    if (!disc.ok) {
-      return { fleetId: null, sessionName, dryRun: true, plan: null, teardowns: [], relaunches: [], ok: false, error: disc.reason };
-    }
-    const plan = computeTeardownPlan(spec, disc.fleetId, sessionPanes(run, sessionName));
-    opts.log?.(renderResetPlan(spec, disc.fleetId, sessionName, plan));
-    return { fleetId: disc.fleetId, sessionName, dryRun: true, plan, teardowns: [], relaunches: [], ok: true };
+    if (!disc.ok) return errResult(true, disc.reason);
+    const panes = sessionPanes(run, sessionName);
+    const plan = computeTeardownPlan(spec, disc.fleetId, panes);
+    const survivors = survivorsOf(panes, disc.fleetId);
+    opts.log?.(renderResetPlan(spec, disc.fleetId, sessionName, plan, survivors));
+    return { fleetId: disc.fleetId, sessionName, dryRun: true, plan, survivors, teardowns: [], relaunches: [], ok: true };
   }
 
   // MUTATING path: acquire the lock FIRST, THEN discover + compute the plan INSIDE
@@ -204,11 +234,30 @@ export async function resetFleet(
   const ensureDeps = (): EnsureWindowDeps => ({ run, now: opts.now, log: opts.log, ...opts.ensureDeps });
   return withFleetLock(repoRoot, async () => {
     const disc = discover();
-    if (!disc.ok) {
-      return { fleetId: null, sessionName, dryRun: false, plan: null, teardowns: [], relaunches: [], ok: false, error: disc.reason };
-    }
+    if (!disc.ok) return errResult(false, disc.reason);
     const fleetId = disc.fleetId;
-    const plan = computeTeardownPlan(spec, fleetId, sessionPanes(run, sessionName));
+    const panes = sessionPanes(run, sessionName);
+    let plan = computeTeardownPlan(spec, fleetId, panes);
+    const survivors = survivorsOf(panes, fleetId);
+
+    // CONFIRM-FIDELITY (max): when the menu passes the confirmed preview's pane-ids /
+    // window-names, act on ONLY their intersection with the fresh-locked plan — so a
+    // pane that appeared AFTER the confirm is never torn down UNSEEN. Surface the
+    // appeared-but-unconfirmed items so a re-run can pick them up.
+    let unconfirmed: ResetResult["unconfirmed"];
+    if (opts.confirmedTargets || opts.confirmedMissing) {
+      unconfirmed = { targets: [], missing: [] };
+      if (opts.confirmedTargets) {
+        const ok = new Set(opts.confirmedTargets);
+        for (const t of plan.targets) if (!ok.has(t.pane.pane)) unconfirmed.targets.push(t.pane.pane);
+        plan = { ...plan, targets: plan.targets.filter((t) => ok.has(t.pane.pane)) };
+      }
+      if (opts.confirmedMissing) {
+        const ok = new Set(opts.confirmedMissing);
+        for (const w of plan.missing) if (!ok.has(w.name)) unconfirmed.missing.push(w.name);
+        plan = { ...plan, missing: plan.missing.filter((w) => ok.has(w.name)) };
+      }
+    }
 
     // PHASE 1 — QUIESCE: respawn-k EVERY target straight through (no relaunch yet,
     // so no old/new coexistence), each preceded by its live spec-target re-check. No
@@ -239,6 +288,6 @@ export async function resetFleet(
     }
 
     const ok = teardowns.every((t) => t.ok) && relaunches.every((r) => r.ok);
-    return { fleetId, sessionName, dryRun: false, plan, teardowns, relaunches, ok };
+    return { fleetId, sessionName, dryRun: false, plan, survivors, teardowns, relaunches, unconfirmed, ok };
   });
 }

@@ -285,6 +285,50 @@ test("missing windows (no managed pane) are CREATED fresh (new-window -P -F) and
   });
 });
 
+// ── confirm-fidelity + survivors (max button-gates) ──────────────────────────────
+
+test("confirm-fidelity: a target that appeared AFTER the confirm is NOT torn down unseen", async () => {
+  await withRepo(async (repoRoot) => {
+    // Operator confirmed only main (%1) from the preview; max's pane (%2) appeared
+    // since. The live run must teardown ONLY %1 and surface %2 as unconfirmed.
+    const fx = fakeTmux([
+      row({ pane: "%1", windowName: "main" }),
+      row({ pane: "%2", windowName: "max", currentCommand: "claude" }),
+    ]);
+    const res = await resetFleet({ ...spec, windows: [spec.windows[0], spec.windows[1]] }, repoRoot, "oxtail", {
+      dryRun: false,
+      run: fx.run,
+      ensure: fx.ensure,
+      confirmedTargets: ["%1"],
+      confirmedMissing: [],
+    });
+    assert.ok(fx.seq.includes("teardown:%1"), "confirmed main IS torn down");
+    assert.ok(!fx.seq.includes("teardown:%2"), "unconfirmed max is NOT torn down unseen");
+    assert.ok(!fx.seq.some((s) => s.startsWith("relaunch:max")), "and not relaunched");
+    assert.deepEqual(res.unconfirmed?.targets, ["%2"], "the appeared pane is surfaced for a re-run");
+    assert.equal(res.teardowns.length, 1, "only the confirmed target was acted on");
+  });
+});
+
+test("survivors: the session's non-fleet (unmarked human) panes are surfaced + shown in the plan", async () => {
+  await withRepo(async (repoRoot) => {
+    const fx = fakeTmux([
+      row({ pane: "%1", windowName: "main" }), // ours
+      row({ pane: "%9", windowName: "editor", managedBy: null, currentCommand: "nvim" }), // human split
+    ]);
+    let rendered = "";
+    const res = await resetFleet({ ...spec, windows: [spec.windows[0]] }, repoRoot, "oxtail", {
+      run: fx.run,
+      log: (m) => {
+        rendered = m;
+      },
+    }); // dry-run
+    assert.deepEqual(res.survivors.map((p) => p.pane), ["%9"], "the unmarked human pane survives, surfaced");
+    assert.match(rendered, /UNTOUCHED \(not ours/);
+    assert.match(rendered, /nvim/, "the survivor is named in the plan the operator reads");
+  });
+});
+
 test("resetFleet errors (no mutation) when the session has nothing of ours", async () => {
   await withRepo(async (repoRoot) => {
     const seen: string[][] = [];
