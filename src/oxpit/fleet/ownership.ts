@@ -130,3 +130,67 @@ export function readPaneMarker(pane: string, run: TmuxRun = tmux): string | null
     return null;
   }
 }
+
+// Remove the tmux WINDOW containing `pane` — the cockpit's per-window kill: that one
+// agent stops and its window/tab disappears, the rest of the fleet keeps running.
+// Three guards, all fail-CLOSED (refuse + reason, never a destructive surprise):
+//   1. OWNERSHIP — the pane must carry an @oxpit_managed marker (a human's window is
+//      never ours to kill).
+//   2. LAST-WINDOW — killing the session's only window COLLAPSES the session (tmux
+//      closes a session with no windows). That's destroy-the-fleet, not a per-window
+//      kill — refuse and point at RESET / an explicit kill-session.
+//   3. UNMANAGED-SPLIT — `kill-window` takes EVERY pane in the window, so if a human
+//      split a pane into our window, killing it destroys their work. The additive-
+//      safety pillar is "untagged panes are NEVER touched", so refuse unless EVERY
+//      pane in the window carries THIS fleet's marker. (max's stricter call over the
+//      WIP's "acceptable since the window is ours" — flagged for codex review.)
+// `-t <pane>` targets the window the pane belongs to (verified vs tmux 3.5a: list-panes
+// -t <pane> is window-scoped; #{session_windows} is the session's window count).
+export function killManagedWindow(
+  pane: string,
+  run: TmuxRun = tmux,
+): { ok: true; fleetId: string } | { ok: false; reason: string } {
+  const marker = readPaneMarker(pane, run);
+  if (!marker) {
+    return { ok: false, reason: `pane ${pane} is not oxpit-managed (no @oxpit_managed marker) — refusing to kill` };
+  }
+  // (2) LAST-WINDOW guard.
+  let windowCount: number;
+  try {
+    windowCount = Number(run(["display-message", "-t", pane, "-p", "#{session_windows}"]).trim());
+  } catch (e) {
+    return { ok: false, reason: `could not read the session's window count: ${String(e)}` };
+  }
+  if (!Number.isFinite(windowCount) || windowCount <= 1) {
+    return {
+      ok: false,
+      reason: `pane ${pane} is in the session's ONLY window — killing it would destroy the whole session; use RESET, or kill the session explicitly`,
+    };
+  }
+  // (3) UNMANAGED-SPLIT guard: every pane in the window must carry THIS fleet's marker.
+  // `#{pane_id}=#{@oxpit_managed}` is unambiguous — a pane_id is "%N" and a fleetId is
+  // [A-Za-z0-9_-] (mintFleetId), so neither contains "=" (and no 0x1F to escape). An
+  // empty marker (a human split) → mismatch → refuse.
+  try {
+    const out = run(["list-panes", "-t", pane, "-F", "#{pane_id}=#{@oxpit_managed}"]);
+    for (const line of out.split("\n")) {
+      const l = line.trim();
+      if (!l) continue;
+      const m = l.slice(l.indexOf("=") + 1);
+      if (m !== marker) {
+        return {
+          ok: false,
+          reason: `the window of pane ${pane} contains a pane this fleet doesn't own (${m ? `marker "${m}"` : "unmanaged — a human split"}) — refusing to kill (won't destroy unmanaged work)`,
+        };
+      }
+    }
+  } catch (e) {
+    return { ok: false, reason: `could not enumerate the window's panes: ${String(e)}` };
+  }
+  try {
+    run(["kill-window", "-t", pane]);
+    return { ok: true, fleetId: marker };
+  } catch (e) {
+    return { ok: false, reason: `kill-window failed: ${String(e)}` };
+  }
+}

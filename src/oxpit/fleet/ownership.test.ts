@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { listPanesWithMarkers, markersInSession, mintFleetId } from "./ownership.js";
+import { killManagedWindow, listPanesWithMarkers, markersInSession, mintFleetId } from "./ownership.js";
 
 const FS = "\x1f";
 
@@ -113,4 +113,70 @@ test("mintFleetId is sanitized, prefixed, and unique-ish", () => {
   assert.match(a, /^oxtail-[0-9a-f]{8}$/);
   assert.notEqual(a, b);
   assert.match(mintFleetId("weird/name with spaces!"), /^weird-name-with-spaces--[0-9a-f]{8}$/);
+});
+
+// A tmux mock for killManagedWindow: `marker` = the target pane's @oxpit_managed
+// (null = unmarked); `windows` = #{session_windows}; `panes` = the window's
+// [paneId, marker] rows (defaults to a single pane carrying `marker`).
+function killRun(o: { marker: string | null; windows?: number; panes?: Array<[string, string]> }) {
+  const calls: string[][] = [];
+  const run = (args: string[]): string => {
+    calls.push(args);
+    if (args[0] === "show-options") return o.marker ? `${o.marker}\n` : "\n";
+    if (args[0] === "display-message") return `${o.windows ?? 3}\n`;
+    if (args[0] === "list-panes") {
+      const panes = o.panes ?? [["%1", o.marker ?? ""]];
+      return `${panes.map(([p, m]) => `${p}=${m}`).join("\n")}\n`;
+    }
+    return "";
+  };
+  return { run, killed: () => calls.some((c) => c[0] === "kill-window"), calls };
+}
+
+test("killManagedWindow: kills a marked window when all three guards pass", () => {
+  const { run, killed, calls } = killRun({ marker: "oxtail-abcd1234", windows: 3, panes: [["%1", "oxtail-abcd1234"]] });
+  const r = killManagedWindow("%1", run);
+  assert.equal(r.ok, true, "our marked, non-last, uniformly-owned window is killable");
+  if (r.ok) assert.equal(r.fleetId, "oxtail-abcd1234");
+  assert.ok(killed(), "kill-window fired");
+  assert.ok(calls.some((c) => c[0] === "kill-window" && c.includes("%1")), "targets the pane's window");
+});
+
+test("killManagedWindow: refuses an UNMARKED (human) window", () => {
+  const { run, killed } = killRun({ marker: null });
+  const r = killManagedWindow("%9", run);
+  assert.equal(r.ok, false, "an unmarked window is never ours to kill");
+  if (!r.ok) assert.match(r.reason, /not oxpit-managed/);
+  assert.ok(!killed(), "never kills an unmarked window");
+});
+
+test("killManagedWindow: refuses the session's LAST window (would collapse the session)", () => {
+  const { run, killed } = killRun({ marker: "oxtail-abcd1234", windows: 1 });
+  const r = killManagedWindow("%1", run);
+  assert.equal(r.ok, false, "killing the only window would destroy the session");
+  if (!r.ok) assert.match(r.reason, /only window|destroy the whole session/i);
+  assert.ok(!killed(), "never kills the last window");
+});
+
+test("killManagedWindow: refuses a window holding an UNMANAGED split (won't destroy human work)", () => {
+  const { run, killed } = killRun({
+    marker: "oxtail-abcd1234",
+    windows: 3,
+    panes: [["%1", "oxtail-abcd1234"], ["%2", ""]], // %2 is a human split — unmanaged
+  });
+  const r = killManagedWindow("%1", run);
+  assert.equal(r.ok, false, "a window with an unmanaged split is not cleanly ours to kill");
+  if (!r.ok) assert.match(r.reason, /unmanaged|doesn't own/i);
+  assert.ok(!killed(), "never kills a window containing an unmanaged split");
+});
+
+test("killManagedWindow: refuses a window holding ANOTHER fleet's pane", () => {
+  const { run, killed } = killRun({
+    marker: "oxtail-abcd1234",
+    windows: 3,
+    panes: [["%1", "oxtail-abcd1234"], ["%2", "oxtail-otherfleet"]],
+  });
+  const r = killManagedWindow("%1", run);
+  assert.equal(r.ok, false, "a window mixing two fleets' panes is not cleanly ours to kill");
+  assert.ok(!killed(), "never kills a window with a foreign-fleet pane");
 });

@@ -26,6 +26,7 @@ import { captureClipboardImage } from "./clipboard.js";
 import { parseStatusArgs, USAGE } from "./cli.js";
 import { loadFleetConfig, modelOptionsForAgent, validateFleetSpec, writeFleetScaffold } from "./fleet/spec.js";
 import { renderSpawnPlan, spawnFleet, tmuxSessionExists, tmuxSessionName } from "./fleet/spawn.js";
+import { killManagedWindow } from "./fleet/ownership.js";
 import { buildResetPlan, discoverFleetId, renderResetPlan, resetFleet } from "./fleet/reset.js";
 import { listPanesWithMarkers } from "./fleet/ownership.js";
 import type { FleetSpec } from "./fleet/types.js";
@@ -208,6 +209,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     let logMsgCount = 0; // last-rendered message count (for cursor clamping)
     let logAvail = 0; // last-rendered visible body lines (for cursor paging)
     let pendingNudgeKey: string | null = null; // agentKey awaiting 'y' to confirm a nudge
+    let pendingKillKey: string | null = null; // agentKey awaiting a 2nd 'K' to confirm a window kill
     // SPAWN overlay (P4): a full-screen plan preview + y-confirm gate. `S` computes
     // the dry-run plan (read-only) and opens it; `y` executes the real spawn. Cached
     // so the confirm can't re-resolve against a changed fleet. spawnBusy locks the
@@ -300,7 +302,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     // table windowing reserves exactly the footer's height (no cursor-home desync).
     function footerKeyLines(width: number): string[] {
       const items = [
-        "↑↓ move", "⏎ jump", "n nudge", "m msg", "S spawn", "R reset",
+        "↑↓ move", "⏎ jump", "n nudge", "m msg", "S spawn", "R reset", "K kill",
         "l log", "w thread", "r refresh", "? help", "⌃C quit",
       ];
       const maxW = Math.max(16, width - 2);
@@ -345,6 +347,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "                in the panel: ↑↓ move the › cursor (or scroll an expanded msg) · w expand · j/k agents · f filter · ⏎ jump",
         "  S             configure + spawn a fleet — grid editor (n/m/f/t/r edit a window · a/d add/delete · w save · y spawn)",
         "  R             RESET the selected agent's fleet — teardown + relaunch (red plan; R again to confirm, NOT y)",
+        "  K             KILL the selected agent's window — removes that one window (K again to confirm; only oxpit-managed)",
         "  r             force refresh    ?  toggle help    ⌃C (Ctrl-C)  quit",
         "",
         d("  🟢 active   🟡 idle   ⚫ dead (exited / pid-reused)"),
@@ -828,6 +831,21 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
           if (torndown) return;
           setStatus(warn(`nudge error: ${e instanceof Error ? e.message : e}`, opts.color));
         });
+    }
+
+    // Remove the selected agent's WINDOW (cockpit per-window kill). killManagedWindow
+    // refuses an unmarked pane (only OUR fleet windows), so a human's window is safe.
+    // Bound by the pre-resolved agent (the K-again confirm can't mis-point it).
+    function doKillWindow(agent: FleetAgent): void {
+      const label = agent.window_name ?? agent.short_id;
+      if (!agent.tmux_pane) return setStatus(warn(`no tmux pane for ${label} — can't kill`, opts.color));
+      const r = killManagedWindow(agent.tmux_pane);
+      if (r.ok) {
+        setStatus(ok(`✓ killed window "${label}"`, opts.color));
+        refresh(true); // the window's gone — re-read the fleet
+      } else {
+        setStatus(warn(`kill: ${r.reason}`, opts.color));
+      }
     }
 
     // ── SPAWN (P4): plan overlay → y-confirm → execute ───────────────────────
@@ -1588,6 +1606,17 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         }
         return paint(); // any other key cancels the pending nudge
       }
+      if (pendingKillKey !== null) {
+        const key = pendingKillKey;
+        pendingKillKey = null;
+        if (s === "K") {
+          // a 2nd deliberate K confirms (destructive) — resolve THIS bound agent.
+          const agent = snapshot.agents.find((a) => agentKey(a) === key);
+          if (!agent) return setStatus(warn("selection changed — kill cancelled", opts.color));
+          return doKillWindow(agent);
+        }
+        return paint(); // any other key cancels the pending kill
+      }
       // `l` = the GLOBAL feed (max review): always predictable — opens/switches to
       // the unfiltered panel, and closes only when already showing global. `w`
       // (below) is the per-agent counterpart. So l/w read as "everything vs this one".
@@ -1650,6 +1679,20 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (s === "m") return startCompose();
       if (s === "S") return openFleetEditor(); // capital-S: open the fleet config editor → spawn
       if (s === "R") return openReset(); // capital-R: RESET the selected agent's fleet (red plan)
+      if (s === "K") {
+        // capital-K: remove the selected agent's WINDOW (destructive; K-again confirms).
+        const idx = selectedIndex();
+        if (idx < 0) return;
+        const agent = snapshot.agents[idx];
+        if (!agent.tmux_pane) {
+          return setStatus(warn(`no tmux pane for ${agent.window_name ?? agent.short_id}`, opts.color));
+        }
+        pendingKillKey = agentKey(agent);
+        const selfTag = agent.is_self ? " — THIS IS YOUR OWN SESSION" : "";
+        return setStatus(
+          warn(`KILL window "${agent.window_name ?? agent.short_id}"${selfTag}? press K again to confirm`, opts.color),
+        );
+      }
       if (s === "w") {
         // item 4: open the selected agent's thread (filtered) in the bottom panel,
         // cursor on its latest message. ↑↓ then move the cursor; w expands it.
