@@ -12,9 +12,9 @@
 // operator sanity and because a window name carrying the U+001F field separator
 // would corrupt ownership.ts's list-panes parsing (codex P2 follow-up).
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { type ParseError, parse as parseJsonc, printParseErrorCode } from "jsonc-parser";
 import { z } from "zod";
 import type { FleetSpec } from "./types.js";
@@ -123,6 +123,31 @@ export function defaultFleet(repoRoot?: string): FleetSpec {
 
 export function projectFleetConfigPath(repoRoot: string): string {
   return join(repoRoot, ".oxtail", "fleet.json");
+}
+
+// Scaffold a project .oxtail/fleet.json from `spec` (the operator's starting point
+// to edit) — the "easy config" entry: the SPAWN overlay's `w` key writes the
+// effective spec so you don't author JSON from scratch. REFUSES to clobber an
+// existing config (edit it directly). The leading comment is JSONC-legal (the
+// loader uses jsonc-parser).
+export function writeFleetScaffold(
+  repoRoot: string,
+  spec: FleetSpec,
+): { ok: true; path: string } | { ok: false; reason: string } {
+  const path = projectFleetConfigPath(repoRoot);
+  if (existsSync(path)) {
+    return { ok: false, reason: `a config already exists at ${path} — edit it directly` };
+  }
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    const header =
+      "// oxpit fleet spec — edit freely, then re-run SPAWN. windows[]: name, agent\n" +
+      "// (claude|codex), model, effort, role, remoteControl (claude-only).\n";
+    writeFileSync(path, header + JSON.stringify(spec, null, 2) + "\n");
+    return { ok: true, path };
+  } catch (e) {
+    return { ok: false, reason: `could not write ${path}: ${String(e)}` };
+  }
 }
 
 // Lazy homedir() each call (mirrors registry/mailbox dir helpers) so tests can

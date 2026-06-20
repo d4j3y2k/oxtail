@@ -24,7 +24,7 @@ import { NUDGE_TEXT, sendOperatorMessage } from "./operator.js";
 import { formatAttachmentNote, stageAttachment, type StagedAttachment } from "./attachments.js";
 import { captureClipboardImage } from "./clipboard.js";
 import { parseStatusArgs, USAGE } from "./cli.js";
-import { loadFleetConfig } from "./fleet/spec.js";
+import { loadFleetConfig, writeFleetScaffold } from "./fleet/spec.js";
 import { renderSpawnPlan, spawnFleet, tmuxSessionExists, tmuxSessionName } from "./fleet/spawn.js";
 import { buildResetPlan, discoverFleetId, renderResetPlan, resetFleet } from "./fleet/reset.js";
 import { listPanesWithMarkers } from "./fleet/ownership.js";
@@ -775,6 +775,9 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         d(
           `  → tmux session "${sessionName}" · ${spec.windows.length} window(s): ${spec.windows.map((w) => w.name).join(", ")}`,
         ),
+        cfg.source === "default"
+          ? d("  customize: press w to write a .oxtail/fleet.json you can edit (window count · per-window model/effort/remote-control)")
+          : d(`  customize: edit ${cfg.path}`),
         "",
       ];
       if (collision) {
@@ -794,6 +797,21 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       spawnView = { lines, canSpawn: !collision, spec, sessionName };
       spawnOpen = true;
       paint();
+    }
+
+    // Scaffold the effective spec to .oxtail/fleet.json so the operator has a
+    // starting point to edit (the "easy config" entry — `w` in the SPAWN overlay).
+    // Refuses to clobber an existing config. Closes the overlay so they can go edit.
+    function doScaffoldFleetConfig(): void {
+      if (!spawnView) return;
+      const r = writeFleetScaffold(snapshot.project_root, spawnView.spec);
+      spawnOpen = false;
+      spawnView = null;
+      if (r.ok) {
+        setStatus(ok(`✓ wrote ${r.path} — edit it, then press S to spawn the customized fleet`, opts.color));
+      } else {
+        setStatus(warn(`scaffold: ${r.reason}`, opts.color));
+      }
     }
 
     // Execute the previewed SPAWN for real (non-dry-run). Doubly guarded: the overlay
@@ -849,8 +867,8 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       const prompt = spawnBusy
         ? d("  working… (Ctrl-C aborts the cockpit)")
         : spawnView.canSpawn
-          ? warn("  press y to SPAWN · any other key to cancel", opts.color)
-          : warn("  press any key to close", opts.color);
+          ? warn("  press y to SPAWN · w to save this as .oxtail/fleet.json · any other key to cancel", opts.color)
+          : warn("  w to save this as .oxtail/fleet.json · any other key to close", opts.color);
       const budget = Math.max(1, rows - 1); // reserve the prompt row
       let shown = spawnView.lines;
       if (shown.length > budget) {
@@ -1215,9 +1233,10 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       // through to a harmless no-op in every mode.
       if (spawnOpen) {
         // SPAWN confirm gate: while a spawn is in flight, swallow keys (Ctrl-C above
-        // still aborts the cockpit); `y` (only when not collision-blocked) executes;
-        // ANY other key closes the overlay without spawning.
+        // still aborts the cockpit); `w` scaffolds the config (overlay stays open);
+        // `y` (only when not collision-blocked) executes; ANY other key cancels.
         if (spawnBusy) return;
+        if (s === "w") return doScaffoldFleetConfig();
         if (spawnView?.canSpawn && s === "y") return doSpawn();
         spawnOpen = false;
         spawnView = null;

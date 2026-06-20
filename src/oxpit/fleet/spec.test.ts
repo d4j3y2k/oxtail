@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { defaultFleet, loadFleetConfig } from "./spec.js";
+import { defaultFleet, loadFleetConfig, writeFleetScaffold } from "./spec.js";
 
 function withDirs<T>(fn: (repoRoot: string, home: string) => T): T {
   const repoRoot = mkdtempSync(join(tmpdir(), "oxtail-spec-repo-"));
@@ -245,4 +245,28 @@ test("defaultFleet enables remoteControl on the claude windows, not codex", () =
   assert.equal(byName.main.remoteControl, true, "main (claude) has rc on — part of the ceremony");
   assert.equal(byName.max.remoteControl, true, "max (claude) has rc on");
   assert.notEqual(byName.codex.remoteControl, true, "codex has no /rc");
+});
+
+// ── writeFleetScaffold (the "easy config" entry — `w` in the SPAWN overlay) ──────
+
+test("writeFleetScaffold writes a loadable .oxtail/fleet.json, then refuses to clobber", () => {
+  withDirs((repoRoot, home) => {
+    const spec = defaultFleet(repoRoot);
+    const w = writeFleetScaffold(repoRoot, spec);
+    assert.equal(w.ok, true, "scaffolds when absent");
+
+    // It round-trips: the loader reads it back as a project config (JSONC header ok).
+    const loaded = loadFleetConfig(repoRoot, { home });
+    assert.equal(loaded.ok, true);
+    if (loaded.ok) {
+      assert.equal(loaded.source, "project");
+      assert.deepEqual(loaded.spec.windows.map((win) => win.name), ["main", "max", "codex"]);
+      assert.equal(loaded.spec.windows[0].remoteControl, true, "scaffold preserves rc");
+    }
+
+    // Second call refuses to overwrite an existing config.
+    const again = writeFleetScaffold(repoRoot, spec);
+    assert.equal(again.ok, false, "must not clobber an existing config");
+    if (!again.ok) assert.match(again.reason, /already exists/);
+  });
 });
