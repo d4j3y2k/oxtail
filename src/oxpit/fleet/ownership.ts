@@ -133,7 +133,7 @@ export function readPaneMarker(pane: string, run: TmuxRun = tmux): string | null
 
 // Remove the tmux WINDOW containing `pane` — the cockpit's per-window kill: that one
 // agent stops and its window/tab disappears, the rest of the fleet keeps running.
-// Four guards, all fail-CLOSED (refuse + reason, never a destructive surprise):
+// Three guards, all fail-CLOSED (refuse + reason, never a destructive surprise):
 //   1. EXPECTED IDENTITY — the pane must STILL carry `expectedFleetId` (the fleet the
 //      caller intends to kill in). A bare "is it managed?" check is NOT enough (codex
 //      HIGH): between a SYNC plan and the kill, a non-lock-respecting actor could
