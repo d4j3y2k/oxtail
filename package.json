@@ -14,9 +14,13 @@
     "scripts",
     "assets",
     "integrations",
+    "docs/tools.md",
+    "docs/protocol.md",
     ".claude/commands/oxtail-join.md",
     "AGENTS.md",
     "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
     "LICENSE"
   ],
   "scripts": {
