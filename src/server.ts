@@ -52,6 +52,7 @@ import {
   resolveTarget,
 } from "./resolve-target.js";
 import {
+  type DeliveryOutlook,
   replyAutoWakeTriggered,
   resolveSendWake,
   wakeForSend,
@@ -1127,6 +1128,20 @@ function routeFor(peer: RegistryEntry): DeliveryRoute {
   };
 }
 
+// Prose hint for a send-time delivery outlook (the machine value is computed in
+// resolveSendWake; this composes the English HERE so wake.ts stays prose-free).
+// Framing follows the round-1 design review: legitimize "leave it" FIRST —
+// passive delivery is the correct default for non-urgent traffic, not an error —
+// then fork by INTENT, with wake:"auto" LAST so the hint never trains a reflexive
+// "always wake." The motivating incident wanted a durable/blocking handle
+// (ask_peer / action_required), not a bare nudge; the ordering encodes that.
+function deliveryOutlookHint(outlook: DeliveryOutlook): string {
+  if (outlook === "unknown_liveness") {
+    return 'Can\'t confirm this peer\'s liveness (no activity marker — a Codex or hookless-Claude peer); it reads this at its next turn, not now. If it must ACT on this, prefer ask_peer (you need an answer this turn) or action_required:true (a durable task you track via my_open_work) — neither depends on a fresh-idle marker — over wake:"auto".';
+  }
+  return 'Peer isn\'t actively reading right now — it reads this at its next turn. If this is context/FYI, that\'s fine, leave it. If it must ACT: ask_peer (you need an answer this turn / will block on it), action_required:true (a durable task you track via my_open_work), or wake:"auto" (just nudge it to read now).';
+}
+
 // Our own inbox route, for self re-delivery (ask_peer abort recovery). We are
 // by definition session_keyed-capable when claimed.
 function selfRoute(): DeliveryRoute {
@@ -1156,7 +1171,7 @@ server.registerTool(
   {
     description: [
       "Fire-and-forget message to a peer in the same project root. Target: a tmux session name OR a client_session_id (UUID). Async via the peer's mailbox — delivered mid-turn (PreToolUse hook) or next-turn (read_my_messages); cross-project targets are rejected.",
-      "A plain message does NOT wake an idle peer. Pass wake:\"auto\" to nudge one via per-client send-keys, state-gated (skipped if the peer is mid-turn). EXCEPTION (wake-on-reply): when you set reply_to, this auto-wakes the requester by default so your answer doesn't strand them idle — pass wake:\"off\" to suppress. The reply-default wake is strictly gated: it fires only for a FRESHLY-IDLE requester (one whose Claude Code hooks maintain a fresh idle marker), with a per-target rate limit and a one-wake dedupe; env kill-switch OXTAIL_AUTOWAKE=off. A requester with no idle marker (Codex, or Claude without the hooks) returns skipped_no_fresh_idle and is NOT auto-woken — use explicit wake:\"auto\" for those. Response carries wake_status (\"fired\" | \"skipped_busy\" | \"skipped_debounced\" | \"skipped_no_fresh_idle\" | \"skipped_rate_limited\" | \"skipped_deduped\" | \"skipped_store_error\" | \"skipped_no_target\" | \"disabled\") and, on the reply path, wake_reason:\"reply_to_default\" — or wake_reason:\"late_reply_to_pending\" when this reply answers an ask_peer that had timed out (durably pulls the requester back regardless of the fresh-idle window; \"late_reply_to_pending_suppressed\" if you passed wake:\"off\").",
+      "A plain message does NOT wake an idle peer. Pass wake:\"auto\" to nudge one via per-client send-keys, state-gated (skipped if the peer is mid-turn). EXCEPTION (wake-on-reply): when you set reply_to, this auto-wakes the requester by default so your answer doesn't strand them idle — pass wake:\"off\" to suppress. The reply-default wake is strictly gated: it fires only for a FRESHLY-IDLE requester (one whose Claude Code hooks maintain a fresh idle marker), with a per-target rate limit and a one-wake dedupe; env kill-switch OXTAIL_AUTOWAKE=off. A requester with no idle marker (Codex, or Claude without the hooks) returns skipped_no_fresh_idle and is NOT auto-woken — use explicit wake:\"auto\" for those. Response carries wake_status (\"fired\" | \"skipped_busy\" | \"skipped_debounced\" | \"skipped_no_fresh_idle\" | \"skipped_rate_limited\" | \"skipped_deduped\" | \"skipped_store_error\" | \"skipped_no_target\" | \"disabled\") and, on the reply path, wake_reason:\"reply_to_default\" — or wake_reason:\"late_reply_to_pending\" when this reply answers an ask_peer that had timed out (durably pulls the requester back regardless of the fresh-idle window; \"late_reply_to_pending_suppressed\" if you passed wake:\"off\"). DELIVERY OUTLOOK: a plain send (wake unset, no reply_to) to a CLAIMED peer that won't read it this turn also returns delivery_outlook (\"stranded_until_read\" = idle/stale-busy, read only at its next turn or a wake; \"unknown_liveness\" = Codex/hookless, no activity marker) plus a hint to the right verb (ask_peer / action_required / wake); omitted when the peer is mid-turn (its hooks deliver) or you woke it.",
       "Body is verbatim — wrap in <system-reminder>...</system-reminder> yourself if you want that framing. When replying to ask_peer, include reply_to: request_id from the inbound message. For a blocking send-and-wait, use ask_peer instead.",
     ].join(" "),
     inputSchema: {
@@ -1235,7 +1250,7 @@ server.registerTool(
       source_message_id,
       action_required: obligationDurable,
     });
-    const { wake_status, wake_reason } = await resolveSendWake(peer, effectiveWake, reply_to);
+    const { wake_status, wake_reason, delivery_outlook } = await resolveSendWake(peer, effectiveWake, reply_to);
     if (wake_status) {
       trace("wake_outcome", {
         via: wake_reason === "reply_to_default" ? "reply_default" : "send_message",
@@ -1263,6 +1278,7 @@ server.registerTool(
       ...(note ? { note } : {}),
       ...(wake_status ? { wake_status } : {}),
       ...(wake_reason ? { wake_reason } : {}),
+      ...(delivery_outlook ? { delivery_outlook, hint: deliveryOutlookHint(delivery_outlook) } : {}),
     });
   },
 );
@@ -1348,7 +1364,7 @@ server.registerTool(
   {
     description: [
       "Reply to a specific inbound peer message by its message_id — the atomic, correlation-safe alternative to hand-wiring send_message's target + reply_to. The server looks the message up in this session's durable received-ledger, so you pass only the message_id the PreToolUse hook or read_my_messages already showed you; it derives the reply target (the original sender), carries reply_to=request_id when the inbound was an ask_peer (keeping the exchange correlated), and sets source_message_id for provenance. Replying to a plain send_message works too — it just omits reply_to. Ownership is structural: you can only reply to a message delivered to you. NOTE: this is for ORDINARY replies. If the inbound was an action_required delegation (it carries action_required / appears in my_open_work), close it with complete_work/block_work instead — that is the correlated reply path for delegated work and it clears the obligation; reply_to_message does not.",
-      "Delivery + wake match send_message exactly, including the wake-on-reply default: when the inbound carried a request_id and you leave wake unset, a freshly-idle requester is auto-woken; pass wake:\"auto\" to nudge any idle peer, or wake:\"off\" to suppress. If the inbound ask_peer had since timed out, this reply durably pulls the requester back (wake_reason late_reply_to_pending) regardless of the fresh-idle window. Fail-closed: an unknown or aged-out message_id returns error message-not-found instead of guessing a target.",
+      "Delivery + wake match send_message exactly, including the wake-on-reply default: when the inbound carried a request_id and you leave wake unset, a freshly-idle requester is auto-woken; pass wake:\"auto\" to nudge any idle peer, or wake:\"off\" to suppress. If the inbound ask_peer had since timed out, this reply durably pulls the requester back (wake_reason late_reply_to_pending) regardless of the fresh-idle window. Fail-closed: an unknown or aged-out message_id returns error message-not-found instead of guessing a target. Replying to a PLAIN (non-ask) inbound message to an idle peer also returns a delivery_outlook + hint, exactly like send_message (a reply to an ask_peer carries its own wake_status instead).",
     ].join(" "),
     inputSchema: {
       message_id: z
@@ -1424,7 +1440,7 @@ server.registerTool(
       reply_to: replyTo,
       source_message_id: message_id,
     });
-    const { wake_status, wake_reason } = await resolveSendWake(peer, wake, replyTo);
+    const { wake_status, wake_reason, delivery_outlook } = await resolveSendWake(peer, wake, replyTo);
     if (wake_status) {
       trace("wake_outcome", {
         via: wake_reason === "reply_to_default" ? "reply_default" : "reply_to_message",
@@ -1443,6 +1459,7 @@ server.registerTool(
       correlation: replyTo ? "correlated" : "uncorrelated",
       ...(wake_status ? { wake_status } : {}),
       ...(wake_reason ? { wake_reason } : {}),
+      ...(delivery_outlook ? { delivery_outlook, hint: deliveryOutlookHint(delivery_outlook) } : {}),
     });
   },
 );

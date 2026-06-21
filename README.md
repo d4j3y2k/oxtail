@@ -76,7 +76,7 @@ command = "npx"
 args = ["-y", "oxtail@latest"]
 ```
 
-> Pin a version (`oxtail@0.23.1`) for daily configs; `@latest` is fine for trying it
+> Pin a version (`oxtail@0.24.0`) for daily configs; `@latest` is fine for trying it
 > out. On Windows, wrap the command as `cmd /c npx -y oxtail@latest`.
 
 **2. (Claude Code) Install the hooks** so agents receive messages autonomously and
