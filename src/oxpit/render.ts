@@ -619,18 +619,22 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
   // A live ⛔ condition (deadlock or orphaned wait) tints the title red — a
   // peripheral cue that registers before the operator reads the attention line.
   const alarm = s.cycles.some((c) => c.all_live) || s.agents.some((a) => a.waiting?.orphaned);
+  const background = s.background ?? [];
   const head =
     paint("oxpit", C.bold, alarm ? C.red : C.cyan) +
     paint(`  ${projName}`, C.dim) +
     `  ${s.agents.length} agent${s.agents.length === 1 ? "" : "s"}` +
-    paint(` (${active} active)`, C.green);
+    paint(` (${active} active)`, C.green) +
+    (background.length > 0 ? paint(`  +${background.length} bg`, C.dim) : "");
   lines.push(head);
 
   // Top attention line — only present when the fleet has trouble worth a glance.
   const attn = attentionLine(s, paint);
   if (attn) lines.push(attn);
 
-  const { byShortId: labels } = computeAgentLabels(s.agents);
+  // Labels over foreground + background so a wait-graph target or comms peer that got
+  // collapsed into the background still resolves to its window name, not a bare hex id.
+  const { byShortId: labels } = computeAgentLabels([...s.agents, ...background]);
   const rowLabel = (a: FleetAgent): string => labels.get(a.short_id) ?? a.short_id;
   const paneAct = (a: FleetAgent): PaneActivity | undefined => opts.paneActivity?.get(agentKey(a));
   // Resolve the tool sub-state: when the overlay HAS the key it wins (an explicit
@@ -674,6 +678,19 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
       }
       if (end < total) lines.push(paint(`  ⋯ ${total - end} more below`, C.dim));
     }
+  }
+
+  // Collapsed background processes — detached MCP children / `codex exec` subprocesses
+  // with no tmux pane. One dim footer line instead of N un-jumpable rows; the count is
+  // already echoed in the header (`+N bg`).
+  if (background.length > 0) {
+    const n = background.length;
+    lines.push(
+      paint(
+        `  + ${n} background ${n === 1 ? "process" : "processes"} (detached — no tmux pane, not jumpable)`,
+        C.dim,
+      ),
+    );
   }
 
   lines.push(...renderWaitGraph(s, paint, labels, opts.maxWaitRows));

@@ -289,6 +289,28 @@ export function currentPaneForServerPid(serverPid: number): string | null {
   return findTmuxPaneByAncestry(serverPid, listTmuxPanePids(), listAllPpids());
 }
 
+// Resolve, in ONE batched pass, which of the given server pids currently OWN a live
+// tmux pane — i.e. which agents `jump`/nudge/wake can actually reach. Uses the SAME
+// process-subtree ancestry signal as currentPaneForServerPid / chooseVerifiedWakePane,
+// but computes the pane-pid + ppid maps ONCE and reuses them for every pid, so it
+// stays a single `tmux list-panes` + single `ps` regardless of fleet size (calling
+// chooseVerifiedWakePane per agent re-execs BOTH on every call). Empty set when tmux
+// is absent / has no panes. The cockpit uses this to separate real, navigable fleet
+// windows from DETACHED background processes — registered MCP children and `codex
+// exec` subprocesses that own a registry entry but live in no tmux pane, so a jump to
+// them can only ever fail "couldn't verify a live pane".
+export function resolveJumpablePids(serverPids: Iterable<number>): Set<number> {
+  const panePids = listTmuxPanePids();
+  const out = new Set<number>();
+  if (panePids.size === 0) return out; // tmux absent / no panes — nothing is jumpable
+  const ppids = listAllPpids();
+  for (const pid of serverPids) {
+    const pane = findTmuxPaneByAncestry(pid, panePids, ppids);
+    if (pane && isValidTmuxPane(pane)) out.add(pid);
+  }
+  return out;
+}
+
 // The OS start-time signature (lstart) of a process, or "" if it can't be read
 // (dead pid, or ps unavailable). Same provenance signal claims.ts uses on
 // ancestor pids: an OS-recycled pid yields a DIFFERENT start time, so comparing

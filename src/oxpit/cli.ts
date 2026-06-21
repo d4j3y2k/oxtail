@@ -177,9 +177,12 @@ export function runStatus(
   }
   out(renderSnapshot(snap, { color, width, paneActivity }));
   if (a.log) {
-    const { bySession } = computeAgentLabels(snap.agents);
+    // Background (detached) peers can still have sent/received fleet mail — include
+    // them so the comms log neither drops those messages nor shows a bare hex sender.
+    const all = [...snap.agents, ...(snap.background ?? [])];
+    const { bySession } = computeAgentLabels(all);
     out("");
-    out(renderCommsLog(buildCommsLog(snap.agents, { limit }), bySession, { color, width }));
+    out(renderCommsLog(buildCommsLog(all, { limit }), bySession, { color, width }));
   }
   return a.check ? checkCode() : 0;
 }

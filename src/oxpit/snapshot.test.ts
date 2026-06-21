@@ -652,3 +652,144 @@ test("buildSnapshot: empty registry ⇒ no agents, no throw", () => {
     assert.equal(snap.cycles.length, 0);
   });
 });
+
+// ── background-process split: detached MCP children / `codex exec` subprocesses ──
+// Reproduces the oxpit screenshot: 3 real tmux-window agents (main/max/codex) plus
+// detached codex processes that own no tmux pane — the 019… (claimed, has transcript)
+// and pid: (unclaimed, no transcript) rows whose jump fails "couldn't verify a live
+// pane". Those must collapse into `background`: off the navigable list AND off the
+// "awaiting you" worklist, while real windows and dead agents stay put.
+const FG = { main: 5001, max: 5002, codex: 5003 };
+
+function phantomFleet(home: string): {
+  entries: RegistryEntry[];
+  deps: Partial<Parameters<typeof buildSnapshot>[0]>;
+} {
+  const txMain = writeTranscript(home, "ph-main.jsonl", 5); // active
+  const txMax = writeTranscript(home, "ph-max.jsonl", 900); // idle 15m
+  const txCodex = writeTranscript(home, "ph-codex.jsonl", 480); // idle 8m
+  const txDetached = writeTranscript(home, "ph-019.jsonl", 720); // detached, idle 12m
+
+  const main = makeEntry({
+    type: "claude-code",
+    server_pid: FG.main,
+    tmux_pane: "%1",
+    client: { transcript_path: txMain } as never,
+  });
+  const max = makeEntry({
+    type: "claude-code",
+    server_pid: FG.max,
+    tmux_pane: "%2",
+    client: { transcript_path: txMax } as never,
+  });
+  const codex = makeEntry({
+    type: "codex",
+    server_pid: FG.codex,
+    tmux_pane: "%3",
+    client: { transcript_path: txCodex } as never,
+  });
+  // Detached codex WITH a claimed session + transcript → short_id "019eebb0". This is
+  // THE false positive: idle-at-prompt with a transcript, so awaiting_human is true —
+  // it would wrongly read "awaiting you" if left in the foreground.
+  const bgClaimed = makeEntry({
+    type: "codex",
+    server_pid: 5101,
+    tmux_pane: null,
+    client: {
+      session_id: "019eebb0-0000-0000-0000-000000000000",
+      transcript_path: txDetached,
+    } as never,
+  });
+  // Detached codex children, UNCLAIMED (no session) + no transcript → short_id "pid:<n>".
+  const bgPid1 = makeEntry({ type: "codex", server_pid: 5102, tmux_pane: null });
+  bgPid1.client.session_id = null;
+  const bgPid2 = makeEntry({ type: "codex", server_pid: 5103, tmux_pane: null });
+  bgPid2.client.session_id = null;
+
+  return {
+    entries: [main, max, codex, bgClaimed, bgPid1, bgPid2],
+    deps: {
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      isAlive: () => true, // every process alive — the phantoms are LIVE, just detached
+      resolveJumpablePids: () => new Set([FG.main, FG.max, FG.codex]),
+      resolvePaneInfo: () =>
+        new Map([
+          ["%1", { name: "main", activity_at: NOW_S - 5, window_index: 0 }],
+          ["%2", { name: "max", activity_at: NOW_S - 900, window_index: 1 }],
+          ["%3", { name: "codex", activity_at: NOW_S - 480, window_index: 2 }],
+        ]),
+    },
+  };
+}
+
+test("buildSnapshot: detached pane-less processes collapse into background (screenshot repro)", () => {
+  withHome((home) => {
+    const { entries, deps } = phantomFleet(home);
+    const snap = buildSnapshot({ readEntries: () => entries, ...deps });
+
+    // Foreground = only the 3 real tmux windows, in window order.
+    assert.equal(snap.agents.length, 3);
+    assert.deepEqual(
+      snap.agents.map((a) => a.window_name),
+      ["main", "max", "codex"],
+    );
+
+    // The detached processes are split out, not listed as navigable agents.
+    const bg = snap.background ?? [];
+    assert.equal(bg.length, 3);
+    const bgIds = bg.map((a) => a.short_id).sort();
+    assert.deepEqual(bgIds, ["019eebb0", "pid:5102", "pid:5103"]);
+    assert.ok(bg.every((a) => a.liveness !== "dead"), "background processes are LIVE, just detached");
+
+    // The bug: the claimed detached codex IS idle-at-prompt (awaiting_human), so it
+    // WOULD have been a false "awaiting you" — but it's now in background.
+    const claimed = bg.find((a) => a.short_id === "019eebb0")!;
+    assert.equal(claimed.awaiting_human, true, "would have falsely read 'awaiting you' in the foreground");
+
+    // Worklist now names only the REAL idle agents, never the phantom.
+    const awaiting = snap.agents.filter((a) => a.awaiting_human).map((a) => a.window_name);
+    assert.deepEqual(awaiting, ["max", "codex"]);
+  });
+});
+
+test("buildSnapshot: no tmux pane info ⇒ no background split (can't tell detached from not-in-tmux)", () => {
+  withHome((home) => {
+    const { entries, deps } = phantomFleet(home);
+    const snap = buildSnapshot({ readEntries: () => entries, ...deps, resolvePaneInfo: () => new Map() });
+    assert.equal(snap.agents.length, 6, "tmux absent ⇒ keep everyone navigable");
+    assert.equal((snap.background ?? []).length, 0);
+  });
+});
+
+test("buildSnapshot: nothing jumpable ⇒ never collapse the WHOLE fleet (no empty table)", () => {
+  withHome((home) => {
+    const { entries, deps } = phantomFleet(home);
+    const snap = buildSnapshot({ readEntries: () => entries, ...deps, resolveJumpablePids: () => new Set() });
+    assert.equal(snap.agents.length, 6, "empty jumpable set ⇒ likely a misfire ⇒ keep all");
+    assert.equal((snap.background ?? []).length, 0);
+  });
+});
+
+test("buildSnapshot: a DEAD un-jumpable agent stays foreground (⚫dead + orphaned-wait visibility)", () => {
+  withHome((home) => {
+    const { entries, deps } = phantomFleet(home);
+    const deadPid = 5101; // the claimed detached codex is now DEAD, not alive
+    const snap = buildSnapshot({ readEntries: () => entries, ...deps, isAlive: (pid) => pid !== deadPid });
+    const dead = snap.agents.find((a) => a.short_id === "019eebb0");
+    assert.ok(dead, "dead detached agent stays in the navigable list, not collapsed");
+    assert.equal(dead!.liveness, "dead");
+    assert.equal((snap.background ?? []).length, 2, "the two LIVE unclaimed children still collapse");
+  });
+});
+
+test("buildSnapshot: classifyBackground:false keeps every entry in agents (escape hatch)", () => {
+  withHome((home) => {
+    const { entries, deps } = phantomFleet(home);
+    const snap = buildSnapshot({ readEntries: () => entries, ...deps, classifyBackground: false });
+    assert.equal(snap.agents.length, 6);
+    assert.equal((snap.background ?? []).length, 0);
+  });
+});
