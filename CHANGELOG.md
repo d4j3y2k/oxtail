@@ -8,6 +8,45 @@ behavioral changes). Dates are release dates of the published npm tag.
 The hook protocol has its own version (`HOOK_MARKER_VERSION`); when it bumps,
 re-run `npx oxtail install-hook`. The current hook version is noted per release.
 
+## [0.24.0] — 2026-06-21
+
+**Send-time delivery outlook — the sender learns when a plain send will strand.**
+Closes the participant-error stall gap: a plain `send_message` to an *idle* peer is
+delivered yet never read (no hook fires, no wake), `ok: true` comes back, and the
+work silently strands — the exact human-relay this project exists to eliminate. The
+machinery never malfunctioned; the sender just used the wrong verb for the peer's
+state, and the system was silent about it. Now it speaks, in-context, at send time:
+
+- **`delivery_outlook` on `send_message` / `reply_to_message`.** A plain send (no
+  `wake`, no `reply_to`) to a **claimed** peer that won't read it this turn returns
+  `delivery_outlook` plus a `hint`:
+  - `"stranded_until_read"` — the peer is idle (or stale-/skewed-busy); it reads this
+    only at its next turn or a wake.
+  - `"unknown_liveness"` — the peer has no activity marker (Codex / hookless Claude);
+    liveness can't be confirmed.
+- **Additive — the advisory is read-only.** `delivery_outlook` adds a response field
+  and changes no delivery or wake decision (the one disclosed wake change this release
+  is the clock-skew fix below, in the safe direction).
+  The field is **omitted on every path that already speaks**: a mid-turn (fresh-busy)
+  peer whose hooks will deliver, anything you woke (`wake: "auto"`), a reply that
+  carries its own `wake_status`, a `wake: "off"` deliberate fire-and-forget, and an
+  unclaimed target (which already gets `bootstrap` + `note`). No parallel vocabulary
+  re-encoding `wake_status` — the advisory fills only the genuinely-silent seam.
+- **Intent-keyed hint, `wake: "auto"` last.** The hint legitimizes "leave it" first
+  (passive delivery is the correct default for FYI traffic), then forks by intent —
+  `ask_peer` (need an answer this turn), `action_required: true` (durable task tracked
+  via `my_open_work`), and only then `wake: "auto"` (a bare nudge) — so it steers to
+  the *right* verb instead of training a reflexive "always wake."
+- **Clock-skew fix (found in review).** The shared `isFreshBusy` predicate now requires
+  a non-negative marker age, so a future-mtime ("busy") marker is no longer mistaken
+  for a live mid-turn peer: the wake path wakes it (rather than `skipped_busy`) and the
+  outlook flags it as a possible strand — the safe direction on both.
+
+Designed against the `participant-error-feedback` spec with a two-lens fleet review
+(design/structure + accuracy/edge-cases). No hook-protocol change (`HOOK_MARKER_VERSION`
+unchanged). Follow-on (separate slice): an `oxpit --check` trouble view for "unread
+no-wake mail on a live-but-idle owner older than N."
+
 ## [0.23.1] — 2026-06-21
 
 - **Docs: world-class README restructure.** The README is now a lean, visual-first

@@ -129,8 +129,16 @@ exchange.
   receiver gains an OPEN OBLIGATION it discovers via `my_open_work` and closes via
   `complete_work` / `block_work`, surviving a missed wake — and `wake` then defaults
   to `auto`.
+- A plain send (no `wake`, no `reply_to`) to a **claimed** peer that won't read it
+  this turn returns a `delivery_outlook` + `hint` so a silent strand is visible at
+  send time: `"stranded_until_read"` (idle/stale-busy — read at its next turn or a
+  wake) or `"unknown_liveness"` (Codex/hookless, no activity marker). It is **omitted**
+  wherever a `wake_status` already speaks (a mid-turn peer whose hooks deliver, one you
+  woke with `wake: "auto"`, a reply) or you chose fire-and-forget (`wake: "off"`) — an
+  absent `delivery_outlook` means *that path reports via `wake_status`, or you opted
+  out*, **not** that delivery is guaranteed.
 
-Returns `{ ok, message_id, target_session_id, target_server_pid, wake_status, ... }`.
+Returns `{ ok, message_id, target_session_id, target_server_pid, wake_status, delivery_outlook?, ... }`.
 Sending to a peer with the same tmux session name as another live peer returns
 `ambiguous-target` with the candidate `client_session_id`s.
 

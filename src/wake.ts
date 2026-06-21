@@ -12,6 +12,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import {
   autowakeKillSwitchOff,
+  type ActivitySnapshot,
   claimWake,
   decideReplyAutoWake,
   defaultAutowakeDir,
@@ -46,6 +47,17 @@ export type WakeStatus =
   | "skipped_store_error"    // reply-default wake: dedupe/rate store unusable — best-effort degrade, message still enqueued — Slice 1
   | "skipped_debounced"      // a wake fired for this peer within the debounce window — coalesced (issue #5)
   | "disabled";         // OXTAIL_ASK_PEER_WAKE_STRATEGY=off, or reply-default wake with OXTAIL_AUTOWAKE=off
+
+// Send-time delivery-outlook advisory (participant-error feedback). A SEND can
+// be delivered yet never read, because a plain fire-and-forget message does not
+// wake an idle peer — the silent stall this advisory exists to flag to the
+// SENDER, in-context, at send time. Only the genuinely-silent send path carries
+// it (see classifyDeliveryOutlook); every path that already returns a
+// wake_status stays silent rather than re-encode that signal into a parallel
+// vocabulary.
+export type DeliveryOutlook =
+  | "stranded_until_read"  // claimed idle/stale-busy peer: read only at its next turn or a wake
+  | "unknown_liveness";    // claimed peer with no activity marker (Codex / hookless Claude)
 
 // OXTAIL_ASK_PEER_WAKE_STRATEGY = "auto" | "legacy" | "off"
 //   auto    — per-client routing: Codex gets paste-burst-aware wake (500ms gap
@@ -241,11 +253,51 @@ function readActivity(sessionId: string | null): { status: string; ageMs: number
   }
 }
 
+// A "fresh busy" marker = the peer is mid-turn RIGHT NOW: status "busy" with an
+// age in [0, TTL). A NEGATIVE age (future mtime — clock skew) is NOT trusted as
+// fresh (mirrors autowake's isFreshIdle), so a skewed busy marker falls through
+// to a wake instead of silently suppressing one. ONE predicate, TWO consumers
+// (the wake gate below + the delivery-outlook advisory) so they can never
+// disagree about whether the peer is mid-turn.
+function isFreshBusy(act: ActivitySnapshot): boolean {
+  return !!act && act.status === "busy" && act.ageMs >= 0 && act.ageMs < ACTIVITY_BUSY_TTL_MS;
+}
+
 // Skip the wake only when the peer is FRESHLY busy. Idle, unknown (no activity
-// file — hooks not installed), or stale-busy (a turn that outran the TTL, or a
-// peer that exited without a clean Stop) all fall through to a wake.
-function shouldWakeForSend(act: { status: string; ageMs: number } | null): boolean {
-  return !(act && act.status === "busy" && act.ageMs < ACTIVITY_BUSY_TTL_MS);
+// file — hooks not installed), stale-busy (a turn that outran the TTL, or a
+// peer that exited without a clean Stop), or skewed-busy (future mtime) all fall
+// through to a wake.
+function shouldWakeForSend(act: ActivitySnapshot): boolean {
+  return !isFreshBusy(act);
+}
+
+// The delivery-outlook advisory. PURE (no tmux/FS/env): given the target
+// identity, an activity snapshot, and the requested wake/reply mode, decide
+// whether a SEND will silently strand on the peer — and ONLY for the truly-
+// silent path. Every path that already carries a wake_status (wake:"auto", a
+// reply-default wake, the durable pending-ask pull-back) returns null here:
+// re-encoding wake_status into a parallel vocabulary is exactly what we do NOT
+// do (per the round-1 design review). We fill only the hole where
+// resolveSendWake would otherwise return {} with nothing to say:
+//
+//   wake:"off"          → caller chose fire-and-forget; nagging is alarm fatigue → null
+//   replyTo set         → a reply carries its own wake_status → null
+//   unclaimed peer      → handler already emits bootstrap+note → null
+//   claimed, no marker  → Codex / hookless Claude: liveness unknown → "unknown_liveness"
+//   claimed, fresh-busy → mid-turn; its hooks deliver this turn → null
+//   claimed, idle / stale- or skewed-busy → won't self-read until its next turn
+//                         or a wake → "stranded_until_read"
+export function classifyDeliveryOutlook(input: {
+  sessionId: string | null;
+  activity: ActivitySnapshot;
+  wake: "off" | "auto" | undefined;
+  replyTo: string | undefined;
+}): DeliveryOutlook | null {
+  if (input.wake !== undefined || input.replyTo) return null;
+  if (!input.sessionId) return null;
+  if (!input.activity) return "unknown_liveness";
+  if (isFreshBusy(input.activity)) return null;
+  return "stranded_until_read";
 }
 
 export async function wakeForSend(
@@ -344,7 +396,7 @@ export async function resolveSendWake(
   peer: RegistryEntry,
   wake: "off" | "auto" | undefined,
   replyTo: string | undefined,
-): Promise<{ wake_status?: WakeStatus; wake_reason?: string }> {
+): Promise<{ wake_status?: WakeStatus; wake_reason?: string; delivery_outlook?: DeliveryOutlook }> {
   if (replyTo) {
     const sid = peer.client.session_id ?? "";
     if (consumePendingAsk(defaultPendingAskDir(), sid, replyTo, Date.now())) {
@@ -371,6 +423,21 @@ export async function resolveSendWake(
   }
   if (wake === "auto") {
     return { wake_status: await wakeForSend(peer) };
+  }
+  // The silent seam: a plain send with wake unset and no reply correlation. This
+  // is the ONLY path that returns no wake_status, so it is the only one that can
+  // strand without the sender knowing — attach the delivery-outlook advisory.
+  // (A wake:"off" caller also lands here; classifyDeliveryOutlook returns null
+  // for it — they chose fire-and-forget.) readActivity(null) is a no-op, so an
+  // unclaimed target costs no FS read; a claimed default-send costs one stat.
+  if (wake === undefined && !replyTo) {
+    const delivery_outlook = classifyDeliveryOutlook({
+      sessionId: peer.client.session_id ?? null,
+      activity: readActivity(peer.client.session_id),
+      wake,
+      replyTo,
+    });
+    if (delivery_outlook) return { delivery_outlook };
   }
   return {};
 }
