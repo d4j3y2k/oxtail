@@ -247,7 +247,18 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       role: string;
       remoteControl: boolean;
     };
-    let fleetEdit: { fleetName: string; windows: EditWin[]; cursor: number; note: string } | null = null;
+    // `reset` present ⇒ the editor was opened from the RESET overlay (`R` → `e`): apply
+    // (`y`) recomputes the red teardown+relaunch plan with the EDITED spec instead of
+    // spawning/syncing, and esc returns to that plan. Absent ⇒ the `S` spawn/sync flow.
+    let fleetEdit:
+      | {
+          fleetName: string;
+          windows: EditWin[];
+          cursor: number;
+          note: string;
+          reset?: { sessionName: string; repoRoot: string };
+        }
+      | null = null;
     // Active when typing into a text field — only NAMES are free text (window name /
     // fleet name); everything else is a pick-from-list menu (you shouldn't have to
     // know an exact model id, David).
@@ -364,7 +375,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "  w             open the selected agent's thread in the panel (per-agent)",
         "                in the panel: ↑↓ move the › cursor (or scroll an expanded msg) · w expand · j/k agents · f filter · ⏎ jump",
         "  S             configure a fleet — grid editor (n/m/f/t/r edit a window · a/d add/delete · w save · y apply: SPAWN if new, SYNC if the session exists)",
-        "  R             RESET the selected agent's fleet — teardown + relaunch (red plan; R again to confirm, NOT y)",
+        "  R             RESET the selected agent's fleet — teardown + relaunch (red plan; R again to confirm, NOT y; e to reconfigure the relaunch first)",
         "  K             KILL the selected agent's window — removes that one window (K again to confirm; only oxpit-managed)",
         "  r             force refresh    ?  toggle help    ⌃C (Ctrl-C)  quit",
         "",
@@ -503,8 +514,11 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       const footerKeys = d(
         `  ↑↓ ${logExpanded ? "scroll" : "select"} · w ${logExpanded ? "collapse" : "expand"} · jk agents · f filter${logFilterSelf ? "*" : ""} · ⏎ jump · l global · Esc close`,
       );
-      const { bySession } = computeAgentLabels(snapshot.agents);
-      let comms: CommsMessage[] = buildCommsLog(snapshot.agents, { limit: LOG_FETCH });
+      // Include background (detached) peers so their fleet mail still shows with a
+      // resolved label rather than vanishing / rendering as a bare hex id.
+      const commsAgents = [...snapshot.agents, ...(snapshot.background ?? [])];
+      const { bySession } = computeAgentLabels(commsAgents);
+      let comms: CommsMessage[] = buildCommsLog(commsAgents, { limit: LOG_FETCH });
       let filterNote = "";
       if (logFilterSelf) {
         const sel = snapshot.agents[selectedIndex()];
@@ -960,7 +974,10 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         fleetEdit.note = `✗ ${v.error}`;
         return paint();
       }
-      const r = writeFleetScaffold(snapshot.project_root, v.spec, { overwrite: true });
+      // In reset-mode save to the SELECTED agent's project (could differ from the
+      // cockpit's in --all mode); the spawn flow saves to the cockpit's project.
+      const root = fleetEdit.reset?.repoRoot ?? snapshot.project_root;
+      const r = writeFleetScaffold(root, v.spec, { overwrite: true });
       fleetEdit.note = r.ok ? `✓ saved ${r.path}` : `✗ ${r.reason}`;
       paint();
     }
@@ -992,10 +1009,16 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (!fleetEdit) return "";
       const fe = fleetEdit;
       const b = (s: string) => (opts.color ? `\x1b[1m\x1b[36m${s}\x1b[0m` : s);
+      const red = (s: string) => (opts.color ? `\x1b[1m\x1b[31m${s}\x1b[0m` : s);
       const d = (s: string) => dim(s, opts.color);
       const sessionName = tmuxSessionName(fe.fleetName);
+      const header = fe.reset
+        ? red("RESET — reconfigure") +
+          d(`   fleet "${fe.fleetName}" → session "${sessionName}"  (y: preview the reset with these edits)`)
+        : b("FLEET — configure") +
+          d(`     fleet "${fe.fleetName}" → session "${sessionName}"  (y: spawn if new, sync if it exists)`);
       const lines: string[] = [
-        b("FLEET — configure") + d(`     fleet "${fe.fleetName}" → session "${sessionName}"  (y: spawn if new, sync if it exists)`),
+        header,
         d(`  ${fe.note}`),
         "",
         d("  " + "window".padEnd(14) + "agent".padEnd(8) + "model".padEnd(16) + "effort".padEnd(8) + "rc"),
@@ -1035,7 +1058,13 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       } else {
         lines.push(d("  ↑↓ select · a add window · d delete"));
         lines.push(d("  n name · m model · f effort · t type · r remote-control"));
-        lines.push(d("  F fleet-name · w save .oxtail/fleet.json · y APPLY (spawn new / sync existing) · esc cancel"));
+        lines.push(
+          d(
+            fe.reset
+              ? "  F fleet-name · w save .oxtail/fleet.json · y PREVIEW RESET (with these edits) · esc back to plan"
+              : "  F fleet-name · w save .oxtail/fleet.json · y APPLY (spawn new / sync existing) · esc cancel",
+          ),
+        );
       }
       return lines
         .slice(0, Math.max(1, rows))
@@ -1097,7 +1126,11 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       }
       const w = fe.windows[fe.cursor];
       if (s === "\x1b") {
+        // esc from a reset-seeded editor returns to the (unchanged) red plan, not the
+        // fleet — the operator is mid-reset, abandoning the edits, not the reset.
+        const backToReset = Boolean(fe.reset);
         fleetEdit = null;
+        if (backToReset) resetOpen = true;
         return paint();
       }
       if (s === "\x1b[A" || s === "k") {
@@ -1167,7 +1200,8 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         return paint();
       }
       if (s === "w") return doSaveFromEdit();
-      if (s === "y") return doSpawnFromEdit();
+      // Apply: in reset-mode → preview the reset with these edits; else spawn/sync.
+      if (s === "y") return fe.reset ? doResetFromEdit() : doSpawnFromEdit();
     }
 
     // Execute the previewed SPAWN for real (non-dry-run). Doubly guarded: the overlay
@@ -1381,6 +1415,40 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     // pane-ids / missing window-names. Mutates nothing — doReset is the gated
     // destructive execute, and it passes the captured set so the live run can only
     // touch what the operator SAW (confirm-fidelity).
+    // Build the RESET preview (red plan + survivors + confirmed targets) for a given
+    // spec against a live session. Pure-ish (reads tmux); shared by the initial `R`
+    // (on-disk spec) and the `R`→`e` editor apply (edited spec), so the red preview the
+    // operator confirms ALWAYS reflects the spec that will actually relaunch. Returns
+    // the resetView payload, or a reason string when discovery fails.
+    function resetViewFromSpec(
+      spec: FleetSpec,
+      sessionName: string,
+      repoRoot: string,
+    ): { ok: true; view: NonNullable<typeof resetView> } | { ok: false; reason: string } {
+      const disc = discoverFleetId(sessionName);
+      if (!disc.ok) return { ok: false, reason: disc.reason };
+      const fleetId = disc.fleetId;
+      const plan = buildResetPlan(spec, fleetId, sessionName);
+      const survivors = listPanesWithMarkers().filter((p) => p.session === sessionName && p.managedBy !== fleetId);
+      const red = (s: string) => (opts.color ? `\x1b[1m\x1b[31m${s}\x1b[0m` : s);
+      const lines: string[] = [
+        red("RESET — tear down + relaunch this fleet (DESTRUCTIVE)"),
+        ...renderResetPlan(spec, fleetId, sessionName, plan, survivors).split("\n").map((l) => "  " + l),
+      ];
+      return {
+        ok: true,
+        view: {
+          lines,
+          spec,
+          repoRoot,
+          sessionName,
+          fleetId,
+          confirmedTargets: plan.targets.map((t) => t.pane.pane),
+          confirmedMissing: plan.missing.map((w) => w.name),
+        },
+      };
+    }
+
     function openReset(): void {
       if (resetOpen || resetBusy || spawnOpen) return;
       const idx = selectedIndex();
@@ -1397,26 +1465,55 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (!cfg.ok) {
         return setStatus(warn(`reset: fleet config invalid (${cfg.source}) — ${cfg.error}`, opts.color));
       }
-      const spec = cfg.spec;
-      const disc = discoverFleetId(sessionName);
-      if (!disc.ok) return setStatus(warn(`reset: ${disc.reason}`, opts.color));
-      const fleetId = disc.fleetId;
-      const plan = buildResetPlan(spec, fleetId, sessionName);
-      const survivors = listPanesWithMarkers().filter((p) => p.session === sessionName && p.managedBy !== fleetId);
-      const red = (s: string) => (opts.color ? `\x1b[1m\x1b[31m${s}\x1b[0m` : s);
-      const lines: string[] = [
-        red("RESET — tear down + relaunch this fleet (DESTRUCTIVE)"),
-        ...renderResetPlan(spec, fleetId, sessionName, plan, survivors).split("\n").map((l) => "  " + l),
-      ];
-      resetView = {
-        lines,
-        spec,
-        repoRoot,
-        sessionName,
-        fleetId,
-        confirmedTargets: plan.targets.map((t) => t.pane.pane),
-        confirmedMissing: plan.missing.map((w) => w.name),
+      const built = resetViewFromSpec(cfg.spec, sessionName, repoRoot);
+      if (!built.ok) return setStatus(warn(`reset: ${built.reason}`, opts.color));
+      resetView = built.view;
+      resetOpen = true;
+      paint();
+    }
+
+    // `e` on the RESET overlay → open the SAME grid editor seeded from the reset's spec,
+    // so the operator can reconfigure what the fleet relaunches as (model/effort/type,
+    // add/remove windows) before the destroy. resetView is kept as the cancel fallback.
+    function openResetEditor(): void {
+      if (!resetView || resetBusy) return;
+      const { spec, sessionName, repoRoot } = resetView;
+      fleetEdit = {
+        fleetName: spec.name,
+        windows: spec.windows.map((w) => ({
+          name: w.name,
+          agent: w.agent,
+          model: w.model ?? "",
+          effort: w.effort ?? "",
+          role: w.role ?? "",
+          remoteControl: w.remoteControl ?? false,
+        })),
+        cursor: 0,
+        note: "RESET config — y previews the reset with these settings · w saves to .oxtail/fleet.json",
+        reset: { sessionName, repoRoot },
       };
+      resetOpen = false; // the editor takes the screen; resetView stays as the esc fallback
+      paint();
+    }
+
+    // `y` in the reset-seeded editor → recompute the red plan with the EDITED spec and
+    // return to the confirm overlay (the destructive trigger stays the deliberate 2nd R).
+    function doResetFromEdit(): void {
+      if (!fleetEdit?.reset) return;
+      const v = validateFleetSpec(specFromEdit(fleetEdit));
+      if (!v.ok) {
+        fleetEdit.note = `✗ cannot apply: ${v.error}`;
+        return paint();
+      }
+      const { sessionName, repoRoot } = fleetEdit.reset;
+      const built = resetViewFromSpec(v.spec, sessionName, repoRoot);
+      if (!built.ok) {
+        fleetEdit.note = `✗ ${built.reason}`;
+        return paint();
+      }
+      fleetEdit = null;
+      fleetEditInput = null;
+      resetView = built.view;
       resetOpen = true;
       paint();
     }
@@ -1479,7 +1576,8 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       const red = (s: string) => (opts.color ? `\x1b[1m\x1b[31m${s}\x1b[0m` : s);
       const prompt = resetBusy
         ? d("  working… (Ctrl-C aborts the cockpit)")
-        : red("  press R again to RESET (destroy + relaunch) · any other key cancels");
+        : red("  press R again to RESET (destroy + relaunch)") +
+          d(" · e edit config · any other key cancels");
       const wrapW = Math.max(8, width);
       const wrapped = resetView.lines.flatMap((l) => {
         if (l.includes("\x1b") || l.length <= wrapW) return [l];
@@ -1759,6 +1857,9 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         // other key closes the overlay.
         if (resetBusy) return;
         if (s === "R") return doReset();
+        // `e` → reconfigure the post-reset fleet in the grid editor, then come back to
+        // the red plan recomputed with those edits (the 2nd-R confirm is unchanged).
+        if (s === "e") return openResetEditor();
         resetOpen = false;
         resetView = null;
         return paint();
