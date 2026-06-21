@@ -8,6 +8,14 @@ behavioral changes). Dates are release dates of the published npm tag.
 The hook protocol has its own version (`HOOK_MARKER_VERSION`); when it bumps,
 re-run `npx oxtail install-hook`. The current hook version is noted per release.
 
+## [0.23.1] — 2026-06-21
+
+- **Docs: world-class README restructure.** The README is now a lean, visual-first
+  hub (−78% words): release history moved to this changelog, the threat model to
+  `SECURITY.md`, and the full tool/protocol reference to `docs/tools.md` +
+  `docs/protocol.md`. The npm tarball now ships those relocated docs (`package.json`
+  `files`) so the README's relative links resolve. No runtime changes.
+
 ## [0.23.0] — 2026-06-20
 
 **oxpit goes VIEWER → ACTOR.** The fleet cockpit can now stand up, converge, and
