@@ -248,3 +248,42 @@ test("delivery: unclaimed receiver still gets the message, just no ledger handle
     assert.equal(lookupReceived(SENDER, msg.id), null);
   });
 });
+
+// H1 — durable obligation under ledger-write failure (the disk-full incident).
+// my_open_work / countOpenObligations read the LEDGER, not the mailbox, so an
+// action_required delegation whose ledger write fails must NOT be delivered as
+// untracked mail — fail loud so the sender retries. An ordinary message keeps the
+// best-effort behaviour (deliver anyway; worst case a missing reply handle).
+
+test("deliverToPeer: action_required + ledger-write failure → throws, nothing enqueued (H1)", () => {
+  withHome(() => {
+    const boom = () => {
+      throw new Error("ENOSPC: no space left on device");
+    };
+    assert.throws(
+      () => deliverToPeer(KEYED, "do the review", SENDER, { action_required: true }, boom),
+      /ledger write failed|delivery aborted/,
+      "an action_required delegation must fail loud when its ledger record fails",
+    );
+    assert.equal(
+      mailbox.mailboxHasMessages(RECEIVER_BOX),
+      false,
+      "delivery aborted before enqueue — no obligation stranded invisible in the mailbox",
+    );
+  });
+});
+
+test("deliverToPeer: ordinary message + ledger-write failure → still delivered (best-effort, H1)", () => {
+  withHome(() => {
+    const boom = () => {
+      throw new Error("ENOSPC: no space left on device");
+    };
+    const msg = deliverToPeer(KEYED, "fyi", SENDER, {}, boom); // not action_required
+    assert.ok(msg.id, "ordinary delivery proceeds despite a ledger failure");
+    assert.equal(
+      mailbox.mailboxHasMessages(RECEIVER_BOX),
+      true,
+      "ordinary message still enqueued (worst case = a missing reply handle)",
+    );
+  });
+});

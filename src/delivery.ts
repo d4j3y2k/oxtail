@@ -85,22 +85,37 @@ function deliver(route: DeliveryRoute, msg: mailbox.Mailbox): void {
 // ledger to own the handle and we skip the record — reply_to_message simply
 // won't find it, which is the documented fall-back-to-send_message path.
 //
-// The ledger write is best-effort: a ledger failure must NEVER drop the actual
-// delivery. Worst case the reply handle is missing and the peer falls back to
-// send_message — never the reverse (a visible line with no handle on success),
-// because record precedes append.
+// The ledger write is best-effort FOR ORDINARY messages: a failure must not drop
+// the delivery — worst case the reply handle is missing and the peer falls back to
+// send_message (never the reverse: a visible line with no handle, because record
+// precedes append). EXCEPTION — an action_required delegation: its obligation lives
+// ONLY in the ledger, so a ledger failure there ABORTS the delivery (fail loud →
+// sender retries) rather than enqueue a delegation the obligation surface can't see.
+// `record` is injectable so tests can drive the ledger-failure branch.
 export function deliverToPeer(
   route: DeliveryRoute,
   body: string,
   fromSessionId: string | undefined,
   options: mailbox.EnqueueOptions = {},
+  record: (sessionId: string, msg: mailbox.Mailbox) => void = recordReceived,
 ): mailbox.Mailbox {
   const msg = mailbox.buildMessage(body, fromSessionId, options);
   if (route.session_id) {
     try {
-      recordReceived(route.session_id, msg);
+      record(route.session_id, msg);
     } catch (e) {
       trace("received_ledger_write_failed", { message_id: msg.id, error: String(e) });
+      // H1: my_open_work / countOpenObligations read the LEDGER, not the mailbox,
+      // and recordReceived rewrites the whole ledger via atomicWrite (temp+rename)
+      // — far likelier to fail under disk pressure than the tiny mailbox append
+      // that follows. Delivering anyway would enqueue a delegation INVISIBLE to the
+      // obligation surface, silently voiding its durable guarantee (the disk-full
+      // incident). Fail loud so the sender retries; abort before deliver().
+      if (msg.action_required) {
+        throw new Error(
+          `durable obligation not recorded — ledger write failed, delivery aborted: ${String(e)}`,
+        );
+      }
     }
   }
   deliver(route, msg);
