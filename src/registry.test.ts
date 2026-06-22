@@ -28,6 +28,7 @@ import {
   type RegistryEntry,
 } from "./registry.js";
 import * as mailbox from "./mailbox.js";
+import { recordReceived, countOpenObligations } from "./received.js";
 // IMPORTANT: import from list-shape.js, NOT server.js — importing server.js
 // runs its top-level register() and turns the test process into a live oxtail
 // agent against the real $HOME (real registry entry + orphan-mailbox GC).
@@ -610,6 +611,98 @@ test("register: leaves live sibling alone (legitimate multi-scope case)", () => 
   });
 });
 
+test("register: reaps a PRIOR incarnation's dead entry from a DIFFERENT session (cross-session ghost-row gap)", () => {
+  withTempHome((home) => {
+    const dir = join(home, ".oxtail", "sessions");
+    mkdirSync(dir, { recursive: true });
+    // A previous fleet's agent (its own session_id), now exited with an empty
+    // mailbox. gcDeadSiblings leaves it alone (different session_id) and an idle
+    // fleet may never drive readAll() over it — so without this it lingers as a
+    // ⚫dead·gone ghost row in the cockpit forever.
+    const deadGhost = deadPid();
+    writeFileSync(
+      join(dir, `${deadGhost}.json`),
+      JSON.stringify(makeRegistryEntry({ pid: deadGhost, session_id: "uuid-prior", started_at: 1 })),
+    );
+    // The restarted fleet registers a fresh, unrelated session.
+    register(
+      makeRegistryEntry({ pid: process.pid, session_id: "uuid-current", started_at: 2 }),
+    );
+    const files = readdirSync(dir).filter((f) => f.endsWith(".json"));
+    assert.deepEqual(
+      files,
+      [`${process.pid}.json`],
+      "prior incarnation's empty dead breadcrumb reaped at register; only the live one remains",
+    );
+  });
+});
+
+test("register: does NOT reap a dead cross-session entry that still holds undrained mail (mail-safe)", () => {
+  withTempHome((home) => {
+    const dir = join(home, ".oxtail", "sessions");
+    mkdirSync(dir, { recursive: true });
+    const deadGhost = deadPid();
+    writeFileSync(
+      join(dir, `${deadGhost}.json`),
+      JSON.stringify(makeRegistryEntry({ pid: deadGhost, session_id: "uuid-prior", started_at: 1 })),
+    );
+    mailbox.enqueue(deadGhost, "left for a now-dead peer"); // undrained mail
+    register(
+      makeRegistryEntry({ pid: process.pid, session_id: "uuid-current", started_at: 2 }),
+    );
+    assert.ok(
+      existsSync(join(dir, `${deadGhost}.json`)),
+      "a dead breadcrumb with pending mail is kept (reap-deferral) even cross-session — no deliverable mail dropped",
+    );
+  });
+});
+
+test("register: KEEPS a dead cross-session entry whose SESSION box holds mail (stranded ✉ preserved)", () => {
+  withTempHome((home) => {
+    const dir = join(home, ".oxtail", "sessions");
+    mkdirSync(dir, { recursive: true });
+    const deadGhost = deadPid();
+    writeFileSync(
+      join(dir, `${deadGhost}.json`),
+      JSON.stringify(makeRegistryEntry({ pid: deadGhost, session_id: "uuid-stranded", started_at: 1 })),
+    );
+    // v0.17 mail lives in the SESSION box, not the pid box (which is empty here).
+    // The pid-box-only keep-gate reaped this and erased the cockpit's stranded ✉
+    // for the dead owner — the bug max+codex caught. It must be KEPT.
+    mailbox.enqueue(mailbox.mailboxSessionKey("uuid-stranded"), "unread by a now-dead peer");
+    register(
+      makeRegistryEntry({ pid: process.pid, session_id: "uuid-current", started_at: 2 }),
+    );
+    assert.ok(
+      existsSync(join(dir, `${deadGhost}.json`)),
+      "session-box mail keeps the dead breadcrumb — stranded ✉ signal survives register",
+    );
+  });
+});
+
+test("register: KEEPS a dead cross-session entry with an OPEN OBLIGATION (stranded ⚑ preserved)", () => {
+  withTempHome((home) => {
+    const dir = join(home, ".oxtail", "sessions");
+    mkdirSync(dir, { recursive: true });
+    const deadGhost = deadPid();
+    writeFileSync(
+      join(dir, `${deadGhost}.json`),
+      JSON.stringify(makeRegistryEntry({ pid: deadGhost, session_id: "uuid-owes", started_at: 1 })),
+    );
+    // A delegation the dead session never closed lives in its LEDGER (pid box empty).
+    // Reaping would erase the cockpit's stranded ⚑ "work stranded on a dead owner".
+    recordReceived("uuid-owes", mailbox.buildMessage("review this", "boss-sid", { action_required: true }));
+    assert.equal(countOpenObligations("uuid-owes"), 1, "obligation is open before register");
+    register(
+      makeRegistryEntry({ pid: process.pid, session_id: "uuid-current", started_at: 2 }),
+    );
+    assert.ok(
+      existsSync(join(dir, `${deadGhost}.json`)),
+      "an open obligation keeps the dead breadcrumb — stranded ⚑ signal survives register",
+    );
+  });
+});
+
 // ────────────────────────────────────────────────────────────────────────────
 // session_id union drain + reap-deferral + dead-sibling consolidation
 // (fixes silent message loss on MCP-child pid rotation)
@@ -665,6 +758,47 @@ test("readAll: defers reaping a dead CLAIMED entry whose mailbox is non-empty", 
     mailbox.drain(dead);
     readAll();
     assert.ok(!existsSync(join(dir, `${dead}.json`)), "reaped after mailbox emptied");
+  });
+});
+
+test("readAll: KEEPS a dead claimed entry with an OPEN OBLIGATION — the messaging path can't erase the stranded ⚑ (Finding 1)", () => {
+  withTempHome((home) => {
+    const dir = join(home, ".oxtail", "sessions");
+    mkdirSync(dir, { recursive: true });
+    const dead = deadPid();
+    writeFileSync(
+      join(dir, `${dead}.json`),
+      JSON.stringify(makeRegistryEntry({ pid: dead, session_id: "uuid-owes", started_at: 1 })),
+    );
+    // The obligation lives in the LEDGER; pid + session boxes are empty. The old
+    // pid-box-only rule reaped this on the messaging path, erasing the stranded ⚑.
+    recordReceived("uuid-owes", mailbox.buildMessage("review it", "boss", { action_required: true }));
+    const result = readAll();
+    assert.equal(result.length, 0, "dead entry excluded from live[]");
+    assert.ok(
+      existsSync(join(dir, `${dead}.json`)),
+      "readAll keeps the breadcrumb — an open obligation is a stranded signal, not pure noise",
+    );
+  });
+});
+
+test("readAll: KEEPS a dead claimed entry with SESSION-box mail (Finding 1)", () => {
+  withTempHome((home) => {
+    const dir = join(home, ".oxtail", "sessions");
+    mkdirSync(dir, { recursive: true });
+    const dead = deadPid();
+    writeFileSync(
+      join(dir, `${dead}.json`),
+      JSON.stringify(makeRegistryEntry({ pid: dead, session_id: "uuid-stranded", started_at: 1 })),
+    );
+    // v0.17 mail in the SESSION box, pid box empty — the old rule reaped it here.
+    mailbox.enqueue(mailbox.mailboxSessionKey("uuid-stranded"), "unread v0.17 mail");
+    const result = readAll();
+    assert.equal(result.length, 0, "dead entry excluded from live[]");
+    assert.ok(
+      existsSync(join(dir, `${dead}.json`)),
+      "readAll keeps the breadcrumb — session-box mail is a stranded ✉, not pure noise",
+    );
   });
 });
 

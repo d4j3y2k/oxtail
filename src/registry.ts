@@ -19,6 +19,7 @@ import {
   mailboxSessionKey,
   migrateMailbox,
 } from "./mailbox.js";
+import { countOpenObligations } from "./received.js";
 
 export type StateCard = {
   purpose: string | null;
@@ -372,6 +373,12 @@ export function register(entry: RegistryEntry): void {
   // undrained mail into us first. Leaves live siblings alone; readAll() collapses
   // those by session_id.
   gcDeadSiblings(entry);
+  // Then reap a PRIOR incarnation's fully-exited breadcrumbs (different
+  // session_id, dead pid, empty mailbox) that gcDeadSiblings leaves alone and
+  // an idle messaging path never drives readAll() over — otherwise they linger
+  // as ⚫dead·gone ghost rows in the cockpit. Mail-safe (readAll()'s own rule).
+  // Skip our own freshly-published breadcrumb (entry.server_pid).
+  gcDeadBreadcrumbs(entry.server_pid);
   // Finally sweep mailbox files nothing can route to anymore (empty + old +
   // unreferenced) — registry reaping removes the breadcrumbs but used to leave
   // the 0-byte box files behind forever. register() also re-fires on claim /
@@ -462,6 +469,88 @@ function gcDeadSiblings(entry: RegistryEntry): void {
   }
 }
 
+// A dead breadcrumb is PURE NOISE only when it carries no signal the cockpit must
+// surface. It is worth KEEPING when it still holds undrained mail (legacy pid box
+// OR the v0.17 session box) OR an unclosed delegation in the receiver's ledger —
+// which is exactly the snapshot's stranded ⚑/✉ definition (countUnread +
+// countOpenObligations). Mirroring that here is the whole point: register-time GC
+// must never silently erase a "work stranded on a dead owner" warning. (The bug
+// max + codex caught: the earlier pid-box-only keep-gate reaped the very signal
+// this code claimed to preserve.) Conservative — any probe error counts as a
+// signal (keep, never reap on uncertainty).
+function deadBreadcrumbHasSignal(entry: RegistryEntry): boolean {
+  const sid = entry.client.session_id;
+  if (sid == null) return false; // unclaimed dead child: no ledger, not identity-addressable
+  try {
+    return (
+      mailboxHasMessages(entry.server_pid) || // legacy pid box
+      mailboxHasMessages(mailboxSessionKey(sid)) || // v0.17 session box
+      countOpenObligations(sid) > 0 // unclosed delegation in the ledger
+    );
+  } catch {
+    return true; // never reap on uncertainty
+  }
+}
+
+// Reap PURE-NOISE dead breadcrumbs across ALL sessions. WHY a second home for it:
+// readAll() reaps dead entries too, but only on the peer-messaging / target-
+// resolution path — an idle or freshly-restarted fleet may not call it for a long
+// time, so a PRIOR incarnation's dead breadcrumbs linger and readAllPassive() (the
+// cockpit's read-only view) renders them as ⚫dead·gone ghost rows. gcDeadSiblings()
+// doesn't catch them: it only touches dead entries that share the REGISTERING
+// session's id (the pid-rotation drain), never a different, fully-exited session.
+// register() fires on every (re)start — exactly when those corpses appear — so
+// sweep them here.
+//
+// SIGNAL-SAFE, not just mail-safe: a dead breadcrumb still carrying undrained mail
+// (pid OR session box) or an open obligation is LEFT in place — so no deliverable
+// mail is dropped AND the cockpit's stranded ⚑/✉ warning survives. Only a
+// breadcrumb with no mail and no open work is reaped. Best-effort; never throws —
+// housekeeping must not break register().
+//
+// TOCTOU: the reap is lock-free, so re-read the entry immediately before unlink and
+// unlink ONLY when it is still byte-identical (server_pid + started_at + proc_sig)
+// to the dead, signal-free breadcrumb we decided to reap. That closes the window
+// where a concurrent register() reuses this pid (publishing a new LIVE entry under
+// <pid>.json) or a sender appends mail after our check — without it we could unlink
+// a freshly-live row or orphan just-appended mail (codex #1/#2). A residual
+// hair-width window between the re-read and the unlink is inherent to FS GC with no
+// mailbox lock (a provably race-free FS advisory lock isn't achievable here).
+//
+// `skipPid` is the breadcrumb register() just published: never reap the entry we
+// are registering in this very call. In production it is always our live pid (moot),
+// but a caller registering a breadcrumb for an already-dead pid (test fixtures; a
+// breadcrumb written before its mail lands) must not have it yanked out from under
+// them between write and use.
+export function gcDeadBreadcrumbs(skipPid?: number): void {
+  const dir = registryDir();
+  if (!existsSync(dir)) return;
+  for (const file of readdirSync(dir)) {
+    const entry = readEntryFile(dir, file);
+    if (!entry) continue; // non-<pid>.json, parse error, or forged server_pid
+    if (skipPid != null && entry.server_pid === skipPid) continue;
+    if (isAlive(entry.server_pid)) continue;
+    if (deadBreadcrumbHasSignal(entry)) continue;
+    // Compare-and-clear: pin identity, re-read, unlink only if unchanged + still
+    // dead + still signal-free. See the TOCTOU note above.
+    const fresh = readEntryFile(dir, file);
+    if (!fresh) continue; // already gone
+    if (
+      fresh.server_pid !== entry.server_pid ||
+      fresh.started_at !== entry.started_at ||
+      fresh.proc_sig !== entry.proc_sig
+    ) {
+      continue; // pid reused / entry rewritten since our checks
+    }
+    if (isAlive(fresh.server_pid) || deadBreadcrumbHasSignal(fresh)) continue;
+    try {
+      unlinkSync(join(dir, file));
+    } catch {
+      // already gone, fine
+    }
+  }
+}
+
 export function unregister(pid = process.pid): void {
   try {
     unlinkSync(entryPath(pid));
@@ -489,15 +578,16 @@ export function readAll(): RegistryEntry[] {
     if (!entry) continue; // non-<pid>.json, parse error, or forged server_pid
     const full = join(dir, file);
     if (!isAlive(entry.server_pid)) {
-      // Reap-deferral: a dead child's mailbox may still hold undrained mail
-      // that the session's union-drain (PreToolUse hook + read_my_messages)
-      // must reach. Keep the registry file as a routing breadcrumb until the
-      // mailbox is empty — but ONLY for a claimed (non-null session_id) entry:
-      // a null-session dead child is not identity-addressable, so retaining it
-      // would only grow ambiguity. Either way it is excluded from `live`.
-      const keepForMail =
-        entry.client.session_id != null && mailboxHasMessages(entry.server_pid);
-      if (!keepForMail) {
+      // Reap-deferral: keep a dead child's registry breadcrumb while it still
+      // carries a SIGNAL a reader or the cockpit must reach — undrained mail in
+      // the pid OR session box (the session union-drain must deliver it), OR an
+      // open obligation the stranded ⚑ derives from. deadBreadcrumbHasSignal is
+      // the SAME predicate gcDeadBreadcrumbs uses, so this messaging-path reaper
+      // can't erase a stranded signal the register-time GC was careful to keep
+      // (codex re-verify Finding 1 — the old pid-box-only rule here defeated the
+      // fix). A null-session dead child has no signal and isn't identity-
+      // addressable → reaped. Either way it is excluded from `live`.
+      if (!deadBreadcrumbHasSignal(entry)) {
         try {
           unlinkSync(full);
         } catch {
