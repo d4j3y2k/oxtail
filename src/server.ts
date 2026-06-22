@@ -2345,10 +2345,6 @@ const invokedDirectly =
 const ORPHAN_WATCHDOG_MS = 30_000;
 
 if (invokedDirectly) {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  await maybeHookHint();
-
   // Orphan self-reap. This MCP server exists ONLY to serve the host agent (codex /
   // claude) that spawned it. The SIGINT/SIGTERM/exit handlers above cover a CLEAN host
   // shutdown — but a host that dies UNCLEANLY (crash, SIGKILL, or just dropping our
@@ -2360,6 +2356,12 @@ if (invokedDirectly) {
   //   1. our stdin (the host's pipe to us) hitting EOF / closing — the immediate signal;
   //   2. being reparented to pid 1 — a backstop for a detached host whose death does
   //      not EOF our stdin. Both are no-ops while the host is alive and serving.
+  // WIRED BEFORE server.connect() AND before any await (codex review): a host that
+  // dies DURING startup could otherwise fire stdin end/close before the listeners
+  // exist, and capture initialPpid as 1 (already reparented) — disabling the watchdog
+  // and leaking the very orphan this is meant to reap. Listeners predate the transport's
+  // read; initialPpid is snapshotted before the connect await; and an explicit
+  // already-closed check after connect catches an EOF that landed inside that window.
   let reaped = false;
   const reap = (why: string): void => {
     if (reaped) return;
@@ -2367,15 +2369,23 @@ if (invokedDirectly) {
     trace("orphan_reap", { server_pid: process.pid, ppid: process.ppid, why });
     process.exit(0);
   };
+  const initialPpid = process.ppid;
   // 'end'/'close' listeners do NOT put stdin in flowing mode, so the transport's own
   // reading is unaffected; they only fire when the host closes the pipe.
   process.stdin.on("end", () => reap("stdin_end"));
   process.stdin.on("close", () => reap("stdin_close"));
-  const initialPpid = process.ppid;
   if (initialPpid !== 1) {
     const watchdog = setInterval(() => {
       if (parentLikelyDied(initialPpid, process.ppid)) reap("reparented");
     }, ORPHAN_WATCHDOG_MS);
     watchdog.unref?.();
   }
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  // The connect await yields the event loop; if stdin already hit EOF / was destroyed
+  // during it (host died mid-startup), the end/close event may have already fired —
+  // catch that missed signal directly rather than waiting on the 30s watchdog.
+  if (process.stdin.readableEnded || process.stdin.destroyed) reap("stdin_already_closed");
+  await maybeHookHint();
 }
