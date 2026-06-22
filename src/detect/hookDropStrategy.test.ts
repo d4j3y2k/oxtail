@@ -17,16 +17,31 @@ function withHome<T>(fn: (home: string) => T): T {
   const home = mkdtempSync(join(tmpdir(), "oxtail-drop-"));
   const prev = process.env.HOME;
   process.env.HOME = home;
-  try {
-    return fn(home);
-  } finally {
+  const cleanup = () => {
     process.env.HOME = prev;
     try {
       rmSync(home, { recursive: true, force: true });
     } catch {
       // best effort
     }
+  };
+  let result: T;
+  try {
+    result = fn(home);
+  } catch (err) {
+    cleanup();
+    throw err;
   }
+  // Async callers (`await withHome(async ...)`) must keep HOME set and the temp
+  // dir alive until their promise SETTLES. A `try/finally` would fire the instant
+  // fn() returns its pending promise — deleting the dir mid-test, after which the
+  // subprocess hook re-creates `$HOME/.oxtail/session-starts/` via `mkdir -p` and
+  // that recreated tree is never cleaned up (the leak: ~1.5k dirs over the project).
+  if (result && typeof (result as { then?: unknown }).then === "function") {
+    return (result as unknown as Promise<unknown>).finally(cleanup) as unknown as T;
+  }
+  cleanup();
+  return result;
 }
 
 // started_at defaults to 60s ago: most tests exercise the post-grace state
