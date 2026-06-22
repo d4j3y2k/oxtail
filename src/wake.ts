@@ -26,18 +26,22 @@ import { fireKeystrokes } from "./keystrokes.js";
 
 // Typed into the peer's TUI as a synthetic prompt, so it lands in their context
 // once per wake — kept terse. For HOOKED Claude Code the delivered envelope
-// carries the full reply instruction, but Codex and hookless Claude peers only
-// get raw mailbox JSON from read_my_messages — so the wake itself must preserve
-// the reply path (read → reply via send_message). Per Codex Phase-D review.
+// carries the full instruction, but Codex and hookless Claude peers only get raw
+// mailbox JSON from read_my_messages — so the wake itself must preserve BOTH paths:
+// an action_required item is a durable OBLIGATION the peer closes with
+// complete_work/block_work (answering it with a plain send_message leaves the
+// obligation OPEN forever — a stall codex hit live), while an ordinary message is
+// answered with send_message. Per Codex Phase-D review + the action_required fix.
 export const ASK_PEER_WAKE_TEXT =
-  "oxtail msg: read_my_messages; reply via send_message; set reply_to=request_id if present";
+  "oxtail msg: read_my_messages, then act on it — close action_required work via complete_work/block_work; otherwise reply via send_message (reply_to=request_id if present)";
 
 // The Codex paste-burst gap (CODEX_SUBMIT_DELAY_MS) and the low-level fire
 // primitive (fireKeystrokes) now live in ./keystrokes.ts, shared with the oxpit
 // fleet executor; see that module for the paste-burst rationale + verification.
 
 export type WakeStatus =
-  | "fired"             // wake keystrokes were sent (peer should enter a turn)
+  | "fired"             // keystrokes sent to a HOOKED peer — its hooks are the delivery safety net; the wake is only an accelerator
+  | "fired_unconfirmed" // keystrokes sent to a HOOKLESS peer (Codex / no activity marker): OPEN-LOOP — nothing passively delivers and submission is NOT confirmed (the paste-burst Enter can be suppressed). NOT proof of pickup; the durable obligation + the peer's next read_my_messages are the guarantee
   | "skipped_unsupported" // client_type cannot be woken externally (reserved — no client currently returns this in auto mode)
   | "skipped_no_target" // no tmux pane/session resolved, or send-keys failed everywhere
   | "skipped_busy"      // peer is mid-turn — skipped the keystroke; hooks/poll deliver (send_message wake:auto + ask_peer)
@@ -58,6 +62,22 @@ export type WakeStatus =
 export type DeliveryOutlook =
   | "stranded_until_read"  // claimed idle/stale-busy peer: read only at its next turn or a wake
   | "unknown_liveness";    // claimed peer with no activity marker (Codex / hookless Claude)
+
+// H2 — honest wake status. A successful keystroke send is a confident "fired" ONLY
+// for a HOOKED peer: one with a session_id AND a live activity marker (its hooks
+// passively deliver and are the safety net). Every OTHER fire is OPEN-LOOP — a
+// hookless claimed peer (Codex / no marker) OR an unclaimed peer (no session_id,
+// inherently hookless) — nothing delivers passively and we never confirm the
+// paste-burst's Enter actually submitted, so report "fired_unconfirmed": keystrokes
+// sent, pickup NOT confirmed. (`!activity` mirrors classifyDeliveryOutlook's hookless
+// proxy; the `!sessionId` arm closes max N1 — an unclaimed wake is open-loop too.)
+// Pure so it is unit-testable without a live pane.
+export function honestFireStatus(
+  sessionId: string | null | undefined,
+  activity: ActivitySnapshot,
+): WakeStatus {
+  return !sessionId || !activity ? "fired_unconfirmed" : "fired";
+}
 
 // OXTAIL_ASK_PEER_WAKE_STRATEGY = "auto" | "legacy" | "off"
 //   auto    — per-client routing: Codex gets paste-burst-aware wake (500ms gap
@@ -214,7 +234,11 @@ export async function wakePeer(
     // synchronous, so they cannot interleave here.
     wakeDebounce.delete(sid);
   }
-  return ok ? "fired" : "skipped_no_target";
+  if (!ok) return "skipped_no_target";
+  // H2: keystrokes landed, but only a HOOKED peer's "fired" implies likely pickup;
+  // a hookless peer (Codex) has no passive delivery and no submit confirmation, so
+  // report it open-loop. See honestFireStatus.
+  return honestFireStatus(sid, readActivity(sid));
 }
 
 // --- send_message wake:auto gating -------------------------------------------

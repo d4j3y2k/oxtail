@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { acquireDirLock, releaseDirLock } from "./locks.js";
@@ -108,8 +108,21 @@ function releaseLock(sessionId: string): void {
 // writeFileSync, which issues multiple write() syscalls.
 function atomicWrite(path: string, data: string): void {
   const tmp = `${path}.tmp.${process.pid}.${randomBytes(6).toString("hex")}`;
-  writeFileSync(tmp, data, { mode: 0o600 });
-  renameSync(tmp, path);
+  try {
+    writeFileSync(tmp, data, { mode: 0o600 });
+    renameSync(tmp, path);
+  } catch (err) {
+    // ENOSPC mid-write (the exact condition H1's fail-loud path now exercises)
+    // can leave a partial temp file behind; remove it so disk pressure doesn't
+    // compound into temp-file accumulation, then rethrow so the caller decides
+    // (H1: an action_required delivery fails loud and the sender retries). (max N3)
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // already gone / never created — fine
+    }
+    throw err;
+  }
 }
 
 function readLines(sessionId: string): string[] {

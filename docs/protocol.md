@@ -104,7 +104,7 @@ reached by `send_message({ wake: "auto" })`, `ask_peer`, or an explicit
 
 ```js
 send_message({ target: "<peer>", body: "...", wake: "auto" })
-// → { ok: true, ..., wake_status: "fired" | "skipped_busy" | "skipped_no_target" | "disabled" }
+// → { ok: true, ..., wake_status: "fired" | "fired_unconfirmed" | "skipped_busy" | "skipped_no_target" | "disabled" }
 ```
 
 It is **state-gated** off the activity flag: if the peer is mid-turn (`busy`), the
@@ -145,16 +145,20 @@ idle-wake.
 ask_peer({ target, body })
   → {
       ok, message_id, request_id,
-      wake_status: "fired" | "skipped_busy" | "skipped_debounced" | "skipped_no_target" | "disabled",
+      wake_status: "fired" | "fired_unconfirmed" | "skipped_busy" | "skipped_debounced" | "skipped_no_target" | "disabled",
       reply: { id, body, enqueued_at, from_session_id, reply_to, correlation } | null,
       correlation: "correlated" | "uncorrelated" | "none",
       timeout_ms, timed_out,
     }
 ```
 
-`wake_status` distinguishes outcomes a caller may handle differently. `fired` = wake
-attempted (or the reply arrived during the grace window). `skipped_busy` = peer
-mid-turn (its hooks/poll will deliver; we still poll for the reply).
+`wake_status` distinguishes outcomes a caller may handle differently. `fired` =
+keystrokes sent to a HOOKED peer (its hooks are the delivery safety net).
+`fired_unconfirmed` = keystrokes sent to a HOOKLESS peer (Codex / no activity marker,
+or an unclaimed peer) — open-loop: nothing delivers passively and submission isn't
+confirmed, so it is **not** proof of pickup (the durable obligation + the peer's next
+`read_my_messages` are the guarantee). `skipped_busy` = peer mid-turn **or** the reply
+arrived during the grace window (its hooks/poll deliver; we still poll for the reply).
 `skipped_debounced` = a wake fired for this peer moments ago and was coalesced.
 `skipped_no_target` = no process-tree-verified pane resolved. `disabled` =
 `OXTAIL_ASK_PEER_WAKE_STRATEGY=off`. `timed_out` is `true` only when the poll loop ran

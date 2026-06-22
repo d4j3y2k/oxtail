@@ -192,9 +192,13 @@ export async function sendOperatorMessage(
     // Wake carries the message content ("oxpit msg: …") so it shows in the target's
     // pane, unlike the generic peer read_my_messages nudge.
     wake_status = await wake(entry, operatorWakeText(body));
-    // Stamp the throttle ONLY when the wake actually fired, so a failed/no-target
-    // wake leaves the door open for a retry.
-    if (wake_status === "fired") stampWake(entry.client.session_id, nowMs);
+    // Stamp the throttle when keystrokes actually fired — confirmed ("fired") OR
+    // open-loop to a hookless peer ("fired_unconfirmed"); both put text in the
+    // pane and must be throttled. A failed/no-target wake leaves the door open for
+    // a retry.
+    if (wake_status === "fired" || wake_status === "fired_unconfirmed") {
+      stampWake(entry.client.session_id, nowMs);
+    }
   }
 
   return {

@@ -6,15 +6,19 @@ import { ASK_PEER_WAKE_TEXT, askPeerWakeImpl } from "./wake.js";
 // Phase D: the wake prompt is trimmed, but because Codex / hookless Claude peers
 // see only raw mailbox JSON (no reply instruction) after waking, the wake text
 // itself MUST preserve the read→reply path. Guards against a future over-trim.
-test("wake text stays terse but keeps the read + reply path", () => {
+test("wake text stays terse but keeps BOTH the obligation-close and reply paths", () => {
   assert.ok(ASK_PEER_WAKE_TEXT.includes("read_my_messages"), "wake text points at the inbox");
   assert.ok(
     ASK_PEER_WAKE_TEXT.includes("send_message"),
-    "wake text preserves the reply path (send_message) for hookless peers",
+    "wake text preserves the reply path (send_message) for ordinary messages",
   );
   assert.ok(
-    Buffer.byteLength(ASK_PEER_WAKE_TEXT, "utf8") < 100,
-    "wake text stays terse (< 100 bytes)",
+    ASK_PEER_WAKE_TEXT.includes("complete_work") || ASK_PEER_WAKE_TEXT.includes("block_work"),
+    "wake text tells a hookless peer to CLOSE action_required work — not leave the obligation open",
+  );
+  assert.ok(
+    Buffer.byteLength(ASK_PEER_WAKE_TEXT, "utf8") < 200,
+    "wake text stays terse (< 200 bytes) — it is typed into the peer's composer",
   );
 });
 
