@@ -63,18 +63,20 @@ export type DeliveryOutlook =
   | "stranded_until_read"  // claimed idle/stale-busy peer: read only at its next turn or a wake
   | "unknown_liveness";    // claimed peer with no activity marker (Codex / hookless Claude)
 
-// H2 — honest wake status. A successful keystroke send is only a confident "fired"
-// for a HOOKED peer (one with an activity marker — its hooks passively deliver and
-// are the safety net). For a HOOKLESS peer (Codex / no marker) the send is
-// OPEN-LOOP: nothing delivers passively and we never confirm the paste-burst's
-// Enter actually submitted, so report "fired_unconfirmed" — keystrokes sent, pickup
-// NOT confirmed. `!activity` is the same hookless proxy classifyDeliveryOutlook uses
-// for "unknown_liveness". Pure so it is unit-testable without a live pane.
+// H2 — honest wake status. A successful keystroke send is a confident "fired" ONLY
+// for a HOOKED peer: one with a session_id AND a live activity marker (its hooks
+// passively deliver and are the safety net). Every OTHER fire is OPEN-LOOP — a
+// hookless claimed peer (Codex / no marker) OR an unclaimed peer (no session_id,
+// inherently hookless) — nothing delivers passively and we never confirm the
+// paste-burst's Enter actually submitted, so report "fired_unconfirmed": keystrokes
+// sent, pickup NOT confirmed. (`!activity` mirrors classifyDeliveryOutlook's hookless
+// proxy; the `!sessionId` arm closes max N1 — an unclaimed wake is open-loop too.)
+// Pure so it is unit-testable without a live pane.
 export function honestFireStatus(
   sessionId: string | null | undefined,
   activity: ActivitySnapshot,
 ): WakeStatus {
-  return sessionId && !activity ? "fired_unconfirmed" : "fired";
+  return !sessionId || !activity ? "fired_unconfirmed" : "fired";
 }
 
 // OXTAIL_ASK_PEER_WAKE_STRATEGY = "auto" | "legacy" | "off"

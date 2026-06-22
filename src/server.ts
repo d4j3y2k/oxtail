@@ -1995,7 +1995,7 @@ server.registerTool(
   {
     description: [
       "Delegate-and-wait: enqueue a message to a peer in the same project root, wake them, and block until they reply (via send_message) or the timeout elapses. Use this for back-and-forth; use send_message for fire-and-forget.",
-      "Wakes the peer via per-client tmux send-keys (Codex gets a paste-burst-aware gap, Claude Code doesn't), then polls for a reply. For reply_to-capable peers, only from_session_id + reply_to == request_id satisfies the wait; legacy peers fall back to best-effort from_session_id matching and the response reports correlation:\"uncorrelated\". Response carries wake_status: \"fired\" | \"skipped_busy\" | \"skipped_no_target\" | \"disabled\" (skipped_unsupported is reserved). A peer that is mid-turn is NOT keystroke-woken (skipped_busy) — its hook/poll delivers the enqueued message and we still poll for the reply. Returns reply: null, timed_out: true on timeout (default 60000ms, override per call with timeout_ms, or set OXTAIL_ASK_PEER_TIMEOUT_MS at startup). timeout_ms is clamped to a safe ceiling (default 100000ms, env OXTAIL_ASK_PEER_MAX_TIMEOUT_MS) so the wait can't outlast the client's tool-call abort window — exceeding it makes the client hard-fail the call instead of returning graceful timed_out; the response reports timeout_clamped_from_ms when clamped. DURABLE DELEGATION: on timeout (correlated peers, claimed requester), the request is recorded as a pending obligation, so when the peer's reply finally arrives — minutes or hours later — it WAKES you back (wake_reason late_reply_to_pending), not just landing silently in read_my_messages. So ask_peer is safe for long tasks: let it time out, end your turn, get pulled back when the work is done.",
+      "Wakes the peer via per-client tmux send-keys (Codex gets a paste-burst-aware gap, Claude Code doesn't), then polls for a reply. For reply_to-capable peers, only from_session_id + reply_to == request_id satisfies the wait; legacy peers fall back to best-effort from_session_id matching and the response reports correlation:\"uncorrelated\". Response carries wake_status: \"fired\" | \"fired_unconfirmed\" | \"skipped_busy\" | \"skipped_no_target\" | \"disabled\" (skipped_unsupported is reserved; \"fired_unconfirmed\" = a hookless target like Codex: keystrokes sent but pickup NOT confirmed, so don't treat the wake as delivery — the poll / durable late-reply path is the guarantee). A peer that is mid-turn is NOT keystroke-woken (skipped_busy) — its hook/poll delivers the enqueued message and we still poll for the reply. Returns reply: null, timed_out: true on timeout (default 60000ms, override per call with timeout_ms, or set OXTAIL_ASK_PEER_TIMEOUT_MS at startup). timeout_ms is clamped to a safe ceiling (default 100000ms, env OXTAIL_ASK_PEER_MAX_TIMEOUT_MS) so the wait can't outlast the client's tool-call abort window — exceeding it makes the client hard-fail the call instead of returning graceful timed_out; the response reports timeout_clamped_from_ms when clamped. DURABLE DELEGATION: on timeout (correlated peers, claimed requester), the request is recorded as a pending obligation, so when the peer's reply finally arrives — minutes or hours later — it WAKES you back (wake_reason late_reply_to_pending), not just landing silently in read_my_messages. So ask_peer is safe for long tasks: let it time out, end your turn, get pulled back when the work is done.",
       "Target must have a registered client.session_id (Codex peers call claim_session first). Body is verbatim — frame it as an assignment (objective + requested action) so it reads as delegation, not chat. Wake overridable via OXTAIL_ASK_PEER_WAKE_STRATEGY=auto|legacy|off.",
     ].join(" "),
     inputSchema: {
@@ -2122,9 +2122,13 @@ server.registerTool(
           );
         }
       } else {
-        // Reply arrived during grace window — peer was already mid-turn and
-        // the hook delivered the outbound to it as additionalContext.
-        wakeStatus = "fired";
+        // Reply arrived during the grace window: the peer was mid-tool-call when
+        // our outbound landed, so its hook delivered the message and it replied —
+        // NO keystroke was ever sent. That is exactly skipped_busy (mid-turn, hook
+        // delivers), not "fired" (which under H2 means keystrokes were sent). Report
+        // it honestly so a reply-during-grace can't masquerade as a confirmed wake
+        // (codex re-verify Finding 4).
+        wakeStatus = "skipped_busy";
       }
     } catch (e) {
       if ((e as Error).message === "aborted") {

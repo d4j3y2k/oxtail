@@ -22,8 +22,9 @@ test("honestFireStatus: HOOKED peer (stale marker still present) → fired", () 
   assert.equal(honestFireStatus("uuid-claude", { status: "busy", ageMs: 9_000_000 }), "fired");
 });
 
-test("honestFireStatus: unclaimed peer (no session_id) → fired", () => {
-  // No identity to key the activity marker on — fall back to the plain status
-  // rather than over-claim uncertainty for a peer we can't even classify.
-  assert.equal(honestFireStatus(null, null), "fired");
+test("honestFireStatus: unclaimed peer (no session_id) → fired_unconfirmed", () => {
+  // An unclaimed peer is inherently hookless (no session to key a marker on), so a
+  // wake to it is open-loop too — report the honest status, not a confident "fired"
+  // (max N1: the one open-loop case the original gate still labeled "fired").
+  assert.equal(honestFireStatus(null, null), "fired_unconfirmed");
 });
