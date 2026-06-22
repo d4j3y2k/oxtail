@@ -15,7 +15,7 @@ import { existsSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildSnapshot, type FleetAgent, type FleetSnapshot } from "./snapshot.js";
-import { ANIM_FRAMES, attentionLine, commsBodyLines, computeAgentLabels, renderSnapshot } from "./render.js";
+import { ANIM_FRAMES, attentionLine, BACKGROUND_ROW_CAP, commsBodyLines, computeAgentLabels, renderSnapshot } from "./render.js";
 import { buildCommsLog, type CommsMessage } from "./comms.js";
 import { agentKey, capturePaneActivity, type AgentActivity, type PaneActivity } from "./activity.js";
 import { clipToWidth, scrubBufferText } from "./format.js";
@@ -203,6 +203,10 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     let helpOpen = false;
     let mode: "fleet" | "log" = "fleet";
     let logFilterSelf = false; // scope the log to the fleet-selected agent
+    // `b` expands the detached-background section into its individual rows (default
+    // collapsed to a count header). Detached processes are never navigable, so this is
+    // a pure view toggle — it never moves the fleet selection.
+    let showBackground = false;
     let logExpanded = false; // `w` — expand the cursor'd message's full body
     let logCursorFromEnd = 0; // comms cursor: 0 = latest message, +1 = one older, …
     let logBodyOffset = 0; // when expanded: lines scrolled within the message body
@@ -332,7 +336,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     function footerKeyLines(width: number): string[] {
       const items = [
         "↑↓ move", "⏎ jump", "n nudge", "m msg", "S fleet", "R reset", "K kill",
-        "l log", "w thread", "r refresh", "? help", "⌃C quit",
+        "l log", "w thread", "b bg", "r refresh", "? help", "⌃C quit",
       ];
       const maxW = Math.max(16, width - 2);
       const lines: string[] = [];
@@ -371,6 +375,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "  n             nudge the selected agent (canned operator message; y to confirm)",
         "  m             compose a message (Enter send · ⌥⏎/⌃J newline · ⌃X unattach · Esc cancel)",
         "                attach: drag a file then ⌃A · ⌃V pastes a clipboard image (copy then ⌃V)",
+        "  b             show/hide detached background processes (MCP children / codex exec with no tmux pane)",
         "  l             toggle the comms-log bottom panel (fleet stays visible above)",
         "  w             open the selected agent's thread in the panel (per-agent)",
         "                in the panel: ↑↓ move the › cursor (or scroll an expanded msg) · w expand · j/k agents · f filter · ⏎ jump",
@@ -409,7 +414,17 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       // height tracks the width so a wrapped footer doesn't overflow the table window.
       const attn = attentionLine(snapshot, (x) => x) ? 1 : 0;
       const footerRows = 1 + footerKeyLines(width).length;
-      return 1 + attn + 1 + footerRows + wgLines + snapshot.warnings.length + 2 + 1;
+      // The detached-background section: 0 when none; 1 (collapsed header) by default;
+      // header + capped rows (+ overflow line) when expanded. Reserved so the agent
+      // table windows ABOVE it instead of the section overflowing the frame.
+      const bg = snapshot.background ?? [];
+      const bgLines =
+        bg.length === 0
+          ? 0
+          : showBackground
+            ? 1 + Math.min(bg.length, BACKGROUND_ROW_CAP) + (bg.length > BACKGROUND_ROW_CAP ? 1 : 0)
+            : 1;
+      return 1 + attn + 1 + footerRows + wgLines + bgLines + snapshot.warnings.length + 2 + 1;
     }
 
     function fleetFrame(width: number, rows: number): string {
@@ -423,6 +438,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         paneActivity,
         toolActivity: activityCache, // sticky overlay — never mutates the snapshot
         burstFrames: animEnabled ? bursts : undefined, // per-agent one-shot bursts
+        showBackground,
       });
     }
 
@@ -1939,6 +1955,15 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (s === "\x1b[A" || s === "k") return move(-1);
       if (s === "\x1b[B" || s === "j") return move(1);
       if (s === "\r" || s === "\n") return doJump();
+      if (s === "b") {
+        // Expand/collapse the detached-background section. A no-op view toggle when
+        // there are none — say so rather than silently doing nothing.
+        if ((snapshot.background ?? []).length === 0) {
+          return setStatus(dim("no detached background processes", opts.color));
+        }
+        showBackground = !showBackground;
+        return paint();
+      }
       if (s === "n") {
         const idx = selectedIndex();
         if (idx < 0) return;

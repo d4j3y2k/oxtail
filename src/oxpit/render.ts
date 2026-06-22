@@ -47,7 +47,15 @@ export type RenderOptions = {
   // (0..ANIM_FRAMES-1) of a one-shot burst. A row plays a short burst when you move to
   // it OR when its status changes (backlog item 1 — event-driven, not a loop).
   burstFrames?: Map<string, number>;
+  // Expand the detached-background section into its individual rows (TUI `b` toggle).
+  // Default false: the section renders as a single collapsed count header.
+  showBackground?: boolean;
 };
+
+// Cap on background rows rendered when the section is expanded, so a runaway process
+// leak can't overflow the frame. Shared with the TUI's height reservation so the two
+// agree on how many lines the expanded section occupies.
+export const BACKGROUND_ROW_CAP = 8;
 
 type Paint = (s: string, ...codes: string[]) => string;
 
@@ -605,6 +613,21 @@ function wrap(s: string, w: number): string[] {
   return out.length ? out : [""];
 }
 
+// One row in the expanded "background" section: a detached process you can SEE but
+// not drive from the cockpit. Deliberately DISTINCT from a fleet row — extra indent, a
+// dim `·` marker instead of the liveness glyph + › cursor, and the whole line dimmed —
+// so it never reads as a navigable fleet member. Shows identity + status + the real
+// server pid (so "is this real?" is answerable) and any unread/open-work it still holds.
+function renderBackgroundRow(a: FleetAgent, paint: Paint, label: string): string {
+  const id = cell(label, ID_W);
+  const type = cell(agentLabel(a.client_type), TYPE_W);
+  const status = cell(statusText(a), STATUS_W);
+  const bits = [`pid ${a.server_pid}`];
+  if (a.unread > 0) bits.push(`✉${a.unread}`);
+  if (a.open_work > 0) bits.push(`⚑${a.open_work}`);
+  return paint(`     · ${id} ${type} ${status} ${bits.join("  ")}`, C.dim);
+}
+
 // Render the full snapshot to a string. `selected` highlights a TUI row.
 export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): string {
   const color = opts.color ?? false;
@@ -680,17 +703,23 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
     }
   }
 
-  // Collapsed background processes — detached MCP children / `codex exec` subprocesses
-  // with no tmux pane. One dim footer line instead of N un-jumpable rows; the count is
-  // already echoed in the header (`+N bg`).
+  // Detached background processes get their OWN section below the fleet — distinct from
+  // the real, jumpable windows. Collapsed by default to a count header; the TUI's `b`
+  // expands it to the individual (dim) rows so they stay inspectable ("are these real?")
+  // without ever cluttering the navigable list. Count is also echoed in the header.
   if (background.length > 0) {
     const n = background.length;
-    lines.push(
-      paint(
-        `  + ${n} background ${n === 1 ? "process" : "processes"} (detached — no tmux pane, not jumpable)`,
-        C.dim,
-      ),
-    );
+    const noun = n === 1 ? "process" : "processes";
+    const desc = `${n} background ${noun} (detached — no tmux pane, not jumpable)`;
+    if (opts.showBackground) {
+      lines.push(paint(`  ▾ ${desc} · b to hide`, C.dim));
+      for (const a of background.slice(0, BACKGROUND_ROW_CAP)) {
+        lines.push(renderBackgroundRow(a, paint, rowLabel(a)));
+      }
+      if (n > BACKGROUND_ROW_CAP) lines.push(paint(`     ⋯ ${n - BACKGROUND_ROW_CAP} more`, C.dim));
+    } else {
+      lines.push(paint(`  ▸ ${desc} · b to show`, C.dim));
+    }
   }
 
   lines.push(...renderWaitGraph(s, paint, labels, opts.maxWaitRows));
