@@ -578,15 +578,16 @@ export function readAll(): RegistryEntry[] {
     if (!entry) continue; // non-<pid>.json, parse error, or forged server_pid
     const full = join(dir, file);
     if (!isAlive(entry.server_pid)) {
-      // Reap-deferral: a dead child's mailbox may still hold undrained mail
-      // that the session's union-drain (PreToolUse hook + read_my_messages)
-      // must reach. Keep the registry file as a routing breadcrumb until the
-      // mailbox is empty — but ONLY for a claimed (non-null session_id) entry:
-      // a null-session dead child is not identity-addressable, so retaining it
-      // would only grow ambiguity. Either way it is excluded from `live`.
-      const keepForMail =
-        entry.client.session_id != null && mailboxHasMessages(entry.server_pid);
-      if (!keepForMail) {
+      // Reap-deferral: keep a dead child's registry breadcrumb while it still
+      // carries a SIGNAL a reader or the cockpit must reach — undrained mail in
+      // the pid OR session box (the session union-drain must deliver it), OR an
+      // open obligation the stranded ⚑ derives from. deadBreadcrumbHasSignal is
+      // the SAME predicate gcDeadBreadcrumbs uses, so this messaging-path reaper
+      // can't erase a stranded signal the register-time GC was careful to keep
+      // (codex re-verify Finding 1 — the old pid-box-only rule here defeated the
+      // fix). A null-session dead child has no signal and isn't identity-
+      // addressable → reaped. Either way it is excluded from `live`.
+      if (!deadBreadcrumbHasSignal(entry)) {
         try {
           unlinkSync(full);
         } catch {

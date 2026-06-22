@@ -761,6 +761,47 @@ test("readAll: defers reaping a dead CLAIMED entry whose mailbox is non-empty", 
   });
 });
 
+test("readAll: KEEPS a dead claimed entry with an OPEN OBLIGATION — the messaging path can't erase the stranded ⚑ (Finding 1)", () => {
+  withTempHome((home) => {
+    const dir = join(home, ".oxtail", "sessions");
+    mkdirSync(dir, { recursive: true });
+    const dead = deadPid();
+    writeFileSync(
+      join(dir, `${dead}.json`),
+      JSON.stringify(makeRegistryEntry({ pid: dead, session_id: "uuid-owes", started_at: 1 })),
+    );
+    // The obligation lives in the LEDGER; pid + session boxes are empty. The old
+    // pid-box-only rule reaped this on the messaging path, erasing the stranded ⚑.
+    recordReceived("uuid-owes", mailbox.buildMessage("review it", "boss", { action_required: true }));
+    const result = readAll();
+    assert.equal(result.length, 0, "dead entry excluded from live[]");
+    assert.ok(
+      existsSync(join(dir, `${dead}.json`)),
+      "readAll keeps the breadcrumb — an open obligation is a stranded signal, not pure noise",
+    );
+  });
+});
+
+test("readAll: KEEPS a dead claimed entry with SESSION-box mail (Finding 1)", () => {
+  withTempHome((home) => {
+    const dir = join(home, ".oxtail", "sessions");
+    mkdirSync(dir, { recursive: true });
+    const dead = deadPid();
+    writeFileSync(
+      join(dir, `${dead}.json`),
+      JSON.stringify(makeRegistryEntry({ pid: dead, session_id: "uuid-stranded", started_at: 1 })),
+    );
+    // v0.17 mail in the SESSION box, pid box empty — the old rule reaped it here.
+    mailbox.enqueue(mailbox.mailboxSessionKey("uuid-stranded"), "unread v0.17 mail");
+    const result = readAll();
+    assert.equal(result.length, 0, "dead entry excluded from live[]");
+    assert.ok(
+      existsSync(join(dir, `${dead}.json`)),
+      "readAll keeps the breadcrumb — session-box mail is a stranded ✉, not pure noise",
+    );
+  });
+});
+
 test("readAll: reaps a dead entry with an empty mailbox immediately", () => {
   withTempHome((home) => {
     const dir = join(home, ".oxtail", "sessions");
