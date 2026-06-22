@@ -26,6 +26,7 @@ import {
   isAlive,
   processStartSig,
   readAllPassive,
+  resolveJumpablePids,
   sessionPidsForId,
   type RegistryEntry,
 } from "../registry.js";
@@ -207,6 +208,13 @@ export type FleetSnapshot = {
   generated_at: number; // unix seconds
   self_session_id: string | null;
   agents: FleetAgent[];
+  // DETACHED background processes that registered a breadcrumb but own NO tmux pane —
+  // MCP children / `codex exec` subprocesses oxpit can't jump/nudge/kill (a jump only
+  // ever fails "couldn't verify a live pane"). Split OUT of `agents` so they don't
+  // clutter the navigable fleet or get mis-counted as "awaiting you"; surfaced as a
+  // footer count + still consulted for comms/wait-graph label resolution. Optional so
+  // pre-existing FleetSnapshot literals (tests) keep compiling; readers default to [].
+  background?: FleetAgent[];
   cycles: WaitCycle[];
   warnings: string[];
 };
@@ -237,6 +245,22 @@ export type BuildSnapshotOptions = {
   // call (window label + the orthogonal pane-recent hint). Injectable for tests /
   // to disable (return new Map()).
   resolvePaneInfo?: () => Map<string, PaneInfo>;
+  // Resolve which server pids currently own a live tmux pane (process-subtree
+  // ancestry — the SAME signal `jump` uses). Drives the background/foreground split.
+  // Defaults to the real batched resolver; injectable so tests can declare a fleet's
+  // jumpable set without live tmux/ps. Set false in opts.classifyBackground to skip.
+  resolveJumpablePids?: (serverPids: number[]) => Set<number>;
+  // Disable the background-process split entirely (keep every entry in `agents`).
+  // Default: classify when tmux pane info is available. A safety/escape hatch.
+  classifyBackground?: boolean;
+  // Liveness probe (process.kill(pid,0)). Defaults to the real registry isAlive;
+  // injectable so tests can stand up a multi-pid fleet without live OS processes.
+  isAlive?: (pid: number) => boolean;
+  // Pending-ask map (requester session_id → live pending ask) that sources each
+  // agent's wait-edge. Injectable so a test can stand up a WAITING agent without
+  // writing the on-disk pending-ask registry (covers codex #4 — a waiting detached
+  // process must stay foreground, not collapse into the background footer).
+  pending?: Map<string, PendingAsk>;
 };
 
 function errMsg(e: unknown): string {
@@ -419,6 +443,7 @@ type AgentCtx = {
   checkProcSig: boolean;
   readActivity: boolean;
   paneInfo: Map<string, PaneInfo>;
+  isAlive: (pid: number) => boolean;
 };
 
 function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
@@ -429,7 +454,7 @@ function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
   // some writer's readAll reaps its breadcrumb). Without this an exited agent
   // would fall through to transcript-mtime and read 🟡idle, and the headline
   // "orphaned wait — target dead" could never fire for a REAL dead target (max H2).
-  const pidAlive = isAlive(e.server_pid);
+  const pidAlive = ctx.isAlive(e.server_pid);
 
   // proc_sig pid-reuse guard: a recycled pid (now an unrelated process) has a
   // different start-time signature than the one captured at register time. Only
@@ -687,6 +712,7 @@ export function buildSnapshot(opts: BuildSnapshotOptions = {}): FleetSnapshot {
       generated_at: nowSec,
       self_session_id: selfSessionId,
       agents: [],
+      background: [],
       cycles: [],
       warnings: [`registry read failed: ${errMsg(e)}`],
     };
@@ -702,7 +728,7 @@ export function buildSnapshot(opts: BuildSnapshotOptions = {}): FleetSnapshot {
         }
       });
 
-  const pending = readPendingAsks(nowMs);
+  const pending = opts.pending ?? readPendingAsks(nowMs);
   // H1-KILLER (max's synergy): a pending-ask whose reply is observable in the
   // requester's OWN ledger (reply_to == its request_id) has been ANSWERED — so the
   // agent is NOT waiting, even though the pending-ask file lingers up to an hour.
@@ -731,6 +757,7 @@ export function buildSnapshot(opts: BuildSnapshotOptions = {}): FleetSnapshot {
     checkProcSig,
     readActivity,
     paneInfo,
+    isAlive: opts.isAlive ?? isAlive,
   };
 
   const agents: FleetAgent[] = [];
@@ -753,12 +780,56 @@ export function buildSnapshot(opts: BuildSnapshotOptions = {}): FleetSnapshot {
 
   agents.sort(compareByWindow);
 
+  // Partition off DETACHED background processes — registered MCP children / `codex
+  // exec` subprocesses that own no tmux pane, so jump/nudge/kill can't reach them
+  // (these are the rows that fail "couldn't verify a live pane"). Collapsing them to a
+  // footer keeps the navigable fleet clean and keeps them OFF the "awaiting you"
+  // worklist (an un-jumpable idle row is not your move). Three guard rails so a REAL
+  // fleet is NEVER hidden:
+  //   • only when tmux pane info is actually present — otherwise we can't tell
+  //     "detached" from "oxpit simply isn't in tmux", so we keep everyone;
+  //   • dead agents stay foreground (⚫dead + orphaned-wait surfacing is intentional);
+  //   • never collapse the WHOLE fleet — at least one jumpable foreground must remain,
+  //     which covers a flaky ps/tmux read or a genuinely all-detached environment.
+  let foreground = agents;
+  let background: FleetAgent[] = [];
+  const tmuxAvailable = paneInfo.size > 0;
+  if (tmuxAvailable && opts.classifyBackground !== false) {
+    let jumpable: Set<number> | null = null;
+    try {
+      jumpable = (opts.resolveJumpablePids ?? resolveJumpablePids)(agents.map((a) => a.server_pid));
+    } catch (err) {
+      warnings.push(`background classification skipped: ${errMsg(err)}`);
+    }
+    if (jumpable) {
+      // A WAITING agent (a pending ask / obligation wait-edge) is NOT idle clutter:
+      // its wait must stay on the wait-graph and in the --check trouble count —
+      // especially an orphaned or deadlocked one — even when it is an un-jumpable
+      // detached process (codex #4: a bg-collapsed waiter otherwise vanishes from
+      // the graph unless it happens to be in a retained cycle). So keep any waiter
+      // foreground; only collapse genuinely-idle un-jumpable rows.
+      const fg = agents.filter(
+        (a) => a.liveness === "dead" || jumpable!.has(a.server_pid) || a.waiting != null,
+      );
+      const bg = agents.filter(
+        (a) => a.liveness !== "dead" && !jumpable!.has(a.server_pid) && a.waiting == null,
+      );
+      // Never hide the entire fleet: an empty table under a "+N background" footer is
+      // worse than the un-jumpable rows (likely a misfiring resolver or all-detached).
+      if (fg.length > 0 && bg.length > 0) {
+        foreground = fg;
+        background = bg;
+      }
+    }
+  }
+
   return {
     schema_version: 1,
     project_root: projectRoot,
     generated_at: nowSec,
     self_session_id: selfSessionId,
-    agents,
+    agents: foreground,
+    background,
     cycles,
     warnings,
   };

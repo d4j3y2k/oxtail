@@ -71,11 +71,16 @@ test("[it] plain send to a claimed IDLE peer → stranded_until_read, and NO wak
   });
 });
 
-test("[it] plain send to a claimed peer with NO activity marker → unknown_liveness", async () => {
+test("[it] plain send to a claimed HOOKLESS peer (no marker) → fires a wake, no advisory", async () => {
   await withTempHome(async () => {
+    // A hookless peer (Codex) has no passive delivery, so a plain send is wake-or-never:
+    // resolveSendWake now FIRES the wake instead of merely advising unknown_liveness.
+    // peer() has tmux_pane:null, so the wake can't land a keystroke → skipped_no_target
+    // (deterministic without live tmux) — the point is a wake_status, not an advisory.
     const r = await resolveSendWake(peer(SID), undefined, undefined);
-    assert.equal(r.delivery_outlook, "unknown_liveness");
-    assert.equal(r.wake_status, undefined);
+    assert.equal(r.wake_reason, "hookless_default");
+    assert.equal(r.wake_status, "skipped_no_target");
+    assert.equal(r.delivery_outlook, undefined, "wakes instead of stranding silently");
   });
 });
 

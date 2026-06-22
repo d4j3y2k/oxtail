@@ -757,3 +757,97 @@ test("renderCommsLog: scrubs ESC/bidi from an untrusted message body", () => {
   assert.ok(!out.includes("\x1b[31m"), "raw ESC sequence stripped from body");
   assert.ok(!out.includes("‮"), "bidi override stripped from body");
 });
+
+// ── background (detached) process collapse ──────────────────────────────────────
+
+test("renderSnapshot: detached background processes collapse to a footer, off the table + worklist", () => {
+  const main = agent({
+    short_id: "aaaa1111",
+    window_name: "main",
+    liveness: "active",
+    liveness_reason: "transcript_fresh",
+    awaiting_human: false,
+  });
+  const max = agent({ short_id: "bbbb2222", window_name: "max" });
+  const codex = agent({ short_id: "cccc3333", window_name: "codex", client_type: "codex" });
+  // Detached: pane-less, not jumpable — what the cockpit collapses.
+  const bgClaimed = agent({
+    short_id: "019eebb0",
+    window_name: null,
+    client_type: "codex",
+    tmux_pane: null,
+    window_index: null,
+  });
+  const bgPid = agent({
+    short_id: "pid:88827",
+    window_name: null,
+    client_type: "codex",
+    liveness_reason: "no_transcript",
+    transcript_age_s: null,
+    tmux_pane: null,
+    window_index: null,
+  });
+
+  const s = snap([main, max, codex], { background: [bgClaimed, bgPid] });
+  const out = renderSnapshot(s, { color: false, width: 100 });
+
+  // Header acknowledges the count; a collapsed (▸) section header replaces N rows.
+  assert.ok(out.includes("3 agents (1 active)  +2 bg"), "header shows foreground count + bg suffix");
+  assert.ok(
+    out.includes("▸ 2 background processes (detached — no tmux pane, not jumpable) · b to show"),
+    "a collapsed section header stands in for the detached processes",
+  );
+
+  // The phantom rows are NOT in the navigable table (collapsed), nor named "awaiting you".
+  assert.ok(!out.includes("019eebb0"), "collapsed agent must not appear as a row");
+  assert.ok(!out.includes("pid:88827"), "collapsed agent must not appear as a row");
+  assert.ok(out.includes("awaiting you: max, codex"), "only real idle agents are the worklist");
+});
+
+test("renderSnapshot: showBackground expands the detached section into distinct dim rows", () => {
+  const main = agent({
+    short_id: "aaaa1111",
+    window_name: "main",
+    liveness: "active",
+    liveness_reason: "transcript_fresh",
+    awaiting_human: false,
+  });
+  const bgClaimed = agent({
+    short_id: "019eebb0",
+    window_name: null,
+    client_type: "codex",
+    server_pid: 5101,
+    tmux_pane: null,
+    window_index: null,
+  });
+  const bgPid = agent({
+    short_id: "pid:88827",
+    window_name: null,
+    client_type: "codex",
+    server_pid: 88827,
+    liveness_reason: "no_transcript",
+    transcript_age_s: null,
+    tmux_pane: null,
+    window_index: null,
+  });
+
+  const s = snap([main], { background: [bgClaimed, bgPid] });
+  const out = renderSnapshot(s, { color: false, width: 100, showBackground: true });
+
+  // Expanded header (▾ + "b to hide"), then the individual rows ARE shown, with the
+  // real server pid so the operator can confirm "is this real?".
+  assert.ok(out.includes("▾ 2 background processes (detached — no tmux pane, not jumpable) · b to hide"));
+  assert.ok(out.includes("019eebb0") && out.includes("pid 5101"), "claimed detached row + its pid");
+  assert.ok(out.includes("pid:88827"), "unclaimed detached row shown");
+  // main remains the only real agent in the count; the section rows are not fleet rows.
+  assert.ok(out.includes("1 agent (1 active)  +2 bg"));
+});
+
+test("renderSnapshot: no background ⇒ no footer, no +bg suffix (unchanged)", () => {
+  const out = renderSnapshot(snap([agent({ short_id: "aaaa1111", window_name: "main" })]), {
+    color: false,
+    width: 100,
+  });
+  assert.ok(!out.includes("background"), "no footer when there are no detached processes");
+  assert.ok(!out.includes("+1 bg") && !out.includes("+0 bg"), "no +bg suffix in the header");
+});

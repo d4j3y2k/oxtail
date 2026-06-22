@@ -2929,7 +2929,7 @@ test("messaging: send_message wake:auto with no tmux target returns skipped_no_t
   }
 });
 
-test("messaging: send_message without wake carries no wake_status (contract preserved)", async () => {
+test("messaging: plain send to a HOOKED idle peer carries no wake_status (fire-and-forget preserved)", async () => {
   const server = await spawnServer();
   try {
     const peerSid = "2c2c2c2c-3d3d-4e4e-5f5f-606060606060";
@@ -2939,12 +2939,46 @@ test("messaging: send_message without wake carries no wake_status (contract pres
       tmux_session: "quiet-peer",
       cwd: server.home,
     });
-    const res = await callTool<SendOk & { wake_status?: string }>(server.client, "send_message", {
-      target: peerSid,
-      body: "no wake",
-    });
+    // An activity marker = the peer has hooks (its Stop/UserPromptSubmit hooks deliver
+    // mail at its next turn), so a plain send stays fire-and-forget — no wake, just the
+    // delivery-outlook advisory. This is the contract that's PRESERVED.
+    seedActivity(server.home, peerSid, "idle");
+    const res = await callTool<SendOk & { wake_status?: string; delivery_outlook?: string }>(
+      server.client,
+      "send_message",
+      { target: peerSid, body: "no wake" },
+    );
     assert.equal(res.ok, true);
-    assert.equal(res.wake_status, undefined, "default send_message must not wake");
+    assert.equal(res.wake_status, undefined, "plain send to a hooked peer must not wake");
+    assert.equal(res.delivery_outlook, "stranded_until_read", "hooked idle peer gets the advisory");
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("messaging: plain send to a HOOKLESS peer fires a wake (wake-or-never, not a black hole)", async () => {
+  const server = await spawnServer();
+  try {
+    const peerSid = "7a7a7a7a-8b8b-4c4c-9d9d-0e0e0e0e0e0e";
+    // No activity marker → hookless (Codex). A plain send to such a peer has no passive
+    // delivery, so resolveSendWake now FIRES the wake instead of silently stranding it.
+    // tmux_session has no live pane in the test env, so the wake can't land a keystroke
+    // → skipped_no_target — the point is a wake was ATTEMPTED (wake_status present).
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: peerSid,
+      tmux_session: "hookless-peer",
+      cwd: server.home,
+    });
+    const res = await callTool<SendOk & { wake_status?: string; wake_reason?: string; delivery_outlook?: string }>(
+      server.client,
+      "send_message",
+      { target: peerSid, body: "do the thing" },
+    );
+    assert.equal(res.ok, true);
+    assert.equal(res.wake_reason, "hookless_default");
+    assert.ok(res.wake_status !== undefined, "a wake was attempted, not silently skipped");
+    assert.equal(res.delivery_outlook, undefined, "wakes instead of just advising");
   } finally {
     await server.cleanup();
   }

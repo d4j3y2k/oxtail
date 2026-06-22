@@ -290,6 +290,28 @@ export function currentPaneForServerPid(serverPid: number): string | null {
   return findTmuxPaneByAncestry(serverPid, listTmuxPanePids(), listAllPpids());
 }
 
+// Resolve, in ONE batched pass, which of the given server pids currently OWN a live
+// tmux pane — i.e. which agents `jump`/nudge/wake can actually reach. Uses the SAME
+// process-subtree ancestry signal as currentPaneForServerPid / chooseVerifiedWakePane,
+// but computes the pane-pid + ppid maps ONCE and reuses them for every pid, so it
+// stays a single `tmux list-panes` + single `ps` regardless of fleet size (calling
+// chooseVerifiedWakePane per agent re-execs BOTH on every call). Empty set when tmux
+// is absent / has no panes. The cockpit uses this to separate real, navigable fleet
+// windows from DETACHED background processes — registered MCP children and `codex
+// exec` subprocesses that own a registry entry but live in no tmux pane, so a jump to
+// them can only ever fail "couldn't verify a live pane".
+export function resolveJumpablePids(serverPids: Iterable<number>): Set<number> {
+  const panePids = listTmuxPanePids();
+  const out = new Set<number>();
+  if (panePids.size === 0) return out; // tmux absent / no panes — nothing is jumpable
+  const ppids = listAllPpids();
+  for (const pid of serverPids) {
+    const pane = findTmuxPaneByAncestry(pid, panePids, ppids);
+    if (pane && isValidTmuxPane(pane)) out.add(pid);
+  }
+  return out;
+}
+
 // The OS start-time signature (lstart) of a process, or "" if it can't be read
 // (dead pid, or ps unavailable). Same provenance signal claims.ts uses on
 // ancestor pids: an OS-recycled pid yields a DIFFERENT start time, so comparing
@@ -567,6 +589,23 @@ export function isAlive(pid: number): boolean {
     const err = e as NodeJS.ErrnoException;
     return err.code === "EPERM";
   }
+}
+
+// A child whose parent exits is reparented — to init/launchd (pid 1) on macOS and on
+// a Linux session with no subreaper, but to the nearest SUBREAPER (e.g. `systemd
+// --user`, which is NOT pid 1) on a Linux session that has one. Either way the ppid
+// CHANGES away from the one captured at startup. So a current ppid that DIFFERS from
+// our initial ppid (when we did not start under init) means our host process — the
+// codex/claude that spawned this MCP server — is gone, and the server is orphaned:
+// self-reap so it stops leaking a live, unclaimed registry breadcrumb. (Keying on
+// `=== 1` missed the Linux-subreaper reparent — L3 — leaving stdin-EOF as the only
+// backstop there.) An MCP stdio child's ppid is stable at the host's pid while the
+// host lives, so a CHANGED ppid is a reliable orphan signal, not a false alarm. Pure
+// so it's unit-testable; the server polls process.ppid against the startup ppid.
+// (initialPpid === 1 can't use this signal — a server genuinely launched under init
+// has no parent to lose — returns false; the caller falls back to stdin EOF.)
+export function parentLikelyDied(initialPpid: number, currentPpid: number): boolean {
+  return initialPpid !== 1 && currentPpid !== initialPpid;
 }
 
 export function readAll(): RegistryEntry[] {

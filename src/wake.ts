@@ -448,16 +448,25 @@ export async function resolveSendWake(
   if (wake === "auto") {
     return { wake_status: await wakeForSend(peer) };
   }
-  // The silent seam: a plain send with wake unset and no reply correlation. This
-  // is the ONLY path that returns no wake_status, so it is the only one that can
-  // strand without the sender knowing — attach the delivery-outlook advisory.
-  // (A wake:"off" caller also lands here; classifyDeliveryOutlook returns null
-  // for it — they chose fire-and-forget.) readActivity(null) is a no-op, so an
-  // unclaimed target costs no FS read; a claimed default-send costs one stat.
+  // The plain-send seam: wake unset, no reply correlation. readActivity(null) is a
+  // no-op, so an unclaimed target costs no FS read; a claimed default-send costs one stat.
   if (wake === undefined && !replyTo) {
+    const activity = readActivity(peer.client.session_id);
+    // A CLAIMED peer with NO activity marker is HOOKLESS (Codex, or Claude without
+    // hooks installed): it has no passive delivery — no Stop/UserPromptSubmit hook will
+    // ever surface this mail at a future turn — so a plain "delivered but not woken"
+    // send is a black hole that strands delegated work (the captain-waits-on-Codex
+    // stall). For such a peer a plain send is wake-or-never, so fire the (fresh-busy-
+    // gated) wake instead of merely advising. A HOOKED peer (has a marker) keeps
+    // fire-and-forget: its hooks deliver at its next turn, and classifyDeliveryOutlook
+    // flags that it won't read until then. wake:"off" never reaches here (wake is not
+    // undefined), so the explicit fire-and-forget opt-out is preserved.
+    if (peer.client.session_id != null && !activity) {
+      return { wake_status: await wakeForSend(peer), wake_reason: "hookless_default" };
+    }
     const delivery_outlook = classifyDeliveryOutlook({
       sessionId: peer.client.session_id ?? null,
-      activity: readActivity(peer.client.session_id),
+      activity,
       wake,
       replyTo,
     });
