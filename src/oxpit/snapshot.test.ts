@@ -795,6 +795,21 @@ test("buildSnapshot: nothing jumpable ⇒ never collapse the WHOLE fleet (no emp
   });
 });
 
+test("buildSnapshot: nothing jumpable BUT one agent waiting ⇒ STILL no collapse (anchor gate, CI no-tmux repro)", () => {
+  withHome((home) => {
+    const { entries, deps } = phantomFleet(home);
+    // One detached agent is WAITING. The old guard keyed on a non-empty foreground —
+    // so when nothing is jumpable (process.pid isn't jumpable off-tmux, e.g. CI), a
+    // lone waiter became the only "foreground" and collapsed every non-waiter. The
+    // anchor gate requires a real jumpable/dead anchor before splitting, so the whole
+    // fleet stays foreground — the waiter included.
+    recordPendingAsk(defaultPendingAskDir(), "019eebb0-0000-0000-0000-000000000000", "req-anchor", NOW_MS);
+    const snap = buildSnapshot({ readEntries: () => entries, ...deps, resolveJumpablePids: () => new Set() });
+    assert.equal(snap.agents.length, 6, "no jumpable/dead anchor ⇒ whole fleet foreground, waiter and all");
+    assert.equal((snap.background ?? []).length, 0, "a lone waiter must not trigger the collapse");
+  });
+});
+
 test("buildSnapshot: a DEAD un-jumpable agent stays foreground (⚫dead + orphaned-wait visibility)", () => {
   withHome((home) => {
     const { entries, deps } = phantomFleet(home);

@@ -805,19 +805,22 @@ export function buildSnapshot(opts: BuildSnapshotOptions = {}): FleetSnapshot {
       // A WAITING agent (a pending ask / obligation wait-edge) is NOT idle clutter:
       // its wait must stay on the wait-graph and in the --check trouble count —
       // especially an orphaned or deadlocked one — even when it is an un-jumpable
-      // detached process (codex #4: a bg-collapsed waiter otherwise vanishes from
-      // the graph unless it happens to be in a retained cycle). So keep any waiter
-      // foreground; only collapse genuinely-idle un-jumpable rows.
-      const fg = agents.filter(
-        (a) => a.liveness === "dead" || jumpable!.has(a.server_pid) || a.waiting != null,
-      );
+      // detached process (codex #4). So keep any waiter foreground; only collapse
+      // genuinely-idle un-jumpable rows.
       const bg = agents.filter(
         (a) => a.liveness !== "dead" && !jumpable!.has(a.server_pid) && a.waiting == null,
       );
-      // Never hide the entire fleet: an empty table under a "+N background" footer is
-      // worse than the un-jumpable rows (likely a misfiring resolver or all-detached).
-      if (fg.length > 0 && bg.length > 0) {
-        foreground = fg;
+      // The split fires ONLY when there's a real jumpable/dead ANCHOR in the fleet.
+      // A fleet where nothing is jumpable (oxpit not in tmux, or a resolver miss)
+      // stays WHOLE — the "never collapse the entire fleet" guard. Crucially the
+      // trigger keys on that anchor, NOT on the (now waiter-inclusive) foreground:
+      // otherwise a lone waiter in a no-jumpable env would background every non-waiter
+      // (the CI no-tmux repro that the original empty-fg guard happened to prevent).
+      const anchored = agents.some((a) => a.liveness === "dead" || jumpable!.has(a.server_pid));
+      if (anchored && bg.length > 0) {
+        foreground = agents.filter(
+          (a) => a.liveness === "dead" || jumpable!.has(a.server_pid) || a.waiting != null,
+        );
         background = bg;
       }
     }
