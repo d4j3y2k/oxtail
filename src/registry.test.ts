@@ -28,6 +28,7 @@ import {
   type RegistryEntry,
 } from "./registry.js";
 import * as mailbox from "./mailbox.js";
+import { recordReceived, countOpenObligations } from "./received.js";
 // IMPORTANT: import from list-shape.js, NOT server.js — importing server.js
 // runs its top-level register() and turns the test process into a live oxtail
 // agent against the real $HOME (real registry entry + orphan-mailbox GC).
@@ -652,6 +653,52 @@ test("register: does NOT reap a dead cross-session entry that still holds undrai
     assert.ok(
       existsSync(join(dir, `${deadGhost}.json`)),
       "a dead breadcrumb with pending mail is kept (reap-deferral) even cross-session — no deliverable mail dropped",
+    );
+  });
+});
+
+test("register: KEEPS a dead cross-session entry whose SESSION box holds mail (stranded ✉ preserved)", () => {
+  withTempHome((home) => {
+    const dir = join(home, ".oxtail", "sessions");
+    mkdirSync(dir, { recursive: true });
+    const deadGhost = deadPid();
+    writeFileSync(
+      join(dir, `${deadGhost}.json`),
+      JSON.stringify(makeRegistryEntry({ pid: deadGhost, session_id: "uuid-stranded", started_at: 1 })),
+    );
+    // v0.17 mail lives in the SESSION box, not the pid box (which is empty here).
+    // The pid-box-only keep-gate reaped this and erased the cockpit's stranded ✉
+    // for the dead owner — the bug max+codex caught. It must be KEPT.
+    mailbox.enqueue(mailbox.mailboxSessionKey("uuid-stranded"), "unread by a now-dead peer");
+    register(
+      makeRegistryEntry({ pid: process.pid, session_id: "uuid-current", started_at: 2 }),
+    );
+    assert.ok(
+      existsSync(join(dir, `${deadGhost}.json`)),
+      "session-box mail keeps the dead breadcrumb — stranded ✉ signal survives register",
+    );
+  });
+});
+
+test("register: KEEPS a dead cross-session entry with an OPEN OBLIGATION (stranded ⚑ preserved)", () => {
+  withTempHome((home) => {
+    const dir = join(home, ".oxtail", "sessions");
+    mkdirSync(dir, { recursive: true });
+    const deadGhost = deadPid();
+    writeFileSync(
+      join(dir, `${deadGhost}.json`),
+      JSON.stringify(makeRegistryEntry({ pid: deadGhost, session_id: "uuid-owes", started_at: 1 })),
+    );
+    // A delegation the dead session never closed lives in its LEDGER (pid box empty).
+    // Reaping would erase the cockpit's stranded ⚑ "work stranded on a dead owner".
+    recordReceived("uuid-owes", mailbox.buildMessage("review this", "boss-sid", { action_required: true }));
+    assert.equal(countOpenObligations("uuid-owes"), 1, "obligation is open before register");
+    register(
+      makeRegistryEntry({ pid: process.pid, session_id: "uuid-current", started_at: 2 }),
+    );
+    assert.ok(
+      existsSync(join(dir, `${deadGhost}.json`)),
+      "an open obligation keeps the dead breadcrumb — stranded ⚑ signal survives register",
     );
   });
 });
