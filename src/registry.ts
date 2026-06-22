@@ -502,15 +502,21 @@ export function isAlive(pid: number): boolean {
   }
 }
 
-// A child whose parent exits is reparented to init/launchd (pid 1). So a CURRENT
-// ppid of 1, when we did NOT start under pid 1, means our host process (the codex /
-// claude that spawned this MCP server) is gone — the server is orphaned and should
-// self-reap so it stops leaking a live, unclaimed registry breadcrumb. Pure so it's
-// unit-testable; the server polls process.ppid against the ppid captured at startup.
+// A child whose parent exits is reparented — to init/launchd (pid 1) on macOS and on
+// a Linux session with no subreaper, but to the nearest SUBREAPER (e.g. `systemd
+// --user`, which is NOT pid 1) on a Linux session that has one. Either way the ppid
+// CHANGES away from the one captured at startup. So a current ppid that DIFFERS from
+// our initial ppid (when we did not start under init) means our host process — the
+// codex/claude that spawned this MCP server — is gone, and the server is orphaned:
+// self-reap so it stops leaking a live, unclaimed registry breadcrumb. (Keying on
+// `=== 1` missed the Linux-subreaper reparent — L3 — leaving stdin-EOF as the only
+// backstop there.) An MCP stdio child's ppid is stable at the host's pid while the
+// host lives, so a CHANGED ppid is a reliable orphan signal, not a false alarm. Pure
+// so it's unit-testable; the server polls process.ppid against the startup ppid.
 // (initialPpid === 1 can't use this signal — a server genuinely launched under init
-// has no parent to lose — so it returns false and the caller falls back to stdin EOF.)
+// has no parent to lose — returns false; the caller falls back to stdin EOF.)
 export function parentLikelyDied(initialPpid: number, currentPpid: number): boolean {
-  return initialPpid !== 1 && currentPpid === 1;
+  return initialPpid !== 1 && currentPpid !== initialPpid;
 }
 
 export function readAll(): RegistryEntry[] {

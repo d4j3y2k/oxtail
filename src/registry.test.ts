@@ -881,6 +881,14 @@ test("parentLikelyDied: a live, unchanged parent ⇒ not orphaned", () => {
   assert.equal(parentLikelyDied(4242, 4242), false);
 });
 
+test("parentLikelyDied: reparenting to a Linux SUBREAPER (not pid 1) ⇒ host died (L3)", () => {
+  // On a Linux session with a subreaper (e.g. `systemd --user`) an orphan reparents
+  // to the subreaper's pid, NOT init — so keying on `=== 1` silently missed it and
+  // the watchdog never reaped. A ppid that simply CHANGED from our startup parent is
+  // the portable orphan signal.
+  assert.equal(parentLikelyDied(4242, 50), true, "ppid changed to the subreaper ⇒ original host gone");
+});
+
 test("parentLikelyDied: started under pid 1 ⇒ no parent to lose, signal unusable", () => {
   // A server genuinely launched by init/launchd can't use reparenting as a death
   // tell — it must fall back to stdin EOF — so this never reports a (false) death.
