@@ -755,6 +755,28 @@ test("buildSnapshot: detached pane-less processes collapse into background (scre
   });
 });
 
+test("buildSnapshot: a WAITING detached process stays FOREGROUND, not collapsed to background (codex #4)", () => {
+  withHome((home) => {
+    const { entries, deps } = phantomFleet(home);
+    // The detached CLAIMED codex now has a live pending-ask → it is WAITING. A wait
+    // (especially an orphaned/deadlocked one) must stay on the wait-graph + in
+    // --check, so a waiter must NOT vanish into the background footer.
+    const snap = buildSnapshot({
+      readEntries: () => entries,
+      ...deps,
+      pending: new Map([["019eebb0-0000-0000-0000-000000000000", { requestId: "r1", ageS: 30 }]]),
+    });
+    const fgIds = snap.agents.map((a) => a.short_id);
+    const bgIds = (snap.background ?? []).map((a) => a.short_id).sort();
+    assert.ok(fgIds.includes("019eebb0"), "a waiting detached process stays foreground");
+    const waiter = snap.agents.find((a) => a.short_id === "019eebb0")!;
+    assert.ok(waiter.waiting, "its wait-edge is present so the wait-graph can render it");
+    assert.equal(waiter.awaiting_human, false, "a waiter is not idle-at-prompt, so not on the worklist");
+    // The truly-idle detached phantoms (no wait) still collapse — the fix is targeted.
+    assert.deepEqual(bgIds, ["pid:5102", "pid:5103"]);
+  });
+});
+
 test("buildSnapshot: no tmux pane info ⇒ no background split (can't tell detached from not-in-tmux)", () => {
   withHome((home) => {
     const { entries, deps } = phantomFleet(home);

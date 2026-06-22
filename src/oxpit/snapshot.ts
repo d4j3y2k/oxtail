@@ -256,6 +256,11 @@ export type BuildSnapshotOptions = {
   // Liveness probe (process.kill(pid,0)). Defaults to the real registry isAlive;
   // injectable so tests can stand up a multi-pid fleet without live OS processes.
   isAlive?: (pid: number) => boolean;
+  // Pending-ask map (requester session_id → live pending ask) that sources each
+  // agent's wait-edge. Injectable so a test can stand up a WAITING agent without
+  // writing the on-disk pending-ask registry (covers codex #4 — a waiting detached
+  // process must stay foreground, not collapse into the background footer).
+  pending?: Map<string, PendingAsk>;
 };
 
 function errMsg(e: unknown): string {
@@ -723,7 +728,7 @@ export function buildSnapshot(opts: BuildSnapshotOptions = {}): FleetSnapshot {
         }
       });
 
-  const pending = readPendingAsks(nowMs);
+  const pending = opts.pending ?? readPendingAsks(nowMs);
   // H1-KILLER (max's synergy): a pending-ask whose reply is observable in the
   // requester's OWN ledger (reply_to == its request_id) has been ANSWERED — so the
   // agent is NOT waiting, even though the pending-ask file lingers up to an hour.
@@ -797,8 +802,18 @@ export function buildSnapshot(opts: BuildSnapshotOptions = {}): FleetSnapshot {
       warnings.push(`background classification skipped: ${errMsg(err)}`);
     }
     if (jumpable) {
-      const fg = agents.filter((a) => a.liveness === "dead" || jumpable!.has(a.server_pid));
-      const bg = agents.filter((a) => a.liveness !== "dead" && !jumpable!.has(a.server_pid));
+      // A WAITING agent (a pending ask / obligation wait-edge) is NOT idle clutter:
+      // its wait must stay on the wait-graph and in the --check trouble count —
+      // especially an orphaned or deadlocked one — even when it is an un-jumpable
+      // detached process (codex #4: a bg-collapsed waiter otherwise vanishes from
+      // the graph unless it happens to be in a retained cycle). So keep any waiter
+      // foreground; only collapse genuinely-idle un-jumpable rows.
+      const fg = agents.filter(
+        (a) => a.liveness === "dead" || jumpable!.has(a.server_pid) || a.waiting != null,
+      );
+      const bg = agents.filter(
+        (a) => a.liveness !== "dead" && !jumpable!.has(a.server_pid) && a.waiting == null,
+      );
       // Never hide the entire fleet: an empty table under a "+N background" footer is
       // worse than the un-jumpable rows (likely a misfiring resolver or all-detached).
       if (fg.length > 0 && bg.length > 0) {
