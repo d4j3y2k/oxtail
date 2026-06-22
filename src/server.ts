@@ -18,6 +18,7 @@ import { trace } from "./trace.js";
 import {
   buildEntry,
   findByTmuxSession,
+  parentLikelyDied,
   readAll,
   refreshTmuxBinding,
   register,
@@ -1171,7 +1172,7 @@ server.registerTool(
   {
     description: [
       "Fire-and-forget message to a peer in the same project root. Target: a tmux session name OR a client_session_id (UUID). Async via the peer's mailbox — delivered mid-turn (PreToolUse hook) or next-turn (read_my_messages); cross-project targets are rejected.",
-      "A plain message does NOT wake an idle peer. Pass wake:\"auto\" to nudge one via per-client send-keys, state-gated (skipped if the peer is mid-turn). EXCEPTION (wake-on-reply): when you set reply_to, this auto-wakes the requester by default so your answer doesn't strand them idle — pass wake:\"off\" to suppress. The reply-default wake is strictly gated: it fires only for a FRESHLY-IDLE requester (one whose Claude Code hooks maintain a fresh idle marker), with a per-target rate limit and a one-wake dedupe; env kill-switch OXTAIL_AUTOWAKE=off. A requester with no idle marker (Codex, or Claude without the hooks) returns skipped_no_fresh_idle and is NOT auto-woken — use explicit wake:\"auto\" for those. Response carries wake_status (\"fired\" | \"skipped_busy\" | \"skipped_debounced\" | \"skipped_no_fresh_idle\" | \"skipped_rate_limited\" | \"skipped_deduped\" | \"skipped_store_error\" | \"skipped_no_target\" | \"disabled\") and, on the reply path, wake_reason:\"reply_to_default\" — or wake_reason:\"late_reply_to_pending\" when this reply answers an ask_peer that had timed out (durably pulls the requester back regardless of the fresh-idle window; \"late_reply_to_pending_suppressed\" if you passed wake:\"off\"). DELIVERY OUTLOOK: a plain send (wake unset, no reply_to) to a CLAIMED peer that won't read it this turn also returns delivery_outlook (\"stranded_until_read\" = idle/stale-busy, read only at its next turn or a wake; \"unknown_liveness\" = Codex/hookless, no activity marker) plus a hint to the right verb (ask_peer / action_required / wake); omitted when the peer is mid-turn (its hooks deliver) or you woke it.",
+      "A plain message does NOT wake a HOOKED peer (one whose Claude Code hooks deliver mail at its next turn) — pass wake:\"auto\" to nudge it via per-client send-keys, state-gated (skipped if the peer is mid-turn). A plain message TO A HOOKLESS peer (Codex, or Claude without hooks: no activity marker) DOES fire that wake automatically (wake_reason:\"hookless_default\"): such a peer has no passive delivery, so a plain send would otherwise be a black hole — wake-or-never. EXCEPTION (wake-on-reply): when you set reply_to, this auto-wakes the requester by default so your answer doesn't strand them idle — pass wake:\"off\" to suppress (also the explicit fire-and-forget opt-out for the hookless-default wake). The reply-default wake is strictly gated: it fires only for a FRESHLY-IDLE requester (one whose Claude Code hooks maintain a fresh idle marker), with a per-target rate limit and a one-wake dedupe; env kill-switch OXTAIL_AUTOWAKE=off. A requester with no idle marker (Codex, or Claude without the hooks) returns skipped_no_fresh_idle on the reply path and is NOT auto-woken — use explicit wake:\"auto\" for those. Response carries wake_status (\"fired\" | \"skipped_busy\" | \"skipped_debounced\" | \"skipped_no_fresh_idle\" | \"skipped_rate_limited\" | \"skipped_deduped\" | \"skipped_store_error\" | \"skipped_no_target\" | \"disabled\") and, on the reply path, wake_reason:\"reply_to_default\" — or wake_reason:\"late_reply_to_pending\" when this reply answers an ask_peer that had timed out (durably pulls the requester back regardless of the fresh-idle window; \"late_reply_to_pending_suppressed\" if you passed wake:\"off\"). DELIVERY OUTLOOK: a plain send (wake unset, no reply_to) to a CLAIMED, HOOKED peer that won't read it this turn returns delivery_outlook:\"stranded_until_read\" (idle/stale-busy, read only at its next turn or a wake) plus a hint to the right verb (ask_peer / action_required / wake); omitted when the peer is mid-turn (its hooks deliver), when you woke it, or when it was hookless-default woken.",
       "Body is verbatim — wrap in <system-reminder>...</system-reminder> yourself if you want that framing. When replying to ask_peer, include reply_to: request_id from the inbound message. For a blocking send-and-wait, use ask_peer instead.",
     ].join(" "),
     inputSchema: {
@@ -1190,7 +1191,7 @@ server.registerTool(
         .enum(["off", "auto"])
         .optional()
         .describe(
-          'Wake strategy. Default (unset): no nudge for a plain message, but a reply (reply_to set) auto-wakes a freshly-idle requester. "off": pure fire-and-forget, no nudge even for a reply. "auto": nudge an idle peer via per-client send-keys, state-gated (skipped if the peer is mid-turn). Response carries wake_status when set.',
+          'Wake strategy. Default (unset): no nudge for a plain message to a HOOKED peer, but a plain message to a HOOKLESS peer (Codex / no activity marker) auto-wakes it (wake-or-never), and a reply (reply_to set) auto-wakes a freshly-idle requester. "off": pure fire-and-forget, no nudge even for a reply or a hookless peer. "auto": nudge an idle peer via per-client send-keys, state-gated (skipped if the peer is mid-turn). Response carries wake_status when set.',
         ),
       reply_to: z
         .string()
@@ -2339,8 +2340,42 @@ const invokedDirectly =
   typeof process.argv[1] === "string" &&
   import.meta.url === new URL(process.argv[1], "file:").href;
 
+// How often the orphan watchdog polls for reparenting. 30s is well below any human
+// patience for a stale row, and the poll is unref'd so it never keeps us alive.
+const ORPHAN_WATCHDOG_MS = 30_000;
+
 if (invokedDirectly) {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   await maybeHookHint();
+
+  // Orphan self-reap. This MCP server exists ONLY to serve the host agent (codex /
+  // claude) that spawned it. The SIGINT/SIGTERM/exit handlers above cover a CLEAN host
+  // shutdown — but a host that dies UNCLEANLY (crash, SIGKILL, or just dropping our
+  // stdio pipe) used to leave this process running: pending late-redetect timers hold
+  // the event loop open, so it lingered forever holding a live, unclaimed registry
+  // breadcrumb — exactly the detached "pid:<n> no-tx" rows the cockpit kept listing,
+  // and the churn that breaks peer wake/target resolution. Exit on either tell of a
+  // dead host (process.exit runs the exit handler above → unregister):
+  //   1. our stdin (the host's pipe to us) hitting EOF / closing — the immediate signal;
+  //   2. being reparented to pid 1 — a backstop for a detached host whose death does
+  //      not EOF our stdin. Both are no-ops while the host is alive and serving.
+  let reaped = false;
+  const reap = (why: string): void => {
+    if (reaped) return;
+    reaped = true;
+    trace("orphan_reap", { server_pid: process.pid, ppid: process.ppid, why });
+    process.exit(0);
+  };
+  // 'end'/'close' listeners do NOT put stdin in flowing mode, so the transport's own
+  // reading is unaffected; they only fire when the host closes the pipe.
+  process.stdin.on("end", () => reap("stdin_end"));
+  process.stdin.on("close", () => reap("stdin_close"));
+  const initialPpid = process.ppid;
+  if (initialPpid !== 1) {
+    const watchdog = setInterval(() => {
+      if (parentLikelyDied(initialPpid, process.ppid)) reap("reparented");
+    }, ORPHAN_WATCHDOG_MS);
+    watchdog.unref?.();
+  }
 }

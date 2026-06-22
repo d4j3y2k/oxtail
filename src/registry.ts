@@ -502,6 +502,17 @@ export function isAlive(pid: number): boolean {
   }
 }
 
+// A child whose parent exits is reparented to init/launchd (pid 1). So a CURRENT
+// ppid of 1, when we did NOT start under pid 1, means our host process (the codex /
+// claude that spawned this MCP server) is gone — the server is orphaned and should
+// self-reap so it stops leaking a live, unclaimed registry breadcrumb. Pure so it's
+// unit-testable; the server polls process.ppid against the ppid captured at startup.
+// (initialPpid === 1 can't use this signal — a server genuinely launched under init
+// has no parent to lose — so it returns false and the caller falls back to stdin EOF.)
+export function parentLikelyDied(initialPpid: number, currentPpid: number): boolean {
+  return initialPpid !== 1 && currentPpid === 1;
+}
+
 export function readAll(): RegistryEntry[] {
   const dir = registryDir();
   if (!existsSync(dir)) return [];

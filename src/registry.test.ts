@@ -20,6 +20,7 @@ import {
   findTmuxPaneByAncestry,
   isValidTmuxPane,
   isValidTmuxSession,
+  parentLikelyDied,
   readAll,
   readEntryFile,
   register,
@@ -869,4 +870,19 @@ test("phase-c: compact shape is smaller than the flat shape for multi-agent sess
     compactBytes < flatBytes,
     `compact (${compactBytes}) must be smaller than flat (${flatBytes}) for 4 co-located agents`,
   );
+});
+
+// ── parentLikelyDied: orphan self-reap signal (MCP server whose host died) ───────
+test("parentLikelyDied: reparenting to pid 1 from a real parent ⇒ host died", () => {
+  assert.equal(parentLikelyDied(4242, 1), true, "had a real parent, now reparented to init");
+});
+
+test("parentLikelyDied: a live, unchanged parent ⇒ not orphaned", () => {
+  assert.equal(parentLikelyDied(4242, 4242), false);
+});
+
+test("parentLikelyDied: started under pid 1 ⇒ no parent to lose, signal unusable", () => {
+  // A server genuinely launched by init/launchd can't use reparenting as a death
+  // tell — it must fall back to stdin EOF — so this never reports a (false) death.
+  assert.equal(parentLikelyDied(1, 1), false);
 });
