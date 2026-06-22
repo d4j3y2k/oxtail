@@ -372,6 +372,12 @@ export function register(entry: RegistryEntry): void {
   // undrained mail into us first. Leaves live siblings alone; readAll() collapses
   // those by session_id.
   gcDeadSiblings(entry);
+  // Then reap a PRIOR incarnation's fully-exited breadcrumbs (different
+  // session_id, dead pid, empty mailbox) that gcDeadSiblings leaves alone and
+  // an idle messaging path never drives readAll() over — otherwise they linger
+  // as ⚫dead·gone ghost rows in the cockpit. Mail-safe (readAll()'s own rule).
+  // Skip our own freshly-published breadcrumb (entry.server_pid).
+  gcDeadBreadcrumbs(entry.server_pid);
   // Finally sweep mailbox files nothing can route to anymore (empty + old +
   // unreferenced) — registry reaping removes the breadcrumbs but used to leave
   // the 0-byte box files behind forever. register() also re-fires on claim /
@@ -458,6 +464,55 @@ function gcDeadSiblings(entry: RegistryEntry): void {
       } catch {
         // already gone, fine
       }
+    }
+  }
+}
+
+// Reap dead breadcrumbs across ALL sessions, applying readAll()'s exact
+// (already-accepted, mail-safe) dead-entry rule. WHY a second home for it:
+// readAll() does reap dead entries, but it only runs on the peer-messaging /
+// target-resolution path — an idle or freshly-restarted fleet may not call it
+// for a long time. So a PRIOR incarnation's dead, claimed, empty-mailbox
+// breadcrumbs linger on disk, and readAllPassive() (the cockpit's read-only
+// view) faithfully renders them as ⚫dead·gone ghost rows — with the stranded
+// ⚑ flag when their session box still holds an obligation a dead session will
+// never close. gcDeadSiblings() doesn't catch these: it only touches dead
+// entries that share the REGISTERING session's id (the pid-rotation drain),
+// never a different, fully-exited session. register() fires on every (re)start,
+// which is exactly when those corpses appear, so sweep them here.
+//
+// Mail-safe by construction: identical keep-condition to readAll() — a claimed
+// dead breadcrumb whose pid mailbox still holds undrained mail is LEFT for the
+// reap-deferral / union-drain, so no deliverable mail is dropped. Conservative
+// on any mailbox-probe error (keep, never reap on uncertainty). Best-effort;
+// never throws — housekeeping must not break register().
+//
+// `skipPid` is the breadcrumb register() just published: never reap the entry
+// we're registering in this very call. In production it's always our live pid
+// (so moot), but a caller registering a breadcrumb on behalf of an
+// already-dead pid (test fixtures simulating a dead peer; a breadcrumb written
+// before its mail lands) must not have it yanked out from under them between
+// write and use.
+export function gcDeadBreadcrumbs(skipPid?: number): void {
+  const dir = registryDir();
+  if (!existsSync(dir)) return;
+  for (const file of readdirSync(dir)) {
+    const entry = readEntryFile(dir, file);
+    if (!entry) continue; // non-<pid>.json, parse error, or forged server_pid
+    if (skipPid != null && entry.server_pid === skipPid) continue;
+    if (isAlive(entry.server_pid)) continue;
+    let keepForMail: boolean;
+    try {
+      keepForMail =
+        entry.client.session_id != null && mailboxHasMessages(entry.server_pid);
+    } catch {
+      keepForMail = true; // never reap on uncertainty
+    }
+    if (keepForMail) continue;
+    try {
+      unlinkSync(join(dir, file));
+    } catch {
+      // already gone, fine
     }
   }
 }

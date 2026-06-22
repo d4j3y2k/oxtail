@@ -610,6 +610,52 @@ test("register: leaves live sibling alone (legitimate multi-scope case)", () => 
   });
 });
 
+test("register: reaps a PRIOR incarnation's dead entry from a DIFFERENT session (cross-session ghost-row gap)", () => {
+  withTempHome((home) => {
+    const dir = join(home, ".oxtail", "sessions");
+    mkdirSync(dir, { recursive: true });
+    // A previous fleet's agent (its own session_id), now exited with an empty
+    // mailbox. gcDeadSiblings leaves it alone (different session_id) and an idle
+    // fleet may never drive readAll() over it — so without this it lingers as a
+    // ⚫dead·gone ghost row in the cockpit forever.
+    const deadGhost = deadPid();
+    writeFileSync(
+      join(dir, `${deadGhost}.json`),
+      JSON.stringify(makeRegistryEntry({ pid: deadGhost, session_id: "uuid-prior", started_at: 1 })),
+    );
+    // The restarted fleet registers a fresh, unrelated session.
+    register(
+      makeRegistryEntry({ pid: process.pid, session_id: "uuid-current", started_at: 2 }),
+    );
+    const files = readdirSync(dir).filter((f) => f.endsWith(".json"));
+    assert.deepEqual(
+      files,
+      [`${process.pid}.json`],
+      "prior incarnation's empty dead breadcrumb reaped at register; only the live one remains",
+    );
+  });
+});
+
+test("register: does NOT reap a dead cross-session entry that still holds undrained mail (mail-safe)", () => {
+  withTempHome((home) => {
+    const dir = join(home, ".oxtail", "sessions");
+    mkdirSync(dir, { recursive: true });
+    const deadGhost = deadPid();
+    writeFileSync(
+      join(dir, `${deadGhost}.json`),
+      JSON.stringify(makeRegistryEntry({ pid: deadGhost, session_id: "uuid-prior", started_at: 1 })),
+    );
+    mailbox.enqueue(deadGhost, "left for a now-dead peer"); // undrained mail
+    register(
+      makeRegistryEntry({ pid: process.pid, session_id: "uuid-current", started_at: 2 }),
+    );
+    assert.ok(
+      existsSync(join(dir, `${deadGhost}.json`)),
+      "a dead breadcrumb with pending mail is kept (reap-deferral) even cross-session — no deliverable mail dropped",
+    );
+  });
+});
+
 // ────────────────────────────────────────────────────────────────────────────
 // session_id union drain + reap-deferral + dead-sibling consolidation
 // (fixes silent message loss on MCP-child pid rotation)
