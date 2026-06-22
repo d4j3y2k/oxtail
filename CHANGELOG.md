@@ -8,6 +8,54 @@ behavioral changes). Dates are release dates of the published npm tag.
 The hook protocol has its own version (`HOOK_MARKER_VERSION`); when it bumps,
 re-run `npx oxtail install-hook`. The current hook version is noted per release.
 
+## [0.25.0] — 2026-06-22
+
+**Reliability hardening — silent-failure drift, found by a live multi-agent
+pressure-test.** The delivery core was sound, but the observability/actuation layer
+around it had drifted: best-effort, never-throw guards were turning hard failures into
+*silent* ones, and the suite asserted the happy-path contract, never the emergent one.
+An adversarial review by the Claude+Codex fleet surfaced the pattern and the bugs —
+several the green suite couldn't see. Every fix ships with a test asserting the
+*emergent* contract.
+
+- **Durable delegation survives disk pressure.** `deliverToPeer` recorded the
+  obligation ledger, enqueued the mailbox line, and *swallowed* a ledger-write failure
+  — so under low disk an `action_required` delegation could land in the mailbox with no
+  ledger entry, invisible to `my_open_work`: durability silently voided. It now **fails
+  loud** on a ledger-write failure (aborts before enqueue → the sender retries).
+  Ordinary messages keep best-effort delivery; the `received` ledger also cleans up its
+  temp file on ENOSPC instead of leaking it.
+- **Honest wake status — no false `"fired"`.** A wake reported `"fired"` when the
+  send-keys command succeeded, not when a hookless peer (Codex) actually submitted. A
+  successful fire to a hookless or unclaimed peer now reports **`"fired_unconfirmed"`**
+  (keystrokes sent, pickup NOT confirmed — the durable obligation + the peer's next
+  `read_my_messages` are the guarantee). `ask_peer`'s grace path now reports
+  `skipped_busy` rather than a false `"fired"`.
+- **The wake stimulus closes obligations.** It told a woken peer to "reply via
+  `send_message`", but `action_required` work closes via `complete_work`/`block_work`
+  — so a delegated Codex left its obligation open forever. The text now branches.
+- **Ghost rows without erasing the stranded signal.** A prior fleet incarnation's dead
+  sessions left `⚫dead·gone` breadcrumbs nothing reaped. `register()` now sweeps them
+  (`gcDeadBreadcrumbs`), **signal-safe**: a dead session still holding undrained mail
+  (pid OR session box) or an open obligation is KEPT, so the cockpit's stranded `⚑`/`✉`
+  warning is never silently erased; the same keep-gate governs `readAll`. Reaps are
+  compare-and-clear (identity-pin before unlink).
+- **oxpit: collapsible background section + reconfigurable RESET.** Detached pane-less
+  processes collapse off the navigable fleet into a `(b)`-toggled footer (no longer
+  cluttering the list or mis-reading as "awaiting you"), and a fleet reconfigure can
+  precede a `RESET` (`R → e`). A **waiting** detached agent stays foreground — its wait
+  must stay on the wait-graph and in `--check`.
+- **Codex no longer stalls; orphaned MCP servers self-reap.** A plain `send_message` to
+  an idle hookless peer (Codex) now wakes it (previously a black hole). An MCP server
+  whose host dies uncleanly self-reaps — via stdin-EOF and an orphan-watchdog that now
+  catches Linux-subreaper reparenting too, not just pid 1 — instead of lingering as a
+  detached `pid:<n>` breadcrumb.
+- **Test hygiene.** A promise-unaware `withHome` test helper leaked a `/tmp` dir per
+  suite run; made promise-aware.
+
+The whole arc — diagnose → fix → adversarial verify → BLOCK→AMEND→APPROVE → ship — ran
+through the live Claude+Codex fleet, human-out-of-loop. Hook protocol unchanged.
+
 ## [0.24.0] — 2026-06-21
 
 **Send-time delivery outlook — the sender learns when a plain send will strand.**
