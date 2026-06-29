@@ -6,6 +6,7 @@ import {
   computeAgentLabels,
   fleetTrouble,
   renderCommsLog,
+  renderDock,
   renderSnapshot,
 } from "./render.js";
 import type { FleetAgent, FleetSnapshot } from "./snapshot.js";
@@ -850,4 +851,39 @@ test("renderSnapshot: no background ⇒ no footer, no +bg suffix (unchanged)", (
   });
   assert.ok(!out.includes("background"), "no footer when there are no detached processes");
   assert.ok(!out.includes("+1 bg") && !out.includes("+0 bg"), "no +bg suffix in the header");
+});
+
+// ── renderDock: squash windowing ────────────────────────────────────────────────
+function dockFleet(n: number): FleetSnapshot {
+  const agents = Array.from({ length: n }, (_, i) => {
+    const id = `${i}`.repeat(8).slice(0, 8);
+    return agent({ session_id: `s-${i}`, short_id: id, window_name: `w${i}` });
+  });
+  return snap(agents);
+}
+
+test("renderDock: short fleet renders every row, no markers", () => {
+  const out = renderDock(dockFleet(3), { color: false, width: 100, maxAgentRows: 6 });
+  for (const w of ["w0", "w1", "w2"]) assert.ok(out.includes(w), `${w} present`);
+  assert.ok(!out.includes("more above") && !out.includes("more below"), "no scroll markers");
+});
+
+test("renderDock: tall fleet windows to maxAgentRows with markers + keeps selection", () => {
+  const out = renderDock(dockFleet(8), { color: false, width: 100, maxAgentRows: 4, selected: 6 });
+  const body = out.split("\n");
+  // header + footer + at most maxAgentRows lines for the agent section.
+  assert.ok(body.length <= 2 + 4, `dock fits the budget (got ${body.length} lines)`);
+  assert.ok(out.includes("w6"), "the selected row stays visible");
+  assert.ok(/⋯ \d+ more/.test(out), "shows a '⋯ N more' marker instead of silently truncating");
+});
+
+test("renderDock: dockStatus replaces the footer hints", () => {
+  const out = renderDock(dockFleet(2), {
+    color: false,
+    width: 100,
+    maxAgentRows: 6,
+    dockStatus: "nudge w0? press y to confirm",
+  });
+  assert.ok(out.includes("press y to confirm"), "status shown");
+  assert.ok(!out.includes("⏎ jump"), "key hints replaced by the status line");
 });

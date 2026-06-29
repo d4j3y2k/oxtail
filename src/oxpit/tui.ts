@@ -679,7 +679,13 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     // buffer is tail-windowed so a long multi-line message can't grow the bar without
     // bound (which would desync the cursor-home repaint).
     const MAX_FIELD_LINES = 6;
-    function composerBar(width: number): string[] {
+    // Build the composer (separator + ✉target header + input buffer + attachments +
+    // note + key hint). `maxLines` is the pane budget: in a short dock pane the bar
+    // caps itself to that height — attachments collapse to a count, the buffer
+    // tail-windows to whatever's left, and the hint shortens — so the composer never
+    // overflows the pane (the caller still slices as a backstop). The input line and
+    // hint are always kept.
+    function composerBar(width: number, maxLines: number): string[] {
       const a = composeTargetKey
         ? snapshot.agents.find((ag) => agentKey(ag) === composeTargetKey)
         : undefined;
@@ -687,29 +693,43 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       const b = (s: string) => (opts.color ? `\x1b[1m\x1b[36m${s}\x1b[0m` : s);
       const d = (s: string) => dim(s, opts.color);
       const mark = a?.is_self ? " → your primary session" : "";
-      const lines: string[] = [d("─".repeat(Math.max(4, width))), b(`✉ ${to}`) + d(mark)];
-      // Buffer: each logical line wrapped, a "> " prompt on the first, cursor on the
-      // last, tail-windowed to MAX_FIELD_LINES.
+      const tight = maxLines < 10;
+      const header = [d("─".repeat(Math.max(4, width))), b(`✉ ${to}`) + d(mark)];
+
+      // Attachments: list ≤3 (with overflow) when there's room; collapse to a single
+      // count line when the pane is short so they never crowd out the input.
+      const attBlock: string[] = [];
+      if (composeAttachments.length) {
+        if (tight) {
+          attBlock.push(d(`📎 ${composeAttachments.length} attached`));
+        } else {
+          for (const att of composeAttachments.slice(0, 3)) attBlock.push(d(`📎 ${att.name} (${att.bytes}B)`));
+          if (composeAttachments.length > 3) attBlock.push(d(`📎 …+${composeAttachments.length - 3} more`));
+        }
+      }
+      const noteBlock = composeNote ? [d(composeNote)] : [];
+      const undo = composeAttachments.length ? " · ⌃X unattach" : "";
+      const hint = d(
+        tight
+          ? `⏎ send · ⌥⏎ nl · ⌃A attach · ⌃V img${undo} · esc`
+          : `Enter send · ⌥⏎/⌃J newline · drag+⌃A attach · ⌃V image${undo} · Esc cancel`,
+      );
+
+      // Buffer: each logical line wrapped, "> " on the first SHOWN line, cursor on the
+      // last. Tail-windowed first to MAX_FIELD_LINES, then to whatever the pane budget
+      // leaves after the fixed chrome — but always at least the cursor line.
       const wrapped: string[] = [];
       for (const logical of composeBuf.split("\n")) {
         for (const seg of wrapText(logical, width - 2)) wrapped.push(seg);
       }
       if (wrapped.length === 0) wrapped.push("");
       wrapped[wrapped.length - 1] += "█";
-      const shown =
-        wrapped.length > MAX_FIELD_LINES ? wrapped.slice(wrapped.length - MAX_FIELD_LINES) : wrapped;
-      shown.forEach((seg, i) => lines.push((i === 0 ? d("> ") : "  ") + seg));
-      // Attachments (capped) + transient note.
-      for (const att of composeAttachments.slice(0, 3)) {
-        lines.push(d(`📎 ${att.name} (${att.bytes}B)`));
-      }
-      if (composeAttachments.length > 3) {
-        lines.push(d(`📎 …+${composeAttachments.length - 3} more`));
-      }
-      if (composeNote) lines.push(d(composeNote));
-      const undo = composeAttachments.length ? " · ⌃X unattach" : "";
-      lines.push(d(`Enter send · ⌥⏎/⌃J newline · drag+⌃A attach · ⌃V image${undo} · Esc cancel`));
-      return lines;
+      const fixed = header.length + attBlock.length + noteBlock.length + 1; // +1 = hint
+      const bufBudget = Math.max(1, Math.min(MAX_FIELD_LINES, maxLines - fixed));
+      const win = wrapped.length > bufBudget ? wrapped.slice(wrapped.length - bufBudget) : wrapped;
+      const bufLines = win.map((seg, i) => (i === 0 ? d("> ") : "  ") + seg);
+
+      return [...header, ...bufLines, ...attBlock, ...noteBlock, hint];
     }
 
     function paint(): void {
@@ -737,18 +757,20 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         return;
       }
       if (composing) {
-        // Compose field at the BOTTOM; fleet/log stays visible above. Size the top
-        // region to the remaining rows and pad so the field is pinned to the foot.
-        const bar = composerBar(width).map((l) => clipToWidth(l, width) + CLEAR_EOL);
-        const avail = Math.max(1, rows - bar.length);
-        const topStr =
-          mode === "log" ? logPanelLines(width, avail).join("\n") : fleetFrame(width, avail);
-        const top = topStr
-          .split("\n")
-          .slice(0, avail)
-          .map((l) => clipToWidth(l, width) + CLEAR_EOL);
-        while (top.length < avail) top.push(CLEAR_EOL); // pad so the bar sits at the bottom
-        stdout.write(HOME + [...top, ...bar].join("\n") + CLEAR_BELOW);
+        // Compose field at the BOTTOM; fleet/log stays visible above. The bar is
+        // budgeted to `rows` so in a short dock pane it caps itself (and can take the
+        // whole pane — composing is modal) instead of overflowing; the final slice is
+        // the correctness backstop against any residual over-tall bar.
+        const bar = composerBar(width, rows).map((l) => clipToWidth(l, width) + CLEAR_EOL);
+        const avail = Math.max(0, rows - bar.length);
+        const top: string[] = [];
+        if (avail > 0) {
+          const topStr =
+            mode === "log" ? logPanelLines(width, avail).join("\n") : fleetFrame(width, avail);
+          for (const l of topStr.split("\n").slice(0, avail)) top.push(clipToWidth(l, width) + CLEAR_EOL);
+          while (top.length < avail) top.push(CLEAR_EOL); // pad so the bar sits at the bottom
+        }
+        stdout.write(HOME + [...top, ...bar].slice(0, rows).join("\n") + CLEAR_BELOW);
         return;
       }
       const clipEOL = (l: string) => clipToWidth(l, width) + CLEAR_EOL;
@@ -779,6 +801,12 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
           width,
           selected: selectedIndex(),
           toolActivity: activityCache,
+          // Reserve the header + footer rows; renderDock windows the agents to the rest
+          // (with "⋯ N more" markers) so a tall fleet doesn't silently truncate.
+          maxAgentRows: Math.max(1, rows - 2),
+          // Surface a live confirm/feedback line in the strip's footer (the full table
+          // rides these on its own footer; the dock has no other seam).
+          dockStatus: Date.now() < statusUntil && status ? status : undefined,
         })
           .split("\n")
           .slice(0, rows)

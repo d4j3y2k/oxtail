@@ -50,6 +50,11 @@ export type RenderOptions = {
   // Expand the detached-background section into its individual rows (TUI `b` toggle).
   // Default false: the section renders as a single collapsed count header.
   showBackground?: boolean;
+  // DOCK mode only: a transient operator status/confirm line (already styled). When
+  // set it REPLACES the dock footer key-hints, so confirms ("press y", "press K
+  // again") and feedback are visible in the strip — the full table rides these on its
+  // footer, but the dock has no other seam to surface them.
+  dockStatus?: string;
 };
 
 // Cap on background rows rendered when the section is expanded, so a runaway process
@@ -778,7 +783,7 @@ export function renderDock(s: FleetSnapshot, opts: RenderOptions = {}): string {
   const labels = computeAgentLabels(s.agents).byShortId;
   const sel = opts.selected ?? -1;
   const lines: string[] = [dockHeader(s, paint, width)];
-  s.agents.forEach((a, i) => {
+  const rowFor = (a: FleetSnapshot["agents"][number], i: number): string => {
     const k = agentKey(a);
     const act = opts.toolActivity?.has(k) ? opts.toolActivity.get(k) ?? null : a.activity;
     const b = badges(a, paint, labels, act);
@@ -791,9 +796,32 @@ export function renderDock(s: FleetSnapshot, opts: RenderOptions = {}): string {
         : cell(name, DOCK_NAME_W);
     const status = paint(cell(statusText(a), DOCK_STATUS_W), livenessColor(a.liveness));
     const self = a.is_self ? paint("◂you", C.dim) : "";
-    const row = `${marker}${GLYPH[a.liveness]} ${nameCell} ${status} ${b.text} ${self}`;
-    lines.push(clipToWidth(row.trimEnd(), width));
-  });
-  lines.push(clipToWidth(paint("  ⏎ jump · m msg · n nudge · l log · d full · r refresh · ⌃C quit", C.dim), width));
+    return clipToWidth(`${marker}${GLYPH[a.liveness]} ${nameCell} ${status} ${b.text} ${self}`.trimEnd(), width);
+  };
+  // Window the agent rows to the pane budget (maxAgentRows) so a fleet taller than a
+  // short dock pane shows a "⋯ N more" marker instead of silently truncating off the
+  // bottom — the same idiom as the full table. Reserve up to two marker rows so the
+  // window + markers never exceed the budget (header/footer are accounted by the caller).
+  const total = s.agents.length;
+  const cap = opts.maxAgentRows && opts.maxAgentRows > 0 ? opts.maxAgentRows : total;
+  if (total <= cap) {
+    s.agents.forEach((a, i) => lines.push(rowFor(a, i)));
+  } else {
+    const rowCap = Math.max(1, cap - 2);
+    const anchor = sel >= 0 ? sel : 0;
+    const start = Math.max(0, Math.min(anchor - Math.floor(rowCap / 2), total - rowCap));
+    const end = start + rowCap;
+    if (start > 0) lines.push(clipToWidth(paint(`  ⋯ ${start} more above`, C.dim), width));
+    for (let i = start; i < end; i++) lines.push(rowFor(s.agents[i], i));
+    if (end < total) lines.push(clipToWidth(paint(`  ⋯ ${total - end} more below`, C.dim), width));
+  }
+  // The footer is the dock's only seam for transient feedback: when the TUI hands us a
+  // status/confirm line, show it INSTEAD of the key hints (it expires back to the hints
+  // on the next tick) so "press y"/"press K again" prompts aren't invisible in the strip.
+  lines.push(
+    opts.dockStatus
+      ? clipToWidth("  " + opts.dockStatus, width)
+      : clipToWidth(paint("  ⏎ jump · m msg · n nudge · l log · d full · r refresh · ⌃C quit", C.dim), width),
+  );
   return lines.join("\n");
 }
