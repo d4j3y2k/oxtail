@@ -62,6 +62,38 @@ export type RenderOptions = {
 // agree on how many lines the expanded section occupies.
 export const BACKGROUND_ROW_CAP = 8;
 
+// Window `total` items around `cursor` into at most `budget` DISPLAY rows, RESERVING
+// rows for the "⋯ N more above/below" markers so the markers are always shown (and
+// counted accurately) when items are hidden, and the rendered section — content rows
+// PLUS markers — never exceeds `budget`. Returns the content slice [start, end) and the
+// EXACT hidden counts above/below (0 when that edge isn't clipped). This is the one
+// shared windowing idiom behind the dock strip's agent rows AND the fleet editor's grid
+// (an earlier marker-OVERLAY variant silently dropped the bottom marker and undercounted
+// hidden rows by one when the cursor sat on the window's edge — compile-sim, 3 lenses).
+export function windowWithMarkers(
+  total: number,
+  cursor: number,
+  budget: number,
+): { start: number; end: number; above: number; below: number } {
+  if (budget >= total || total <= 0) return { start: 0, end: Math.max(0, total), above: 0, below: 0 };
+  const c = Math.max(0, Math.min(cursor, total - 1));
+  if (budget <= 2) {
+    // No room for a marker row — show a bare cursor-visible window (markers suppressed
+    // because there's physically nowhere to put one; the section is exactly `budget`).
+    const start = Math.max(0, Math.min(c - Math.floor(budget / 2), total - budget));
+    return { start, end: start + budget, above: 0, below: 0 };
+  }
+  // Reserve BOTH marker rows up front, then reclaim one when an edge isn't actually
+  // hidden — so content + markers == budget when clipped on both sides, and budget-1
+  // (one spare) when clipped on only one. Never exceeds budget.
+  const contentCap = budget - 2;
+  let start = Math.max(0, Math.min(c - Math.floor(contentCap / 2), total - contentCap));
+  let end = start + contentCap;
+  if (start === 0 && end < total) end = Math.min(total, end + 1); // no "above" marker → grow content down
+  else if (end === total && start > 0) start = Math.max(0, start - 1); // no "below" marker → grow content up
+  return { start, end, above: start, below: total - end };
+}
+
 type Paint = (s: string, ...codes: string[]) => string;
 
 function makePaint(color: boolean): Paint {
@@ -800,21 +832,15 @@ export function renderDock(s: FleetSnapshot, opts: RenderOptions = {}): string {
   };
   // Window the agent rows to the pane budget (maxAgentRows) so a fleet taller than a
   // short dock pane shows a "⋯ N more" marker instead of silently truncating off the
-  // bottom — the same idiom as the full table. Reserve up to two marker rows so the
-  // window + markers never exceed the budget (header/footer are accounted by the caller).
+  // bottom — the same idiom as the full table. windowWithMarkers reserves the marker
+  // rows WITHIN the budget, so header + this section + footer never exceeds the pane and
+  // the footer (which carries dockStatus confirms) is never the line that gets clipped.
   const total = s.agents.length;
   const cap = opts.maxAgentRows && opts.maxAgentRows > 0 ? opts.maxAgentRows : total;
-  if (total <= cap) {
-    s.agents.forEach((a, i) => lines.push(rowFor(a, i)));
-  } else {
-    const rowCap = Math.max(1, cap - 2);
-    const anchor = sel >= 0 ? sel : 0;
-    const start = Math.max(0, Math.min(anchor - Math.floor(rowCap / 2), total - rowCap));
-    const end = start + rowCap;
-    if (start > 0) lines.push(clipToWidth(paint(`  ⋯ ${start} more above`, C.dim), width));
-    for (let i = start; i < end; i++) lines.push(rowFor(s.agents[i], i));
-    if (end < total) lines.push(clipToWidth(paint(`  ⋯ ${total - end} more below`, C.dim), width));
-  }
+  const { start, end, above, below } = windowWithMarkers(total, sel >= 0 ? sel : 0, cap);
+  if (above > 0) lines.push(clipToWidth(paint(`  ⋯ ${above} more above`, C.dim), width));
+  for (let i = start; i < end; i++) lines.push(rowFor(s.agents[i], i));
+  if (below > 0) lines.push(clipToWidth(paint(`  ⋯ ${below} more below`, C.dim), width));
   // The footer is the dock's only seam for transient feedback: when the TUI hands us a
   // status/confirm line, show it INSTEAD of the key hints (it expires back to the hints
   // on the next tick) so "press y"/"press K again" prompts aren't invisible in the strip.

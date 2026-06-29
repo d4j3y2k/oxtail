@@ -15,7 +15,7 @@ import { existsSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildSnapshot, type FleetAgent, type FleetSnapshot } from "./snapshot.js";
-import { ANIM_FRAMES, attentionLine, BACKGROUND_ROW_CAP, commsBodyLines, computeAgentLabels, renderDock, renderSnapshot } from "./render.js";
+import { ANIM_FRAMES, attentionLine, BACKGROUND_ROW_CAP, commsBodyLines, computeAgentLabels, renderDock, renderSnapshot, windowWithMarkers } from "./render.js";
 import { buildCommsLog, type CommsMessage } from "./comms.js";
 import { agentKey, capturePaneActivity, type AgentActivity, type PaneActivity } from "./activity.js";
 import { clipToWidth, scrubBufferText } from "./format.js";
@@ -182,17 +182,6 @@ type InteractiveOpts = {
   // instead of the full table — for a short bottom tmux pane. Same data + keys.
   dock: boolean;
 };
-
-// Scroll a list of `len` rows so index `cursor` stays visible inside a window of
-// `cap` rows; returns the [start, end) slice bounds. When the whole list fits, the
-// window is the whole list. Keeps the fleet editor's cursor row (and its key hints)
-// on-screen in a squashed dock pane instead of letting the grid's bottom fall off.
-export function scrollWindow(len: number, cursor: number, cap: number): { start: number; end: number } {
-  if (cap >= len || len <= 0) return { start: 0, end: Math.max(0, len) };
-  const c = Math.max(0, Math.min(cursor, len - 1));
-  const start = Math.max(0, Math.min(c - Math.floor(cap / 2), len - cap));
-  return { start, end: start + cap };
-}
 
 function runInteractive(opts: InteractiveOpts): Promise<number> {
   return new Promise<number>((resolve) => {
@@ -681,10 +670,10 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     const MAX_FIELD_LINES = 6;
     // Build the composer (separator + ✉target header + input buffer + attachments +
     // note + key hint). `maxLines` is the pane budget: in a short dock pane the bar
-    // caps itself to that height — attachments collapse to a count, the buffer
-    // tail-windows to whatever's left, and the hint shortens — so the composer never
-    // overflows the pane (the caller still slices as a backstop). The input line and
-    // hint are always kept.
+    // caps itself toward that height — the separator is dropped, attachments collapse to
+    // a count, the buffer tail-windows, and the hint shortens. The input/cursor line is
+    // always kept; if the pane is shorter than the fixed chrome the trailing hint is
+    // dropped first, and the caller's slice is the final correctness backstop.
     function composerBar(width: number, maxLines: number): string[] {
       const a = composeTargetKey
         ? snapshot.agents.find((ag) => agentKey(ag) === composeTargetKey)
@@ -694,7 +683,11 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       const d = (s: string) => dim(s, opts.color);
       const mark = a?.is_self ? " → your primary session" : "";
       const tight = maxLines < 10;
-      const header = [d("─".repeat(Math.max(4, width))), b(`✉ ${to}`) + d(mark)];
+      // Drop the separator rule in a short pane — every row counts, and the ✉target line
+      // + "> " prompt already delimit the composer from the fleet above.
+      const header = tight
+        ? [b(`✉ ${to}`) + d(mark)]
+        : [d("─".repeat(Math.max(4, width))), b(`✉ ${to}`) + d(mark)];
 
       // Attachments: list ≤3 (with overflow) when there's room; collapse to a single
       // count line when the pane is short so they never crowd out the input.
@@ -1106,9 +1099,16 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       const colHeader = d(
         "  " + "window".padEnd(14) + "agent".padEnd(8) + "model".padEnd(16) + "effort".padEnd(8) + "rc",
       );
-      const head = tight
-        ? [header, d(`  ${fe.note}`), colHeader]
-        : [header, d(`  ${fe.note}`), "", colHeader];
+      // In a very short pane drop the column-header row entirely — that one row, handed
+      // back to the window grid, is what lets a small fleet (and its "⋯ N more" marker)
+      // fully fit instead of clipping a window with no indicator. The note stays (it
+      // carries save/error feedback); the column labels are guessable for a few windows.
+      const head =
+        rows < 8
+          ? [header, d(`  ${fe.note}`)]
+          : tight
+            ? [header, d(`  ${fe.note}`), colHeader]
+            : [header, d(`  ${fe.note}`), "", colHeader];
 
       const winRows = fe.windows.map((w, i) => {
         const rc = w.agent === "claude" ? (w.remoteControl ? "on" : "off") : "–";
@@ -1125,17 +1125,18 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
           : `  ${cells}`;
       });
 
-      // Scroll `linesIn` to keep index `cursor` visible within `cap` rows, marking any
-      // hidden head/tail with a dim "⋯ N more" (never overwriting the cursor row). A
+      // Window `linesIn` to keep `cursor` visible within `cap` rows, prepending/appending
+      // a dim "⋯ N more above/below" marker as its OWN line (additive — never overwrites a
+      // content row, so the count is exact and the bottom marker can't be dropped). A
       // cap ≤ 0 collapses the section to nothing so the footer always wins the budget.
       const fitWin = (linesIn: string[], cursor: number, cap: number): string[] => {
         if (cap <= 0) return [];
-        const { start, end } = scrollWindow(linesIn.length, cursor, cap);
-        const slice = linesIn.slice(start, end);
-        if (start > 0 && cursor !== start) slice[0] = d(`  ⋯ ${start} more above`);
-        const below = linesIn.length - end;
-        if (below > 0 && cursor !== end - 1) slice[slice.length - 1] = d(`  ⋯ ${below} more below`);
-        return slice;
+        const { start, end, above, below } = windowWithMarkers(linesIn.length, cursor, cap);
+        const out: string[] = [];
+        if (above > 0) out.push(d(`  ⋯ ${above} more above`));
+        for (let i = start; i < end; i++) out.push(linesIn[i]);
+        if (below > 0) out.push(d(`  ⋯ ${below} more below`));
+        return out;
       };
 
       let footer: string[];
@@ -1151,7 +1152,9 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         });
         footer = [
           b(`  select ${pk.field} for "${fe.windows[fe.cursor].name}":`),
-          ...fitWin(optLines, pk.cursor, Math.max(1, rows - head.length - 2)), // title + hint
+          // Reserve the title + hint (2) AND the non-tight spacer row so the whole frame
+          // (head + this footer + sep) stays within `rows` and the pick hint survives.
+          ...fitWin(optLines, pk.cursor, Math.max(1, rows - head.length - (tight ? 0 : 1) - 2)),
           d("  ↑↓ · ⏎ pick · esc cancel"),
         ];
       } else if (fleetEditInput) {
