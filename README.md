@@ -76,7 +76,7 @@ command = "npx"
 args = ["-y", "oxtail@latest"]
 ```
 
-> Pin a version (`oxtail@0.25.0`) for daily configs; `@latest` is fine for trying it
+> Pin a version (`oxtail@0.26.0`) for daily configs; `@latest` is fine for trying it
 > out. On Windows, wrap the command as `cmd /c npx -y oxtail@latest`.
 
 **2. (Claude Code) Install the hooks** so agents receive messages autonomously and
@@ -94,6 +94,7 @@ asymmetry?](docs/protocol.md#mid-turn-vs-next-turn-delivery-the-asymmetry))
 
 ```sh
 npx oxtail oxpit       # live interactive cockpit
+npx oxtail oxpit --dock # compact one-line-per-agent strip for a short bottom pane
 npx oxtail status      # print once and exit (scriptable, --json)
 ```
 
@@ -121,7 +122,18 @@ same engine as a one-shot print.
   delegation (`⚑`/`⚑✓`/`⚑✗`) and ask/reply (`❓`/`↩`) markers.
 
 Keys: `↑↓`/`jk` select · `⏎` jump to that agent's pane · `n` nudge · `m` message · `l`
-comms-log · `w` open thread · `?` help · `⌃C` quit.
+comms-log · `w` open thread · `d` dock/full · `?` help · `⌃C` quit.
+
+**As a dock.** `oxpit --dock` renders the same fleet (same data, same keys) as a compact
+one-line-per-agent strip sized for a short bottom tmux pane — an always-on HUD welded
+under wherever you work, so a peer waiting on you (`🙋`) is always in view. Press `d` to
+expand to the full table and back. Every interactive flow — message, nudge, the fleet
+editor, spawn/sync/reset previews — adapts to the squashed space rather than clipping its
+controls. To pin it beneath your current window:
+
+```sh
+tmux split-window -v -l 8 'oxpit --dock'   # an 8-row dock strip at the bottom
+```
 
 **Monitoring is read-only by default** — the cockpit never drains a mailbox or takes a
 lock, and infers liveness, work, and waits from observed facts rather than
