@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { stepInput, type InputAction, type PasteState } from "./tui.js";
+import { scrollWindow, stepInput, type InputAction, type PasteState } from "./tui.js";
 
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
@@ -96,4 +96,34 @@ test("stepInput: under-cap unterminated paste keeps buffering (no premature flus
   assert.deepEqual(actions, [], "nothing flushed yet — still mid-paste");
   assert.equal(state.pasting, true);
   assert.equal(state.pasteBuf, "small");
+});
+
+// ── scrollWindow: keep the fleet-editor cursor visible in a squashed dock pane ──
+test("scrollWindow: everything fits → whole list, no scroll", () => {
+  assert.deepEqual(scrollWindow(3, 1, 5), { start: 0, end: 3 });
+  assert.deepEqual(scrollWindow(3, 2, 3), { start: 0, end: 3 }, "cap === len shows all");
+});
+
+test("scrollWindow: centers the cursor when there's overflow on both sides", () => {
+  const w = scrollWindow(10, 5, 3);
+  assert.deepEqual(w, { start: 4, end: 7 });
+  assert.ok(5 >= w.start && 5 < w.end, "cursor stays inside the window");
+});
+
+test("scrollWindow: clamps at the top without scrolling past 0", () => {
+  const w = scrollWindow(10, 0, 3);
+  assert.deepEqual(w, { start: 0, end: 3 });
+  assert.ok(0 >= w.start && 0 < w.end);
+});
+
+test("scrollWindow: clamps at the bottom without scrolling past the end", () => {
+  const w = scrollWindow(10, 9, 3);
+  assert.deepEqual(w, { start: 7, end: 10 });
+  assert.ok(9 >= w.start && 9 < w.end, "last cursor still visible");
+});
+
+test("scrollWindow: degenerate caps and out-of-range cursors stay in bounds", () => {
+  assert.deepEqual(scrollWindow(0, 0, 5), { start: 0, end: 0 }, "empty list");
+  const w = scrollWindow(10, 99, 4); // cursor past the end clamps to the last row
+  assert.ok(w.end - w.start === 4 && w.end === 10 && w.start >= 0);
 });

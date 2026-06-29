@@ -733,3 +733,67 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
   // (and just looks broken in one-shot mode). ANSI-aware (max M3).
   return lines.map((l) => clipToWidth(l, width)).join("\n");
 }
+
+// ── DOCK mode ────────────────────────────────────────────────────────────────
+// A compact, one-line-per-agent render for a SHORT bottom tmux pane — David's
+// "oxpit as a navigation dock" idea. Same liveness / status / badge TRUTH as
+// renderSnapshot (it reuses the very same helpers), but drops the table chrome,
+// the wait-graph block, the background section, and the multi-line purpose so a
+// header + ~6 agents + a footer fit in ~8-10 rows. Jump/message keys still drive
+// it — this is a denser VIEW, not a different data path.
+const DOCK_NAME_W = 8;
+const DOCK_STATUS_W = 13;
+
+// One-line fleet header: liveness counts + the operator signal a dock exists for
+// (🙋 who's awaiting YOU) + any hard trouble. A clean fleet still shows ✓ so the
+// absence of alarms reads as "checked & fine", matching attentionLine's posture.
+function dockHeader(s: FleetSnapshot, paint: Paint, width: number): string {
+  const t = fleetTrouble(s);
+  const idle = s.agents.filter((a) => a.liveness === "idle").length;
+  const dead = s.agents.filter((a) => a.liveness === "dead").length;
+  const counts: string[] = [];
+  if (t.active) counts.push(paint(`${GLYPH.active}${t.active}`, C.green));
+  if (idle) counts.push(paint(`${GLYPH.idle}${idle}`, C.yellow));
+  if (dead) counts.push(paint(`${GLYPH.dead}${dead}`, C.gray));
+  const segs: string[] = [paint("oxpit", C.cyan, C.bold)];
+  if (counts.length) segs.push(counts.join(" "));
+  if (t.awaiting) segs.push(paint(`🙋${t.awaiting} awaiting you`, C.yellow, C.bold));
+  if (t.deadlocks) segs.push(paint(`⛔${t.deadlocks} deadlock`, C.red, C.bold));
+  if (t.orphaned) segs.push(paint(`⛔${t.orphaned} orphaned`, C.red, C.bold));
+  if (t.stranded) segs.push(paint(`⚑${t.stranded} stranded`, C.red));
+  if (!t.awaiting && !t.deadlocks && !t.orphaned && !t.stranded) segs.push(paint("✓", C.dim));
+  return clipToWidth(segs.join(paint(" · ", C.dim)), width);
+}
+
+export function renderDock(s: FleetSnapshot, opts: RenderOptions = {}): string {
+  const color = opts.color ?? true;
+  const width = opts.width ?? 80;
+  const paint = makePaint(color);
+  if (s.agents.length === 0) {
+    return [
+      dockHeader(s, paint, width),
+      clipToWidth(paint("  no agents in this project yet", C.dim), width),
+    ].join("\n");
+  }
+  const labels = computeAgentLabels(s.agents).byShortId;
+  const sel = opts.selected ?? -1;
+  const lines: string[] = [dockHeader(s, paint, width)];
+  s.agents.forEach((a, i) => {
+    const k = agentKey(a);
+    const act = opts.toolActivity?.has(k) ? opts.toolActivity.get(k) ?? null : a.activity;
+    const b = badges(a, paint, labels, act);
+    const name = labels.get(a.short_id) ?? a.short_id;
+    const selected = i === sel;
+    const marker = selected ? paint("›", C.cyan, C.bold) : " ";
+    const nameCell =
+      selected && color
+        ? `${SELECT_BG}${cell(name, DOCK_NAME_W)}${C.reset}`
+        : cell(name, DOCK_NAME_W);
+    const status = paint(cell(statusText(a), DOCK_STATUS_W), livenessColor(a.liveness));
+    const self = a.is_self ? paint("◂you", C.dim) : "";
+    const row = `${marker}${GLYPH[a.liveness]} ${nameCell} ${status} ${b.text} ${self}`;
+    lines.push(clipToWidth(row.trimEnd(), width));
+  });
+  lines.push(clipToWidth(paint("  ⏎ jump · m msg · n nudge · l log · d full · r refresh · ⌃C quit", C.dim), width));
+  return lines.join("\n");
+}

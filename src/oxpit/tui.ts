@@ -15,7 +15,7 @@ import { existsSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildSnapshot, type FleetAgent, type FleetSnapshot } from "./snapshot.js";
-import { ANIM_FRAMES, attentionLine, BACKGROUND_ROW_CAP, commsBodyLines, computeAgentLabels, renderSnapshot } from "./render.js";
+import { ANIM_FRAMES, attentionLine, BACKGROUND_ROW_CAP, commsBodyLines, computeAgentLabels, renderDock, renderSnapshot } from "./render.js";
 import { buildCommsLog, type CommsMessage } from "./comms.js";
 import { agentKey, capturePaneActivity, type AgentActivity, type PaneActivity } from "./activity.js";
 import { clipToWidth, scrubBufferText } from "./format.js";
@@ -135,21 +135,21 @@ export async function runOxpit(argv: string[]): Promise<number> {
     return 0;
   }
   const buildOpts = { allProjects: a.all, projectRoot: a.project };
+  const dock = argv.includes("--dock");
 
-  // No TTY (piped, CI, popup without -E pty): degrade to a one-shot snapshot.
+  // No TTY (piped, CI, popup without -E pty): degrade to a one-shot snapshot
+  // (dock or full, matching the requested mode).
   if (!process.stdout.isTTY || !process.stdin.isTTY) {
     const snap = buildSnapshot(buildOpts);
-    const out = renderSnapshot(snap, {
-      color: a.color ?? false,
-      width: process.stdout.columns || 100,
-    });
+    const ropts = { color: a.color ?? false, width: process.stdout.columns || 100 };
+    const out = dock ? renderDock(snap, ropts) : renderSnapshot(snap, ropts);
     process.stdout.write(out + "\n");
     return 0;
   }
 
   const color = a.color ?? !process.env.NO_COLOR;
   const client = clientFlag(argv);
-  return runInteractive({ buildOpts, color, client });
+  return runInteractive({ buildOpts, color, client, dock });
 }
 
 // Run the cockpit as a CLI entry point: runOxpit plus a FULL terminal-restore
@@ -178,7 +178,21 @@ type InteractiveOpts = {
   buildOpts: { allProjects: boolean; projectRoot: string | undefined };
   color: boolean;
   client: string | undefined;
+  // Dock mode (`--dock`): paint the compact one-line-per-agent strip (renderDock)
+  // instead of the full table — for a short bottom tmux pane. Same data + keys.
+  dock: boolean;
 };
+
+// Scroll a list of `len` rows so index `cursor` stays visible inside a window of
+// `cap` rows; returns the [start, end) slice bounds. When the whole list fits, the
+// window is the whole list. Keeps the fleet editor's cursor row (and its key hints)
+// on-screen in a squashed dock pane instead of letting the grid's bottom fall off.
+export function scrollWindow(len: number, cursor: number, cap: number): { start: number; end: number } {
+  if (cap >= len || len <= 0) return { start: 0, end: Math.max(0, len) };
+  const c = Math.max(0, Math.min(cursor, len - 1));
+  const start = Math.max(0, Math.min(c - Math.floor(cap / 2), len - cap));
+  return { start, end: start + cap };
+}
 
 function runInteractive(opts: InteractiveOpts): Promise<number> {
   return new Promise<number>((resolve) => {
@@ -202,6 +216,10 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     let torndown = false;
     let helpOpen = false;
     let mode: "fleet" | "log" = "fleet";
+    // `d` flips the whole fleet view between the full table and the compact dock
+    // strip live, same process — seeded by `--dock` but mutable so the cockpit can
+    // collapse to a HUD and lean back out to detail without a quit-and-relaunch.
+    let dock = opts.dock;
     let logFilterSelf = false; // scope the log to the fleet-selected agent
     // `b` expands the detached-background section into its individual rows (default
     // collapsed to a count header). Detached processes are never navigable, so this is
@@ -336,7 +354,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     function footerKeyLines(width: number): string[] {
       const items = [
         "↑↓ move", "⏎ jump", "n nudge", "m msg", "S fleet", "R reset", "K kill",
-        "l log", "w thread", "b bg", "r refresh", "? help", "⌃C quit",
+        "l log", "w thread", "b bg", "d dock", "r refresh", "? help", "⌃C quit",
       ];
       const maxW = Math.max(16, width - 2);
       const lines: string[] = [];
@@ -376,6 +394,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "  m             compose a message (Enter send · ⌥⏎/⌃J newline · ⌃X unattach · Esc cancel)",
         "                attach: drag a file then ⌃A · ⌃V pastes a clipboard image (copy then ⌃V)",
         "  b             show/hide detached background processes (MCP children / codex exec with no tmux pane)",
+        "  d             toggle dock ↔ full — collapse the fleet to a compact one-line-per-agent HUD strip (for a short pane) and back",
         "  l             toggle the comms-log bottom panel (fleet stays visible above)",
         "  w             open the selected agent's thread in the panel (per-agent)",
         "                in the panel: ↑↓ move the › cursor (or scroll an expanded msg) · w expand · j/k agents · f filter · ⏎ jump",
@@ -751,6 +770,23 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         stdout.write(HOME + [...top, ...panel].slice(0, rows).join("\n") + CLEAR_BELOW);
         return;
       }
+      // Dock mode: the compact strip replaces the whole fleet view (it brings its
+      // own header + footer). slice(0, rows) is the overflow backstop — a fleet
+      // taller than the pane truncates rather than wrapping into a repaint desync.
+      if (dock) {
+        const dockBody = renderDock(snapshot, {
+          color: opts.color,
+          width,
+          selected: selectedIndex(),
+          toolActivity: activityCache,
+        })
+          .split("\n")
+          .slice(0, rows)
+          .map(clipEOL)
+          .join("\n");
+        stdout.write(HOME + dockBody + CLEAR_BELOW);
+        return;
+      }
       // Clip every physical line to the terminal width (ANSI-aware) so none wraps —
       // a wrapped line would push the cursor-home repaint out of sync and corrupt
       // the screen. The renderers already clip their lines; this covers the footer
@@ -1033,13 +1069,20 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
           d(`   fleet "${fe.fleetName}" → session "${sessionName}"  (y: preview the reset with these edits)`)
         : b("FLEET — configure") +
           d(`     fleet "${fe.fleetName}" → session "${sessionName}"  (y: spawn if new, sync if it exists)`);
-      const lines: string[] = [
-        header,
-        d(`  ${fe.note}`),
-        "",
-        d("  " + "window".padEnd(14) + "agent".padEnd(8) + "model".padEnd(16) + "effort".padEnd(8) + "rc"),
-      ];
-      fe.windows.forEach((w, i) => {
+      // The control footer ALWAYS stays visible — it's how you operate the editor, so
+      // it must never be the row that gets clipped off in a squashed dock pane. When the
+      // pane is short the verbose multi-line key hints collapse to one dense line, the
+      // head sheds its spacer row, and the window grid scrolls to keep the cursor on
+      // screen. An open pick/input menu replaces the hints (and windows its own options).
+      const tight = rows < 16;
+      const colHeader = d(
+        "  " + "window".padEnd(14) + "agent".padEnd(8) + "model".padEnd(16) + "effort".padEnd(8) + "rc",
+      );
+      const head = tight
+        ? [header, d(`  ${fe.note}`), colHeader]
+        : [header, d(`  ${fe.note}`), "", colHeader];
+
+      const winRows = fe.windows.map((w, i) => {
         const rc = w.agent === "claude" ? (w.remoteControl ? "on" : "off") : "–";
         const cells =
           (w.name || "(unnamed)").padEnd(14) +
@@ -1047,42 +1090,67 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
           (w.model || "–").padEnd(16) +
           (w.effort || "–").padEnd(8) +
           rc;
-        if (i === fe.cursor) {
-          lines.push(opts.color ? `\x1b[7m▸ ${cells}\x1b[0m` : `▸ ${cells}`);
-        } else {
-          lines.push(`  ${cells}`);
-        }
+        return i === fe.cursor
+          ? opts.color
+            ? `\x1b[7m▸ ${cells}\x1b[0m`
+            : `▸ ${cells}`
+          : `  ${cells}`;
       });
-      lines.push("");
+
+      // Scroll `linesIn` to keep index `cursor` visible within `cap` rows, marking any
+      // hidden head/tail with a dim "⋯ N more" (never overwriting the cursor row). A
+      // cap ≤ 0 collapses the section to nothing so the footer always wins the budget.
+      const fitWin = (linesIn: string[], cursor: number, cap: number): string[] => {
+        if (cap <= 0) return [];
+        const { start, end } = scrollWindow(linesIn.length, cursor, cap);
+        const slice = linesIn.slice(start, end);
+        if (start > 0 && cursor !== start) slice[0] = d(`  ⋯ ${start} more above`);
+        const below = linesIn.length - end;
+        if (below > 0 && cursor !== end - 1) slice[slice.length - 1] = d(`  ⋯ ${below} more below`);
+        return slice;
+      };
+
+      let footer: string[];
       if (fleetEditPick) {
         const pk = fleetEditPick;
-        lines.push(b(`  select ${pk.field} for "${fe.windows[fe.cursor].name}":`));
-        pk.options.forEach((opt, i) => {
+        const optLines = pk.options.map((opt, i) => {
           const label = opt === "" ? "(default)" : opt;
-          lines.push(
-            i === pk.cursor
-              ? opts.color
-                ? `\x1b[7m  ▸ ${label}\x1b[0m`
-                : `  ▸ ${label}`
-              : `    ${label}`,
-          );
+          return i === pk.cursor
+            ? opts.color
+              ? `\x1b[7m  ▸ ${label}\x1b[0m`
+              : `  ▸ ${label}`
+            : `    ${label}`;
         });
-        lines.push(d("  ↑↓ · ⏎ pick · esc cancel"));
+        footer = [
+          b(`  select ${pk.field} for "${fe.windows[fe.cursor].name}":`),
+          ...fitWin(optLines, pk.cursor, Math.max(1, rows - head.length - 2)), // title + hint
+          d("  ↑↓ · ⏎ pick · esc cancel"),
+        ];
       } else if (fleetEditInput) {
-        lines.push(b(`  edit ${fleetEditInput.field}: ${fleetEditInput.buf}█`));
-        lines.push(d("  ⏎ ok · esc cancel"));
+        footer = [b(`  edit ${fleetEditInput.field}: ${fleetEditInput.buf}█`), d("  ⏎ ok · esc cancel")];
+      } else if (tight) {
+        footer = [
+          d(
+            fe.reset
+              ? "  ↑↓ sel · a/d add·del · n/m/f/t/r edit · w save · y PREVIEW · esc back"
+              : "  ↑↓ sel · a/d add·del · n/m/f/t/r edit · w save · y apply · esc",
+          ),
+        ];
       } else {
-        lines.push(d("  ↑↓ select · a add window · d delete"));
-        lines.push(d("  n name · m model · f effort · t type · r remote-control"));
-        lines.push(
+        footer = [
+          d("  ↑↓ select · a add window · d delete"),
+          d("  n name · m model · f effort · t type · r remote-control"),
           d(
             fe.reset
               ? "  F fleet-name · w save .oxtail/fleet.json · y PREVIEW RESET (with these edits) · esc back to plan"
               : "  F fleet-name · w save .oxtail/fleet.json · y APPLY (spawn new / sync existing) · esc cancel",
           ),
-        );
+        ];
       }
-      return lines
+
+      const sep = tight ? [] : [""];
+      const cap = rows - head.length - footer.length - sep.length;
+      return [...head, ...fitWin(winRows, fe.cursor, cap), ...sep, ...footer]
         .slice(0, Math.max(1, rows))
         .map((l) => clipToWidth(l, width) + CLEAR_EOL)
         .join("\n");
@@ -1955,6 +2023,12 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (s === "\x1b[A" || s === "k") return move(-1);
       if (s === "\x1b[B" || s === "j") return move(1);
       if (s === "\r" || s === "\n") return doJump();
+      if (s === "d") {
+        // Flip full table ↔ dock strip in place. Same data + selection; the next
+        // paint() picks the matching renderer (and the dock brings its own footer).
+        dock = !dock;
+        return paint();
+      }
       if (s === "b") {
         // Expand/collapse the detached-background section. A no-op view toggle when
         // there are none — say so rather than silently doing nothing.
