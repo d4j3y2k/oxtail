@@ -8,6 +8,38 @@ behavioral changes). Dates are release dates of the published npm tag.
 The hook protocol has its own version (`HOOK_MARKER_VERSION`); when it bumps,
 re-run `npx oxtail install-hook`. The current hook version is noted per release.
 
+## [0.26.0] — 2026-06-29
+
+**The dock becomes a real cockpit.** `oxpit --dock` renders the fleet as a thin
+one-line-per-agent strip for a short bottom tmux pane — an always-on HUD welded under
+wherever you work. This release makes it a first-class surface instead of a glance-only
+strip: you can flip into it live, and every interactive flow now survives the squashed
+vertical space instead of clipping its controls off the bottom.
+
+- **`d` toggles dock ↔ full in place.** Dock mode was launch-only (`--dock`); now `d`
+  flips the live view between the compact strip and the full table in the same process —
+  collapse to a HUD when heads-down, expand to triage. Footers and `?` help advertise it.
+- **The fleet editor (`S` / `R`) survives a short pane.** Its control footer is pinned
+  (collapsing to one dense line when tight), the window grid scrolls to keep the cursor
+  visible, and the model/effort pick-menu windows its options with a `⋯ N more` marker.
+  Previously a 9-row dock clipped the `save` / `apply` / edit-key hints entirely — you
+  couldn't see how to operate it. This also fixes a latent full-view bug where a very
+  large fleet clipped its own footer off the bottom.
+- **Compose (`m`) is budget-aware.** The composer caps itself to the pane — attachments
+  collapse to a count, the buffer tail-windows, the hint shortens — and a slice backstop
+  closes a real overflow/desync bug (a multi-line draft plus the hint used to overflow a
+  short pane with no guard).
+- **Confirms are visible in the dock.** `nudge` / `kill` / error prompts rode the
+  full-view footer only, so in dock mode "press y to confirm" was invisible. The strip
+  now shows the live status line in place of its key hints while a confirm is pending.
+- **The strip never silently truncates.** A fleet taller than the pane now windows to a
+  `⋯ N more above/below` marker around the selection, the same idiom as the full table.
+
+The spawn/sync/reset plan previews and the comms-log panel were already squash-safe (they
+pin their confirm and window the body); this release brings the interactive editor,
+composer, and the strip itself up to the same standard. No hook-protocol change
+(`HOOK_MARKER_VERSION` unchanged).
+
 ## [0.25.0] — 2026-06-22
 
 **Reliability hardening — silent-failure drift, found by a live multi-agent

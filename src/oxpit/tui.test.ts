@@ -97,3 +97,4 @@ test("stepInput: under-cap unterminated paste keeps buffering (no premature flus
   assert.equal(state.pasting, true);
   assert.equal(state.pasteBuf, "small");
 });
+

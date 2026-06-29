@@ -6,7 +6,9 @@ import {
   computeAgentLabels,
   fleetTrouble,
   renderCommsLog,
+  renderDock,
   renderSnapshot,
+  windowWithMarkers,
 } from "./render.js";
 import type { FleetAgent, FleetSnapshot } from "./snapshot.js";
 import type { CommsMessage } from "./comms.js";
@@ -850,4 +852,101 @@ test("renderSnapshot: no background ⇒ no footer, no +bg suffix (unchanged)", (
   });
   assert.ok(!out.includes("background"), "no footer when there are no detached processes");
   assert.ok(!out.includes("+1 bg") && !out.includes("+0 bg"), "no +bg suffix in the header");
+});
+
+// ── windowWithMarkers: the shared dock/editor windowing invariant ───────────────
+test("windowWithMarkers: everything fits → whole list, no markers", () => {
+  assert.deepEqual(windowWithMarkers(3, 1, 5), { start: 0, end: 3, above: 0, below: 0 });
+  assert.deepEqual(windowWithMarkers(3, 2, 3), { start: 0, end: 3, above: 0, below: 0 });
+});
+
+test("windowWithMarkers: both sides hidden → accurate counts, section == budget", () => {
+  // 10 items, budget 4, cursor 5: reserve 2 markers → 2 content rows centred on 5.
+  const w = windowWithMarkers(10, 5, 4);
+  assert.equal(w.above, w.start, "above count == hidden-above");
+  assert.equal(w.below, 10 - w.end, "below count == hidden-below");
+  assert.ok(5 >= w.start && 5 < w.end, "cursor visible");
+  const section = (w.above > 0 ? 1 : 0) + (w.end - w.start) + (w.below > 0 ? 1 : 0);
+  assert.ok(section <= 4, `section ${section} fits budget 4`);
+  assert.ok(w.above > 0 && w.below > 0, "both markers present for an interior cursor");
+});
+
+test("windowWithMarkers: cursor at an edge reclaims the freed marker row", () => {
+  const top = windowWithMarkers(10, 0, 4);
+  assert.equal(top.above, 0, "no above marker at the top");
+  assert.ok(0 >= top.start && 0 < top.end);
+  const bot = windowWithMarkers(10, 9, 4);
+  assert.equal(bot.below, 0, "no below marker at the bottom");
+  assert.ok(9 >= bot.start && 9 < bot.end);
+});
+
+test("windowWithMarkers: budget ≤ 2 → bare cursor-visible window, markers suppressed", () => {
+  const w = windowWithMarkers(8, 6, 2);
+  assert.equal(w.above, 0);
+  assert.equal(w.below, 0);
+  assert.equal(w.end - w.start, 2, "exactly budget rows");
+  assert.ok(6 >= w.start && 6 < w.end, "cursor still visible");
+});
+
+test("windowWithMarkers: INVARIANT — section ≤ budget ∧ cursor visible ∧ markers exact, exhaustively", () => {
+  for (let total = 0; total <= 12; total++) {
+    for (let budget = 1; budget <= 12; budget++) {
+      for (let cursor = 0; cursor < Math.max(1, total); cursor++) {
+        const { start, end, above, below } = windowWithMarkers(total, cursor, budget);
+        const section = (above > 0 ? 1 : 0) + (end - start) + (below > 0 ? 1 : 0);
+        const ctx = `total=${total} budget=${budget} cursor=${cursor}`;
+        // The hard invariant: the rendered section never exceeds the row budget.
+        assert.ok(section <= budget, `${ctx}: section ${section} ≤ budget ${budget}`);
+        // When a marker IS shown its count is exact (no off-by-one, no dropped marker).
+        if (above > 0) assert.equal(above, start, `${ctx}: above count exact`);
+        if (below > 0) assert.equal(below, total - end, `${ctx}: below count exact`);
+        // The cursor row is always inside the content window.
+        if (total > 0) {
+          const c = Math.min(cursor, total - 1);
+          assert.ok(c >= start && c < end, `${ctx}: cursor visible in [${start},${end})`);
+        }
+        // Markers are only suppressed (rows hidden, no marker) when there's no room — i.e.
+        // budget ≤ 2. Above that, any hidden edge MUST carry a marker.
+        if (budget >= 3) {
+          if (start > 0) assert.ok(above > 0, `${ctx}: hidden-above must show a marker`);
+          if (end < total) assert.ok(below > 0, `${ctx}: hidden-below must show a marker`);
+        }
+      }
+    }
+  }
+});
+
+// ── renderDock: squash windowing ────────────────────────────────────────────────
+function dockFleet(n: number): FleetSnapshot {
+  const agents = Array.from({ length: n }, (_, i) => {
+    const id = `${i}`.repeat(8).slice(0, 8);
+    return agent({ session_id: `s-${i}`, short_id: id, window_name: `w${i}` });
+  });
+  return snap(agents);
+}
+
+test("renderDock: short fleet renders every row, no markers", () => {
+  const out = renderDock(dockFleet(3), { color: false, width: 100, maxAgentRows: 6 });
+  for (const w of ["w0", "w1", "w2"]) assert.ok(out.includes(w), `${w} present`);
+  assert.ok(!out.includes("more above") && !out.includes("more below"), "no scroll markers");
+});
+
+test("renderDock: tall fleet windows to maxAgentRows with markers + keeps selection", () => {
+  const out = renderDock(dockFleet(8), { color: false, width: 100, maxAgentRows: 4, selected: 6 });
+  const body = out.split("\n");
+  // header + footer + at most maxAgentRows lines for the agent section.
+  assert.ok(body.length <= 2 + 4, `dock fits the budget (got ${body.length} lines)`);
+  assert.ok(out.includes("w6"), "the selected row stays visible");
+  assert.ok(/⋯ \d+ more/.test(out), "shows a '⋯ N more' marker instead of silently truncating");
+});
+
+test("renderDock: dockStatus replaces the footer hints", () => {
+  const out = renderDock(dockFleet(2), {
+    color: false,
+    width: 100,
+    maxAgentRows: 6,
+    dockStatus: "nudge w0? press y to confirm",
+  });
+  assert.ok(out.includes("press y to confirm"), "status shown");
+  assert.ok(!out.includes("⏎ jump"), "key hints replaced by the status line");
 });

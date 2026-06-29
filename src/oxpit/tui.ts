@@ -15,7 +15,7 @@ import { existsSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildSnapshot, type FleetAgent, type FleetSnapshot } from "./snapshot.js";
-import { ANIM_FRAMES, attentionLine, BACKGROUND_ROW_CAP, commsBodyLines, computeAgentLabels, renderSnapshot } from "./render.js";
+import { ANIM_FRAMES, attentionLine, BACKGROUND_ROW_CAP, commsBodyLines, computeAgentLabels, renderDock, renderSnapshot, windowWithMarkers } from "./render.js";
 import { buildCommsLog, type CommsMessage } from "./comms.js";
 import { agentKey, capturePaneActivity, type AgentActivity, type PaneActivity } from "./activity.js";
 import { clipToWidth, scrubBufferText } from "./format.js";
@@ -135,21 +135,21 @@ export async function runOxpit(argv: string[]): Promise<number> {
     return 0;
   }
   const buildOpts = { allProjects: a.all, projectRoot: a.project };
+  const dock = argv.includes("--dock");
 
-  // No TTY (piped, CI, popup without -E pty): degrade to a one-shot snapshot.
+  // No TTY (piped, CI, popup without -E pty): degrade to a one-shot snapshot
+  // (dock or full, matching the requested mode).
   if (!process.stdout.isTTY || !process.stdin.isTTY) {
     const snap = buildSnapshot(buildOpts);
-    const out = renderSnapshot(snap, {
-      color: a.color ?? false,
-      width: process.stdout.columns || 100,
-    });
+    const ropts = { color: a.color ?? false, width: process.stdout.columns || 100 };
+    const out = dock ? renderDock(snap, ropts) : renderSnapshot(snap, ropts);
     process.stdout.write(out + "\n");
     return 0;
   }
 
   const color = a.color ?? !process.env.NO_COLOR;
   const client = clientFlag(argv);
-  return runInteractive({ buildOpts, color, client });
+  return runInteractive({ buildOpts, color, client, dock });
 }
 
 // Run the cockpit as a CLI entry point: runOxpit plus a FULL terminal-restore
@@ -178,6 +178,9 @@ type InteractiveOpts = {
   buildOpts: { allProjects: boolean; projectRoot: string | undefined };
   color: boolean;
   client: string | undefined;
+  // Dock mode (`--dock`): paint the compact one-line-per-agent strip (renderDock)
+  // instead of the full table — for a short bottom tmux pane. Same data + keys.
+  dock: boolean;
 };
 
 function runInteractive(opts: InteractiveOpts): Promise<number> {
@@ -202,6 +205,10 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     let torndown = false;
     let helpOpen = false;
     let mode: "fleet" | "log" = "fleet";
+    // `d` flips the whole fleet view between the full table and the compact dock
+    // strip live, same process — seeded by `--dock` but mutable so the cockpit can
+    // collapse to a HUD and lean back out to detail without a quit-and-relaunch.
+    let dock = opts.dock;
     let logFilterSelf = false; // scope the log to the fleet-selected agent
     // `b` expands the detached-background section into its individual rows (default
     // collapsed to a count header). Detached processes are never navigable, so this is
@@ -336,7 +343,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     function footerKeyLines(width: number): string[] {
       const items = [
         "↑↓ move", "⏎ jump", "n nudge", "m msg", "S fleet", "R reset", "K kill",
-        "l log", "w thread", "b bg", "r refresh", "? help", "⌃C quit",
+        "l log", "w thread", "b bg", "d dock", "r refresh", "? help", "⌃C quit",
       ];
       const maxW = Math.max(16, width - 2);
       const lines: string[] = [];
@@ -376,6 +383,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "  m             compose a message (Enter send · ⌥⏎/⌃J newline · ⌃X unattach · Esc cancel)",
         "                attach: drag a file then ⌃A · ⌃V pastes a clipboard image (copy then ⌃V)",
         "  b             show/hide detached background processes (MCP children / codex exec with no tmux pane)",
+        "  d             toggle dock ↔ full — collapse the fleet to a compact one-line-per-agent HUD strip (for a short pane) and back",
         "  l             toggle the comms-log bottom panel (fleet stays visible above)",
         "  w             open the selected agent's thread in the panel (per-agent)",
         "                in the panel: ↑↓ move the › cursor (or scroll an expanded msg) · w expand · j/k agents · f filter · ⏎ jump",
@@ -660,7 +668,13 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     // buffer is tail-windowed so a long multi-line message can't grow the bar without
     // bound (which would desync the cursor-home repaint).
     const MAX_FIELD_LINES = 6;
-    function composerBar(width: number): string[] {
+    // Build the composer (separator + ✉target header + input buffer + attachments +
+    // note + key hint). `maxLines` is the pane budget: in a short dock pane the bar
+    // caps itself toward that height — the separator is dropped, attachments collapse to
+    // a count, the buffer tail-windows, and the hint shortens. The input/cursor line is
+    // always kept; if the pane is shorter than the fixed chrome the trailing hint is
+    // dropped first, and the caller's slice is the final correctness backstop.
+    function composerBar(width: number, maxLines: number): string[] {
       const a = composeTargetKey
         ? snapshot.agents.find((ag) => agentKey(ag) === composeTargetKey)
         : undefined;
@@ -668,29 +682,47 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       const b = (s: string) => (opts.color ? `\x1b[1m\x1b[36m${s}\x1b[0m` : s);
       const d = (s: string) => dim(s, opts.color);
       const mark = a?.is_self ? " → your primary session" : "";
-      const lines: string[] = [d("─".repeat(Math.max(4, width))), b(`✉ ${to}`) + d(mark)];
-      // Buffer: each logical line wrapped, a "> " prompt on the first, cursor on the
-      // last, tail-windowed to MAX_FIELD_LINES.
+      const tight = maxLines < 10;
+      // Drop the separator rule in a short pane — every row counts, and the ✉target line
+      // + "> " prompt already delimit the composer from the fleet above.
+      const header = tight
+        ? [b(`✉ ${to}`) + d(mark)]
+        : [d("─".repeat(Math.max(4, width))), b(`✉ ${to}`) + d(mark)];
+
+      // Attachments: list ≤3 (with overflow) when there's room; collapse to a single
+      // count line when the pane is short so they never crowd out the input.
+      const attBlock: string[] = [];
+      if (composeAttachments.length) {
+        if (tight) {
+          attBlock.push(d(`📎 ${composeAttachments.length} attached`));
+        } else {
+          for (const att of composeAttachments.slice(0, 3)) attBlock.push(d(`📎 ${att.name} (${att.bytes}B)`));
+          if (composeAttachments.length > 3) attBlock.push(d(`📎 …+${composeAttachments.length - 3} more`));
+        }
+      }
+      const noteBlock = composeNote ? [d(composeNote)] : [];
+      const undo = composeAttachments.length ? " · ⌃X unattach" : "";
+      const hint = d(
+        tight
+          ? `⏎ send · ⌥⏎ nl · ⌃A attach · ⌃V img${undo} · esc`
+          : `Enter send · ⌥⏎/⌃J newline · drag+⌃A attach · ⌃V image${undo} · Esc cancel`,
+      );
+
+      // Buffer: each logical line wrapped, "> " on the first SHOWN line, cursor on the
+      // last. Tail-windowed first to MAX_FIELD_LINES, then to whatever the pane budget
+      // leaves after the fixed chrome — but always at least the cursor line.
       const wrapped: string[] = [];
       for (const logical of composeBuf.split("\n")) {
         for (const seg of wrapText(logical, width - 2)) wrapped.push(seg);
       }
       if (wrapped.length === 0) wrapped.push("");
       wrapped[wrapped.length - 1] += "█";
-      const shown =
-        wrapped.length > MAX_FIELD_LINES ? wrapped.slice(wrapped.length - MAX_FIELD_LINES) : wrapped;
-      shown.forEach((seg, i) => lines.push((i === 0 ? d("> ") : "  ") + seg));
-      // Attachments (capped) + transient note.
-      for (const att of composeAttachments.slice(0, 3)) {
-        lines.push(d(`📎 ${att.name} (${att.bytes}B)`));
-      }
-      if (composeAttachments.length > 3) {
-        lines.push(d(`📎 …+${composeAttachments.length - 3} more`));
-      }
-      if (composeNote) lines.push(d(composeNote));
-      const undo = composeAttachments.length ? " · ⌃X unattach" : "";
-      lines.push(d(`Enter send · ⌥⏎/⌃J newline · drag+⌃A attach · ⌃V image${undo} · Esc cancel`));
-      return lines;
+      const fixed = header.length + attBlock.length + noteBlock.length + 1; // +1 = hint
+      const bufBudget = Math.max(1, Math.min(MAX_FIELD_LINES, maxLines - fixed));
+      const win = wrapped.length > bufBudget ? wrapped.slice(wrapped.length - bufBudget) : wrapped;
+      const bufLines = win.map((seg, i) => (i === 0 ? d("> ") : "  ") + seg);
+
+      return [...header, ...bufLines, ...attBlock, ...noteBlock, hint];
     }
 
     function paint(): void {
@@ -718,18 +750,20 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         return;
       }
       if (composing) {
-        // Compose field at the BOTTOM; fleet/log stays visible above. Size the top
-        // region to the remaining rows and pad so the field is pinned to the foot.
-        const bar = composerBar(width).map((l) => clipToWidth(l, width) + CLEAR_EOL);
-        const avail = Math.max(1, rows - bar.length);
-        const topStr =
-          mode === "log" ? logPanelLines(width, avail).join("\n") : fleetFrame(width, avail);
-        const top = topStr
-          .split("\n")
-          .slice(0, avail)
-          .map((l) => clipToWidth(l, width) + CLEAR_EOL);
-        while (top.length < avail) top.push(CLEAR_EOL); // pad so the bar sits at the bottom
-        stdout.write(HOME + [...top, ...bar].join("\n") + CLEAR_BELOW);
+        // Compose field at the BOTTOM; fleet/log stays visible above. The bar is
+        // budgeted to `rows` so in a short dock pane it caps itself (and can take the
+        // whole pane — composing is modal) instead of overflowing; the final slice is
+        // the correctness backstop against any residual over-tall bar.
+        const bar = composerBar(width, rows).map((l) => clipToWidth(l, width) + CLEAR_EOL);
+        const avail = Math.max(0, rows - bar.length);
+        const top: string[] = [];
+        if (avail > 0) {
+          const topStr =
+            mode === "log" ? logPanelLines(width, avail).join("\n") : fleetFrame(width, avail);
+          for (const l of topStr.split("\n").slice(0, avail)) top.push(clipToWidth(l, width) + CLEAR_EOL);
+          while (top.length < avail) top.push(CLEAR_EOL); // pad so the bar sits at the bottom
+        }
+        stdout.write(HOME + [...top, ...bar].slice(0, rows).join("\n") + CLEAR_BELOW);
         return;
       }
       const clipEOL = (l: string) => clipToWidth(l, width) + CLEAR_EOL;
@@ -749,6 +783,29 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         while (top.length < topAvail) top.push(CLEAR_EOL);
         const panel = logPanelLines(width, rows - topAvail).map(clipEOL);
         stdout.write(HOME + [...top, ...panel].slice(0, rows).join("\n") + CLEAR_BELOW);
+        return;
+      }
+      // Dock mode: the compact strip replaces the whole fleet view (it brings its
+      // own header + footer). slice(0, rows) is the overflow backstop — a fleet
+      // taller than the pane truncates rather than wrapping into a repaint desync.
+      if (dock) {
+        const dockBody = renderDock(snapshot, {
+          color: opts.color,
+          width,
+          selected: selectedIndex(),
+          toolActivity: activityCache,
+          // Reserve the header + footer rows; renderDock windows the agents to the rest
+          // (with "⋯ N more" markers) so a tall fleet doesn't silently truncate.
+          maxAgentRows: Math.max(1, rows - 2),
+          // Surface a live confirm/feedback line in the strip's footer (the full table
+          // rides these on its own footer; the dock has no other seam).
+          dockStatus: Date.now() < statusUntil && status ? status : undefined,
+        })
+          .split("\n")
+          .slice(0, rows)
+          .map(clipEOL)
+          .join("\n");
+        stdout.write(HOME + dockBody + CLEAR_BELOW);
         return;
       }
       // Clip every physical line to the terminal width (ANSI-aware) so none wraps —
@@ -1033,13 +1090,27 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
           d(`   fleet "${fe.fleetName}" → session "${sessionName}"  (y: preview the reset with these edits)`)
         : b("FLEET — configure") +
           d(`     fleet "${fe.fleetName}" → session "${sessionName}"  (y: spawn if new, sync if it exists)`);
-      const lines: string[] = [
-        header,
-        d(`  ${fe.note}`),
-        "",
-        d("  " + "window".padEnd(14) + "agent".padEnd(8) + "model".padEnd(16) + "effort".padEnd(8) + "rc"),
-      ];
-      fe.windows.forEach((w, i) => {
+      // The control footer ALWAYS stays visible — it's how you operate the editor, so
+      // it must never be the row that gets clipped off in a squashed dock pane. When the
+      // pane is short the verbose multi-line key hints collapse to one dense line, the
+      // head sheds its spacer row, and the window grid scrolls to keep the cursor on
+      // screen. An open pick/input menu replaces the hints (and windows its own options).
+      const tight = rows < 16;
+      const colHeader = d(
+        "  " + "window".padEnd(14) + "agent".padEnd(8) + "model".padEnd(16) + "effort".padEnd(8) + "rc",
+      );
+      // In a very short pane drop the column-header row entirely — that one row, handed
+      // back to the window grid, is what lets a small fleet (and its "⋯ N more" marker)
+      // fully fit instead of clipping a window with no indicator. The note stays (it
+      // carries save/error feedback); the column labels are guessable for a few windows.
+      const head =
+        rows < 8
+          ? [header, d(`  ${fe.note}`)]
+          : tight
+            ? [header, d(`  ${fe.note}`), colHeader]
+            : [header, d(`  ${fe.note}`), "", colHeader];
+
+      const winRows = fe.windows.map((w, i) => {
         const rc = w.agent === "claude" ? (w.remoteControl ? "on" : "off") : "–";
         const cells =
           (w.name || "(unnamed)").padEnd(14) +
@@ -1047,42 +1118,70 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
           (w.model || "–").padEnd(16) +
           (w.effort || "–").padEnd(8) +
           rc;
-        if (i === fe.cursor) {
-          lines.push(opts.color ? `\x1b[7m▸ ${cells}\x1b[0m` : `▸ ${cells}`);
-        } else {
-          lines.push(`  ${cells}`);
-        }
+        return i === fe.cursor
+          ? opts.color
+            ? `\x1b[7m▸ ${cells}\x1b[0m`
+            : `▸ ${cells}`
+          : `  ${cells}`;
       });
-      lines.push("");
+
+      // Window `linesIn` to keep `cursor` visible within `cap` rows, prepending/appending
+      // a dim "⋯ N more above/below" marker as its OWN line (additive — never overwrites a
+      // content row, so the count is exact and the bottom marker can't be dropped). A
+      // cap ≤ 0 collapses the section to nothing so the footer always wins the budget.
+      const fitWin = (linesIn: string[], cursor: number, cap: number): string[] => {
+        if (cap <= 0) return [];
+        const { start, end, above, below } = windowWithMarkers(linesIn.length, cursor, cap);
+        const out: string[] = [];
+        if (above > 0) out.push(d(`  ⋯ ${above} more above`));
+        for (let i = start; i < end; i++) out.push(linesIn[i]);
+        if (below > 0) out.push(d(`  ⋯ ${below} more below`));
+        return out;
+      };
+
+      let footer: string[];
       if (fleetEditPick) {
         const pk = fleetEditPick;
-        lines.push(b(`  select ${pk.field} for "${fe.windows[fe.cursor].name}":`));
-        pk.options.forEach((opt, i) => {
+        const optLines = pk.options.map((opt, i) => {
           const label = opt === "" ? "(default)" : opt;
-          lines.push(
-            i === pk.cursor
-              ? opts.color
-                ? `\x1b[7m  ▸ ${label}\x1b[0m`
-                : `  ▸ ${label}`
-              : `    ${label}`,
-          );
+          return i === pk.cursor
+            ? opts.color
+              ? `\x1b[7m  ▸ ${label}\x1b[0m`
+              : `  ▸ ${label}`
+            : `    ${label}`;
         });
-        lines.push(d("  ↑↓ · ⏎ pick · esc cancel"));
+        footer = [
+          b(`  select ${pk.field} for "${fe.windows[fe.cursor].name}":`),
+          // Reserve the title + hint (2) AND the non-tight spacer row so the whole frame
+          // (head + this footer + sep) stays within `rows` and the pick hint survives.
+          ...fitWin(optLines, pk.cursor, Math.max(1, rows - head.length - (tight ? 0 : 1) - 2)),
+          d("  ↑↓ · ⏎ pick · esc cancel"),
+        ];
       } else if (fleetEditInput) {
-        lines.push(b(`  edit ${fleetEditInput.field}: ${fleetEditInput.buf}█`));
-        lines.push(d("  ⏎ ok · esc cancel"));
+        footer = [b(`  edit ${fleetEditInput.field}: ${fleetEditInput.buf}█`), d("  ⏎ ok · esc cancel")];
+      } else if (tight) {
+        footer = [
+          d(
+            fe.reset
+              ? "  ↑↓ sel · a/d add·del · n/m/f/t/r edit · w save · y PREVIEW · esc back"
+              : "  ↑↓ sel · a/d add·del · n/m/f/t/r edit · w save · y apply · esc",
+          ),
+        ];
       } else {
-        lines.push(d("  ↑↓ select · a add window · d delete"));
-        lines.push(d("  n name · m model · f effort · t type · r remote-control"));
-        lines.push(
+        footer = [
+          d("  ↑↓ select · a add window · d delete"),
+          d("  n name · m model · f effort · t type · r remote-control"),
           d(
             fe.reset
               ? "  F fleet-name · w save .oxtail/fleet.json · y PREVIEW RESET (with these edits) · esc back to plan"
               : "  F fleet-name · w save .oxtail/fleet.json · y APPLY (spawn new / sync existing) · esc cancel",
           ),
-        );
+        ];
       }
-      return lines
+
+      const sep = tight ? [] : [""];
+      const cap = rows - head.length - footer.length - sep.length;
+      return [...head, ...fitWin(winRows, fe.cursor, cap), ...sep, ...footer]
         .slice(0, Math.max(1, rows))
         .map((l) => clipToWidth(l, width) + CLEAR_EOL)
         .join("\n");
@@ -1955,6 +2054,12 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (s === "\x1b[A" || s === "k") return move(-1);
       if (s === "\x1b[B" || s === "j") return move(1);
       if (s === "\r" || s === "\n") return doJump();
+      if (s === "d") {
+        // Flip full table ↔ dock strip in place. Same data + selection; the next
+        // paint() picks the matching renderer (and the dock brings its own footer).
+        dock = !dock;
+        return paint();
+      }
       if (s === "b") {
         // Expand/collapse the detached-background section. A no-op view toggle when
         // there are none — say so rather than silently doing nothing.

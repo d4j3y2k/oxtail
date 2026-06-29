@@ -50,12 +50,49 @@ export type RenderOptions = {
   // Expand the detached-background section into its individual rows (TUI `b` toggle).
   // Default false: the section renders as a single collapsed count header.
   showBackground?: boolean;
+  // DOCK mode only: a transient operator status/confirm line (already styled). When
+  // set it REPLACES the dock footer key-hints, so confirms ("press y", "press K
+  // again") and feedback are visible in the strip — the full table rides these on its
+  // footer, but the dock has no other seam to surface them.
+  dockStatus?: string;
 };
 
 // Cap on background rows rendered when the section is expanded, so a runaway process
 // leak can't overflow the frame. Shared with the TUI's height reservation so the two
 // agree on how many lines the expanded section occupies.
 export const BACKGROUND_ROW_CAP = 8;
+
+// Window `total` items around `cursor` into at most `budget` DISPLAY rows, RESERVING
+// rows for the "⋯ N more above/below" markers so the markers are always shown (and
+// counted accurately) when items are hidden, and the rendered section — content rows
+// PLUS markers — never exceeds `budget`. Returns the content slice [start, end) and the
+// EXACT hidden counts above/below (0 when that edge isn't clipped). This is the one
+// shared windowing idiom behind the dock strip's agent rows AND the fleet editor's grid
+// (an earlier marker-OVERLAY variant silently dropped the bottom marker and undercounted
+// hidden rows by one when the cursor sat on the window's edge — compile-sim, 3 lenses).
+export function windowWithMarkers(
+  total: number,
+  cursor: number,
+  budget: number,
+): { start: number; end: number; above: number; below: number } {
+  if (budget >= total || total <= 0) return { start: 0, end: Math.max(0, total), above: 0, below: 0 };
+  const c = Math.max(0, Math.min(cursor, total - 1));
+  if (budget <= 2) {
+    // No room for a marker row — show a bare cursor-visible window (markers suppressed
+    // because there's physically nowhere to put one; the section is exactly `budget`).
+    const start = Math.max(0, Math.min(c - Math.floor(budget / 2), total - budget));
+    return { start, end: start + budget, above: 0, below: 0 };
+  }
+  // Reserve BOTH marker rows up front, then reclaim one when an edge isn't actually
+  // hidden — so content + markers == budget when clipped on both sides, and budget-1
+  // (one spare) when clipped on only one. Never exceeds budget.
+  const contentCap = budget - 2;
+  let start = Math.max(0, Math.min(c - Math.floor(contentCap / 2), total - contentCap));
+  let end = start + contentCap;
+  if (start === 0 && end < total) end = Math.min(total, end + 1); // no "above" marker → grow content down
+  else if (end === total && start > 0) start = Math.max(0, start - 1); // no "below" marker → grow content up
+  return { start, end, above: start, below: total - end };
+}
 
 type Paint = (s: string, ...codes: string[]) => string;
 
@@ -732,4 +769,85 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
   // would wrap to a second physical row and desync the TUI's cursor-home repaint
   // (and just looks broken in one-shot mode). ANSI-aware (max M3).
   return lines.map((l) => clipToWidth(l, width)).join("\n");
+}
+
+// ── DOCK mode ────────────────────────────────────────────────────────────────
+// A compact, one-line-per-agent render for a SHORT bottom tmux pane — David's
+// "oxpit as a navigation dock" idea. Same liveness / status / badge TRUTH as
+// renderSnapshot (it reuses the very same helpers), but drops the table chrome,
+// the wait-graph block, the background section, and the multi-line purpose so a
+// header + ~6 agents + a footer fit in ~8-10 rows. Jump/message keys still drive
+// it — this is a denser VIEW, not a different data path.
+const DOCK_NAME_W = 8;
+const DOCK_STATUS_W = 13;
+
+// One-line fleet header: liveness counts + the operator signal a dock exists for
+// (🙋 who's awaiting YOU) + any hard trouble. A clean fleet still shows ✓ so the
+// absence of alarms reads as "checked & fine", matching attentionLine's posture.
+function dockHeader(s: FleetSnapshot, paint: Paint, width: number): string {
+  const t = fleetTrouble(s);
+  const idle = s.agents.filter((a) => a.liveness === "idle").length;
+  const dead = s.agents.filter((a) => a.liveness === "dead").length;
+  const counts: string[] = [];
+  if (t.active) counts.push(paint(`${GLYPH.active}${t.active}`, C.green));
+  if (idle) counts.push(paint(`${GLYPH.idle}${idle}`, C.yellow));
+  if (dead) counts.push(paint(`${GLYPH.dead}${dead}`, C.gray));
+  const segs: string[] = [paint("oxpit", C.cyan, C.bold)];
+  if (counts.length) segs.push(counts.join(" "));
+  if (t.awaiting) segs.push(paint(`🙋${t.awaiting} awaiting you`, C.yellow, C.bold));
+  if (t.deadlocks) segs.push(paint(`⛔${t.deadlocks} deadlock`, C.red, C.bold));
+  if (t.orphaned) segs.push(paint(`⛔${t.orphaned} orphaned`, C.red, C.bold));
+  if (t.stranded) segs.push(paint(`⚑${t.stranded} stranded`, C.red));
+  if (!t.awaiting && !t.deadlocks && !t.orphaned && !t.stranded) segs.push(paint("✓", C.dim));
+  return clipToWidth(segs.join(paint(" · ", C.dim)), width);
+}
+
+export function renderDock(s: FleetSnapshot, opts: RenderOptions = {}): string {
+  const color = opts.color ?? true;
+  const width = opts.width ?? 80;
+  const paint = makePaint(color);
+  if (s.agents.length === 0) {
+    return [
+      dockHeader(s, paint, width),
+      clipToWidth(paint("  no agents in this project yet", C.dim), width),
+    ].join("\n");
+  }
+  const labels = computeAgentLabels(s.agents).byShortId;
+  const sel = opts.selected ?? -1;
+  const lines: string[] = [dockHeader(s, paint, width)];
+  const rowFor = (a: FleetSnapshot["agents"][number], i: number): string => {
+    const k = agentKey(a);
+    const act = opts.toolActivity?.has(k) ? opts.toolActivity.get(k) ?? null : a.activity;
+    const b = badges(a, paint, labels, act);
+    const name = labels.get(a.short_id) ?? a.short_id;
+    const selected = i === sel;
+    const marker = selected ? paint("›", C.cyan, C.bold) : " ";
+    const nameCell =
+      selected && color
+        ? `${SELECT_BG}${cell(name, DOCK_NAME_W)}${C.reset}`
+        : cell(name, DOCK_NAME_W);
+    const status = paint(cell(statusText(a), DOCK_STATUS_W), livenessColor(a.liveness));
+    const self = a.is_self ? paint("◂you", C.dim) : "";
+    return clipToWidth(`${marker}${GLYPH[a.liveness]} ${nameCell} ${status} ${b.text} ${self}`.trimEnd(), width);
+  };
+  // Window the agent rows to the pane budget (maxAgentRows) so a fleet taller than a
+  // short dock pane shows a "⋯ N more" marker instead of silently truncating off the
+  // bottom — the same idiom as the full table. windowWithMarkers reserves the marker
+  // rows WITHIN the budget, so header + this section + footer never exceeds the pane and
+  // the footer (which carries dockStatus confirms) is never the line that gets clipped.
+  const total = s.agents.length;
+  const cap = opts.maxAgentRows && opts.maxAgentRows > 0 ? opts.maxAgentRows : total;
+  const { start, end, above, below } = windowWithMarkers(total, sel >= 0 ? sel : 0, cap);
+  if (above > 0) lines.push(clipToWidth(paint(`  ⋯ ${above} more above`, C.dim), width));
+  for (let i = start; i < end; i++) lines.push(rowFor(s.agents[i], i));
+  if (below > 0) lines.push(clipToWidth(paint(`  ⋯ ${below} more below`, C.dim), width));
+  // The footer is the dock's only seam for transient feedback: when the TUI hands us a
+  // status/confirm line, show it INSTEAD of the key hints (it expires back to the hints
+  // on the next tick) so "press y"/"press K again" prompts aren't invisible in the strip.
+  lines.push(
+    opts.dockStatus
+      ? clipToWidth("  " + opts.dockStatus, width)
+      : clipToWidth(paint("  ⏎ jump · m msg · n nudge · l log · d full · r refresh · ⌃C quit", C.dim), width),
+  );
+  return lines.join("\n");
 }
