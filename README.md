@@ -97,6 +97,15 @@ npx oxtail oxpit       # live interactive cockpit
 npx oxtail status      # print once and exit (scriptable, --json)
 ```
 
+To see what oxtail costs in tokens — the standing tool-schema budget, the
+per-delivery hook envelope, and (with `--transcript`) a session's real oxtail
+tool traffic:
+
+```sh
+npx oxtail token-budget                       # static budget + CI-guarded ceiling
+npx oxtail token-budget --transcript <file>   # + measured spend from a transcript
+```
+
 That's it. Start a second agent in the same project and they'll see each other. To let
 agents message without a per-call approval prompt, see
 [Configuration](#configuration).
