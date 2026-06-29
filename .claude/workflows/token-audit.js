@@ -295,8 +295,15 @@ const audited = await pipeline(
   // it). Decision-accuracy regression vetoes regardless of bytes saved.
   (verified, t) => {
     if (!verified) return null;
+    // Independence is CODE-enforced, not just prompt-enforced (codex review):
+    // require exactly two verdicts, two DISTINCT lenses, both non-refuted. Two
+    // same-lens verdicts must NOT reach behavioral on the synthesizer's good
+    // faith — the distinct-lens set check closes that.
+    const lenses = new Set(verified.verdicts.map((v) => v && v.lens));
     const passedStatic =
-      verified.verdicts.length === 2 && verified.verdicts.every((v) => v && v.refuted === false);
+      verified.verdicts.length === 2 &&
+      lenses.size === 2 &&
+      verified.verdicts.every((v) => v && v.refuted === false);
     if (!passedStatic) return { ...verified, behavioral: null };
     return agent(behavioralPrompt(t, verified.proposal), {
       schema: BEHAVIORAL_SCHEMA,
