@@ -30,6 +30,12 @@ import type { Mailbox } from "./mailbox.js";
 
 // Mixed JSON + English prose. ~3.5 chars/tok for dense JSON, ~4.5 for prose;
 // 3.7 is a conservative blend that matches the tool-schema/envelope mix.
+// CAVEAT (codex review): one ratio is fine for a WITHIN-SAME-SURFACE delta
+// (description vs the same description shortened) but NOT for ranking ACROSS
+// surfaces — JSON-heavy schemas, prose-heavy hooks, and natural-language message
+// bodies tokenize differently, so absolute cross-surface comparisons can rank the
+// wrong target. Use it for "did this edit shrink?", not "which surface is biggest
+// in true tokens?". For real economics, measure from a tokenizer/usage, not this.
 export const CHARS_PER_TOKEN = 3.7;
 
 export function estTokens(chars: number): number {
@@ -139,17 +145,22 @@ export function measureEnvelopes(): EnvelopeBudget {
 
 // ── 3. PER-CALL: representative response payloads ─────────────────────────────
 
-// Illustrative — exact bytes depend on runtime (wake outcome, peer claim state,
-// note presence). These are typical happy/edge shapes, measured so the report
-// can show "what lands back in your context after a call".
+// Exact bytes depend on runtime, but every sample below is a SHAPE verified
+// against a live call or the handler source (server.ts / wake.ts) — NOT invented.
+// The enum-bearing fields (wake_status, delivery_outlook) are additionally
+// cross-checked against the live wake.ts unions by the test, so a sample can
+// never drift back to teaching vocabulary the protocol doesn't use. (An
+// illustrative-but-false sample is worse than none: byte-true, protocol-false —
+// it teaches stale vocabulary while the byte tests pass. Found by codex review.)
 const SID = "b7f3e2a1-0c4d-4e5f-8a9b-1c2d3e4f5a6b";
+const MID = "656ddfdf447e3f6c";
 export const RESPONSE_SAMPLES: Array<{ label: string; payload: unknown }> = [
-  { label: "register_my_session", payload: { schema_version: 1, ok: true, session_id: SID, registered: true } },
-  { label: "read_my_messages  count:0 (empty poll)", payload: { schema_version: 1, drained: true, count: 0, messages: [] } },
-  { label: "send_message  happy (idle peer woken)", payload: { schema_version: 1, ok: true, message_id: "m_a1b2c3", target_session_id: SID, target_server_pid: 48213, wake_status: "woken", wake_reason: "send_message" } },
-  { label: "send_message  busy peer + delivery_outlook", payload: { schema_version: 1, ok: true, message_id: "m_a1b2c3", target_session_id: SID, target_server_pid: 48213, wake_status: "skipped_busy", wake_reason: "send_message", delivery_outlook: "will_see_on_next_turn", hint: "Peer is mid-turn; its hook will deliver this at its next tool call or turn end." } },
-  { label: "ask_peer  reply received", payload: { schema_version: 1, status: "replied", correlation: "correlated", reply: { from_session_id: SID, request_id: "req_99", body: "Looks right. Ship it — but gate the publish on my explicit ok first." }, wake_status: "fired" } },
-  { label: "ask_peer  timed_out (durable pending)", payload: { schema_version: 1, status: "timed_out", reply: null, timed_out: true, pending_recorded: true, wake_status: "fired_unconfirmed" } },
+  { label: "read_my_messages  count:0 (empty poll)", payload: { schema_version: 1, ok: true, drained: true, count: 0, messages: [] } },
+  { label: "send_message  idle hooked peer (wake:auto → fired)", payload: { schema_version: 1, ok: true, message_id: MID, target_session_id: SID, target_server_pid: 48213, wake_status: "fired" } },
+  { label: "send_message  hookless peer (wake → fired_unconfirmed)", payload: { schema_version: 1, ok: true, message_id: MID, target_session_id: SID, target_server_pid: 48213, wake_status: "fired_unconfirmed" } },
+  { label: "send_message  plain send strands (delivery_outlook)", payload: { schema_version: 1, ok: true, message_id: MID, target_session_id: SID, target_server_pid: 48213, delivery_outlook: "stranded_until_read", hint: "Peer isn't actively reading right now — it reads this at its next turn. If this is context/FYI, that's fine, leave it. If it must ACT: ask_peer (you need an answer this turn / will block on it), action_required:true (a durable task you track via my_open_work), or wake:\"auto\" (just nudge it to read now)." } },
+  { label: "ask_peer  reply received", payload: { schema_version: 1, ok: true, message_id: MID, request_id: "req_99", wake_status: "fired", reply: { id: "a1b2c3d4e5f60718", body: "Looks right. Ship it — but gate the publish on my explicit ok first.", enqueued_at: 1782663600, from_session_id: SID, reply_to: "req_99", correlation: "correlated" }, correlation: "correlated", timeout_ms: 60000, timed_out: false } },
+  { label: "ask_peer  timed_out (durable pending pull-back)", payload: { schema_version: 1, ok: true, message_id: MID, request_id: "req_99", wake_status: "fired_unconfirmed", reply: null, correlation: "none", timeout_ms: 60000, timed_out: true } },
 ];
 
 export type ResponseMeasure = { label: string; chars: number; tokensEst: number };
@@ -184,6 +195,16 @@ export type SpendSummary = {
 // rewrite) must bump this in the same PR — that review friction is the whole
 // point: every byte here is paid by every session. Each accepted audit round
 // ratchets this DOWN; it should never drift up without a named reason.
+//
+// HONEST LIMITS (max + codex review): this is an anti-GROWTH brake, NOT the
+// optimization objective. It guards the FIXED, prompt-cached cost (~14 tok/turn
+// after turn 1) and is partially gameable — a risky addition can hide under the
+// headroom, and a harmful deletion can "buy budget" for unrelated growth (the
+// 10k floor only catches catastrophic deletion, not loss of one load-bearing
+// clause). The cost that actually SCALES with collaboration is the per-exchange
+// envelope + response payload (see summarizeOxtailToolTraffic / the trace
+// envelope accounting); that — tokens-per-peer-exchange — is the budget worth
+// tracking, not this ceiling. Keep this as a brake; don't mistake it for a goal.
 export const BUDGET_CEILING_CHARS = 25_500;
 
 function isOxtailTool(name: string | undefined): boolean {

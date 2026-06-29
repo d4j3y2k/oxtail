@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -12,9 +12,28 @@ import {
   measureEnvelopes,
   measureResponses,
   measureToolSchemas,
+  RESPONSE_SAMPLES,
   summarizeOxtailToolTraffic,
   type ToolDef,
 } from "./token-budget.js";
+
+// Extract a TS string-literal union (export type X = "a" | "b" | ...;) from
+// source — the live source of truth for the protocol's enum vocabulary.
+function unionMembers(src: string, typeName: string): Set<string> {
+  const start = src.indexOf(`export type ${typeName} =`);
+  assert.ok(start >= 0, `${typeName} not found`);
+  // Strip line comments FIRST — a member's trailing `// ...; ...` comment
+  // contains semicolons that would otherwise truncate the union at the wrong `;`.
+  const tail = src
+    .slice(start)
+    .split("\n")
+    .map((l) => l.replace(/\/\/.*$/, ""))
+    .join("\n");
+  const block = tail.slice(0, tail.indexOf(";"));
+  const members = new Set<string>();
+  for (const m of block.matchAll(/"([a-z_]+)"/g)) members.add(m[1]);
+  return members;
+}
 
 const SERVER_ENTRY = resolve(import.meta.dirname, "server.ts");
 const TSX_BIN = resolve(import.meta.dirname, "..", "node_modules", ".bin", "tsx");
@@ -79,6 +98,36 @@ test("measureResponses returns positive, ordered-by-definition samples", () => {
   // The empty poll is the cheapest response shape.
   const poll = r.find((m) => m.label.includes("count:0"));
   assert.ok(poll && poll.chars < 100, "count:0 poll should be tiny");
+});
+
+// Drift guard (codex review): a response sample must never teach an enum value
+// the live protocol doesn't use. Cross-check each sample's wake_status /
+// delivery_outlook against the real wake.ts unions, and correlation against its
+// inline set. This is the test that would have caught the wake_status:"woken" /
+// delivery_outlook:"will_see_on_next_turn" fabrication.
+test("response samples use only real protocol enum values (no invented vocabulary)", () => {
+  const wakeSrc = readFileSync(new URL("./wake.ts", import.meta.url), "utf8");
+  const wakeStatuses = unionMembers(wakeSrc, "WakeStatus");
+  const outlooks = unionMembers(wakeSrc, "DeliveryOutlook");
+  assert.ok(wakeStatuses.size >= 10, `expected ≥10 WakeStatus members, got ${wakeStatuses.size}`);
+  assert.ok(outlooks.size >= 2, `expected ≥2 DeliveryOutlook members, got ${outlooks.size}`);
+  const correlations = new Set(["correlated", "uncorrelated", "none"]);
+  for (const { label, payload } of RESPONSE_SAMPLES) {
+    const p = payload as Record<string, unknown>;
+    if (typeof p.wake_status === "string") {
+      assert.ok(wakeStatuses.has(p.wake_status), `${label}: wake_status "${p.wake_status}" is not a real WakeStatus`);
+    }
+    if (typeof p.delivery_outlook === "string") {
+      assert.ok(outlooks.has(p.delivery_outlook), `${label}: delivery_outlook "${p.delivery_outlook}" is not a real DeliveryOutlook`);
+    }
+    if (typeof p.correlation === "string") {
+      assert.ok(correlations.has(p.correlation), `${label}: correlation "${p.correlation}" is not real`);
+    }
+    const reply = p.reply as Record<string, unknown> | null | undefined;
+    if (reply && typeof reply.correlation === "string") {
+      assert.ok(correlations.has(reply.correlation as string), `${label}: reply.correlation invalid`);
+    }
+  }
 });
 
 // ── pure: telemetry ──────────────────────────────────────────────────────────

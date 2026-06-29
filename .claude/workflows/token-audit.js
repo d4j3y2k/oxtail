@@ -36,9 +36,18 @@ export const meta = {
     { title: "Target", detail: "measure the budget, pick the heaviest descriptions" },
     { title: "Propose", detail: "one independent agent rewrites each target" },
     { title: "Verify", detail: "independent skeptics (misuse + accuracy-vs-code) try to refute" },
+    { title: "Behavioral", detail: "decision-scenario eval — does the text still cause the right call?" },
     { title: "Synthesize", detail: "re-measure deltas, bucket survivors, emit the report" },
   ],
 };
+
+// OBJECTIVE (re-centered after the real-spend measurement + max/codex review):
+// the goal is DECISION-ACCURACY per real-traffic token, NOT description size.
+// Caching makes turn-count × persistent-context the dominant cost, so a misused
+// call (a wasted turn) costs far more than any description's bytes. Bytes are a
+// capped constraint (the ceiling brake); decision-accuracy is the objective —
+// measured by the Behavioral stage against the frozen scenario bank, not by
+// dueling skeptic opinion.
 
 const REPO = (args && args.repo) || "/Users/davidkim/dev/oxtail";
 const TOP_N = (args && args.topN) || 5;
@@ -90,8 +99,37 @@ const PROPOSAL_SCHEMA = {
     riskTier: { type: "string", enum: ["safe", "needs-review", "needs-behavioral-eval"] },
     leastSure: { type: "string", description: "the single change the reviewers should attack hardest" },
     foundDrift: { type: "boolean", description: "true if the current description contradicts the handler code" },
+    betterLeverElsewhere: { type: "string", description: "if the real win is a protocol change (collapse accreted caller-facing surface) or an ADD (missing field/clarification) a description edit can't reach, name it; else empty" },
   },
   required: ["name", "original", "proposed", "origChars", "proposedChars", "riskTier", "leastSure", "foundDrift"],
+  additionalProperties: false,
+};
+
+const BEHAVIORAL_SCHEMA = {
+  type: "object",
+  properties: {
+    name: { type: "string" },
+    scenariosRun: { type: "number" },
+    accuracyOriginal: { type: "number", description: "0..1 decision-accuracy of the ORIGINAL description" },
+    accuracyProposed: { type: "number", description: "0..1 decision-accuracy of the PROPOSED description" },
+    regressed: { type: "boolean", description: "true if PROPOSED misses any scenario ORIGINAL passed" },
+    perScenario: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          originalCorrect: { type: "boolean" },
+          proposedCorrect: { type: "boolean" },
+          note: { type: "string" },
+        },
+        required: ["id", "originalCorrect", "proposedCorrect"],
+        additionalProperties: false,
+      },
+    },
+    verdict: { type: "string", enum: ["pass", "veto"] },
+  },
+  required: ["name", "accuracyOriginal", "accuracyProposed", "regressed", "verdict"],
   additionalProperties: false,
 };
 
@@ -149,6 +187,8 @@ Do this:
 
 A reader of this description is an LLM agent. A LOAD-BEARING distinction is anything that changes which parameter it sets, how it reads a result, or which tool it reaches for next. Keep all of those.
 
+THE LOOP IS NOT SUBTRACT-ONLY (max review): oxtail's reliability story is mostly ADDED guidance/fields. If the honest conclusion is "this needs a clarifying clause / a missing field" (proposed LONGER), say so — a correct ADD beats a risky cut. And the only move that wins bytes AND behavior at once is collapsing ACCRETED protocol surface: if a description is huge because it exposes many states the CALLER does not act on differently (e.g. several skipped_* wake_status values that all mean "not nudged, in mailbox, seen next turn"), the real fix is a protocol pass (collapse the caller-facing surface, keep detail in a debug field), which a description edit CANNOT reach. You can't make that change here, but FLAG it in betterLeverElsewhere so it's not lost.
+
 Set riskTier honestly: "safe" (only cut dead/redundant text or fixed drift), "needs-review" (tightened live guidance, believe it's preserved), "needs-behavioral-eval" (cut something load-bearing for real savings). In leastSure, name the single change a skeptic should attack hardest — be honest, it's how the hole gets caught.`;
 
 const verifyMisusePrompt = (t, p) =>
@@ -182,9 +222,26 @@ Verify against real behavior: open ${REPO}/src/server.ts at \`registerTool("${t.
 
 Give ONE strongest concrete inaccuracy/omission if refuted (quote the proposed text + the code/original it contradicts or drops), plus the smallest correction. If accurate and complete, say so and name what you cross-checked (esp. the full status/field set and the conditionals).`;
 
+const behavioralPrompt = (t, p) =>
+  `You are the BEHAVIORAL VETO in oxtail's token audit — the MEASUREMENT static skeptics can't provide. Static review checks "does the text still SAY the distinction"; you check "does the text still CAUSE the right decision."
+
+For tool "${t.name}": read ${REPO}/src/eval/scenarios.ts and select the scenarios whose \`tools\` include "${t.name}". For EACH, run the decision test TWICE — once treating ONLY the ORIGINAL description as the agent's knowledge of this tool, once treating ONLY the PROPOSED — decide the action a fresh agent WOULD take given only that description + scenario.situation, and score it against scenario.rubric / scenario.correct. Grade STRICTLY: if the description doesn't make the correct action clearly inferable, that's a MISS even if you personally know the right answer — you are testing the DESCRIPTION, not your knowledge.
+
+ORIGINAL:
+"""
+${p.original}
+"""
+PROPOSED:
+"""
+${p.proposed}
+"""
+Report per-scenario originalCorrect/proposedCorrect, each version's accuracy (fraction correct), regressed=true if PROPOSED misses ANY scenario ORIGINAL passed, and verdict="veto" if it regressed on a high- or medium-frequency scenario (else "pass"). A veto KILLS the candidate regardless of bytes saved — decision-accuracy is the objective, size is the constraint.
+
+(v1 limitation: you role-play the fresh-agent decision for all scenarios in one context; the higher-fidelity upgrade is a truly isolated fresh agent per (description, scenario). Grade honestly against that ideal — and if a scenario's correct action is genuinely ambiguous from EITHER description, say so rather than inventing a pass/fail.)`;
+
 const synthPrompt = (bundle) =>
   `You are the SYNTHESIZER in oxtail's token audit. Below is a JSON array of {target, proposal, verdicts[]}. Produce the human-review report. Rules:
-- A candidate SURVIVES only if BOTH (all) verdicts have refuted=false. Any refutation → survived=false, bucket="rejected", and carry the refuter's argument + minimalFix in the note (so a human can decide whether the small fix rescues it).
+- A candidate SURVIVES only if ALL THREE hold: (1) exactly two verdicts, one per DISTINCT lens (misuse-prevention AND accuracy-vs-code), both refuted=false; (2) behavioral is non-null with verdict="pass" and regressed=false (no decision-accuracy loss on the scenario bank); (3) tokenDelta < 0 OR it's a coherence/drift fix. Independence is the guardrail: one skeptic is not a pass. The behavioral veto is the OBJECTIVE check — a candidate that saves bytes but regresses a high/medium scenario is bucket="needs-behavioral-eval", NEVER safe. A behavioral=null means it was rejected by the static skeptics before behavioral ran → bucket="rejected". Any static refutation → "rejected" with the refuter's argument + minimalFix in the note.
 - For each SURVIVOR, RE-MEASURE the real delta yourself: deltaChars = proposedChars - origChars (negative = saves). Trust the numbers in the proposal only after sanity-checking they're consistent; if a proposal's counts look off, note it.
 - Bucket survivors by the proposal's riskTier (safe / needs-review / needs-behavioral-eval), but DOWNGRADE to needs-review if any verdict was refuted=false at only "low" confidence on a live-guidance change.
 - Rank survivors by (bytes saved × confidence). Sum the total potential saving and translate to ~tokens at 3.7 chars/tok.
@@ -212,12 +269,41 @@ const audited = await pipeline(
   targets,
   // stage 1: propose
   (t) => agent(proposePrompt(t), { schema: PROPOSAL_SCHEMA, label: `propose:${t.name}`, phase: "Propose" }),
-  // stage 2: two INDEPENDENT skeptics in parallel, attached to the proposal
+  // stage 2: two INDEPENDENT skeptics in parallel, attached to the proposal.
+  // FAIL-SAFE (codex review): a verifier that dies (null) becomes a REFUTATION,
+  // never a dropped slot. Independence is the whole guardrail — without this,
+  // a `filter(Boolean)` let a candidate reach synthesis seen by only ONE skeptic
+  // and still satisfy "all returned verdicts passed". Both distinct lenses must
+  // run AND pass before a candidate can survive; a missing lens kills it.
   (proposal, t) =>
     parallel([
       () => agent(verifyMisusePrompt(t, proposal), { schema: VERDICT_SCHEMA, label: `verify-misuse:${t.name}`, phase: "Verify" }),
       () => agent(verifyAccuracyPrompt(t, proposal), { schema: VERDICT_SCHEMA, label: `verify-accuracy:${t.name}`, phase: "Verify" }),
-    ]).then((verdicts) => ({ target: t, proposal, verdicts: verdicts.filter(Boolean) })),
+    ]).then((verdicts) => ({
+      target: t,
+      proposal,
+      verdicts: verdicts.map((v, i) =>
+        v || {
+          lens: i === 0 ? "misuse-prevention" : "accuracy-vs-code",
+          refuted: true,
+          confidence: "low",
+          argument: "verifier returned no verdict — fail-safe refutation; both independent lenses must run and pass before a candidate survives.",
+        }),
+    })),
+  // stage 3: behavioral veto — only spend it on candidates that PASSED both
+  // static skeptics (a candidate already refuted is rejected; don't pay to eval
+  // it). Decision-accuracy regression vetoes regardless of bytes saved.
+  (verified, t) => {
+    if (!verified) return null;
+    const passedStatic =
+      verified.verdicts.length === 2 && verified.verdicts.every((v) => v && v.refuted === false);
+    if (!passedStatic) return { ...verified, behavioral: null };
+    return agent(behavioralPrompt(t, verified.proposal), {
+      schema: BEHAVIORAL_SCHEMA,
+      label: `behavioral:${t.name}`,
+      phase: "Behavioral",
+    }).then((behavioral) => ({ ...verified, behavioral }));
+  },
 );
 
 phase("Synthesize");
