@@ -151,6 +151,23 @@ test("runCockpitDock: existing session + dock present → idempotent (no re-spaw
   assert.ok(find(rec.calls, "switch-client"), "still attaches you to it");
 });
 
+test("runCockpitDock: a THROWING spawn (FleetBusy lock) → clean error, never a crash", async () => {
+  const rec = recorder();
+  const r = await runCockpitDock(SPEC, "/repo", baseOpts({
+    run: rec.run,
+    inTmux: false,
+    spawn: true,
+    sessionExistsFn: () => false,
+    spawnFleetFn: async () => {
+      throw new Error("another oxpit fleet operation is already in progress for /repo");
+    },
+  }));
+  assert.equal(r.ok, false, "throw is caught, not propagated");
+  assert.match(r.error ?? "", /already in progress/);
+  assert.match(r.error ?? "", /re-run/, "includes a retry hint");
+  assert.ok(!find(rec.calls, "split-window"), "no dock split after a failed spawn");
+});
+
 test("runCockpitDock: aborts if the fleet spawn fails to create the session", async () => {
   const rec = recorder();
   const r = await runCockpitDock(SPEC, "/repo", baseOpts({

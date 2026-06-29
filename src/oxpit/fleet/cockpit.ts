@@ -190,7 +190,17 @@ export async function runCockpitDock(
   // 1. Stand up the session (unless it already exists).
   if (!existed) {
     if (willSpawn) {
-      const r = await spawnFleetFn(spec, repoRoot, { dryRun: false, run, sessionName, log: opts.log });
+      // spawnFleet can THROW (FleetBusyError when another op holds this repo's fleet
+      // lock — e.g. a second `oxpit dock` while the first is still launching agents —
+      // or a tmux failure). Catch it so the verb reports a clean line, never a raw
+      // stack trace. The lock is per-REPO, so concurrent spawns in the same repo
+      // serialize; the loser retries once the other finishes (or a stale lock clears).
+      let r: Awaited<ReturnType<typeof spawnFleetFn>>;
+      try {
+        r = await spawnFleetFn(spec, repoRoot, { dryRun: false, run, sessionName, log: opts.log });
+      } catch (e) {
+        return { ...base, ok: false, error: `${e instanceof Error ? e.message : String(e)} — wait for it to finish (or the lock to clear), then re-run` };
+      }
       if (!sessionExistsFn(run, sessionName)) {
         return { ...base, ok: false, error: `fleet spawn did not create session "${sessionName}": ${r.error ?? "see results"}` };
       }
