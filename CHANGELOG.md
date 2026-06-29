@@ -8,7 +8,7 @@ behavioral changes). Dates are release dates of the published npm tag.
 The hook protocol has its own version (`HOOK_MARKER_VERSION`); when it bumps,
 re-run `npx oxtail install-hook`. The current hook version is noted per release.
 
-## [0.26.0] — unreleased
+## [0.26.0] — 2026-06-29
 
 **The dock becomes a real cockpit.** `oxpit --dock` renders the fleet as a thin
 one-line-per-agent strip for a short bottom tmux pane — an always-on HUD welded under
