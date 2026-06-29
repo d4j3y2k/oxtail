@@ -24,6 +24,7 @@ import { NUDGE_TEXT, sendOperatorMessage } from "./operator.js";
 import { formatAttachmentNote, stageAttachment, type StagedAttachment } from "./attachments.js";
 import { captureClipboardImage } from "./clipboard.js";
 import { parseStatusArgs, USAGE } from "./cli.js";
+import { invokedViaOxtail, runCockpitDock } from "./fleet/cockpit.js";
 import { loadFleetConfig, modelOptionsForAgent, validateFleetSpec, writeFleetScaffold } from "./fleet/spec.js";
 import { renderSpawnPlan, spawnFleet, tmuxSessionExists, tmuxSessionName } from "./fleet/spawn.js";
 import { killManagedWindow, readPaneMarker } from "./fleet/ownership.js";
@@ -128,7 +129,74 @@ export function stepInput(
   return { state: { pasting, pasteBuf }, actions };
 }
 
+const DOCK_USAGE = `oxpit dock — assemble (or attach to) the fleet cockpit in one command
+
+Spawns your fleet (each agent in a tmux window), welds the live dock strip
+(oxpit --dock) as a short bottom pane in the MAIN window, and attaches you.
+Re-running just attaches (it never stacks a second strip). With no fleet.json
+it gives you a working shell + dock instead of spawning agents.
+
+  oxpit dock                 spawn (if a fleet.json exists) + dock + attach
+  oxpit dock --dry-run       print the exact plan, change nothing
+  oxpit dock --spawn         spawn the default fleet even without a fleet.json
+  oxpit dock --no-spawn      just a working shell + dock (don't spawn agents)
+  oxpit dock --rows N        dock pane height (default 8)
+  oxpit dock --session NAME  override the tmux session name
+  oxpit dock --project PATH  scope to a specific project root
+  -h, --help                 this help`;
+
+// `oxpit dock` — the cockpit-assembly verb (distinct from the `--dock` render flag).
+// Resolves the fleet spec, then spawns + docks + attaches via the cockpit engine.
+async function runDockCockpit(argv: string[]): Promise<number> {
+  if (argv.includes("-h") || argv.includes("--help")) {
+    process.stdout.write(DOCK_USAGE + "\n");
+    return 0;
+  }
+  const has = (name: string) => argv.includes(name);
+  const valOf = (name: string): string | undefined => {
+    const i = argv.indexOf(name);
+    return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
+  };
+  const dryRun = has("--dry-run") || has("-n");
+  const rowsRaw = valOf("--rows");
+  const dockRows = rowsRaw ? Math.max(4, Number.parseInt(rowsRaw, 10) || 8) : undefined;
+  const projectRoot = valOf("--project") ?? process.cwd();
+
+  const cfg = loadFleetConfig(projectRoot);
+  if (!cfg.ok) {
+    process.stderr.write(`oxpit dock: ${cfg.error}\n`);
+    return 1;
+  }
+  const configured = cfg.source === "project" || cfg.source === "global";
+  // --spawn forces the fleet (even from the built-in default); --no-spawn forces a bare
+  // shell+dock; otherwise auto (spawn iff a real fleet.json configured it).
+  const spawn = has("--spawn") ? true : has("--no-spawn") ? false : undefined;
+
+  if (!dryRun) {
+    process.stdout.write(`oxpit dock → assembling cockpit "${valOf("--session") ?? cfg.spec.name}"…\n`);
+  }
+  const result = await runCockpitDock(cfg.spec, projectRoot, {
+    dryRun,
+    sessionName: valOf("--session"),
+    dockRows,
+    spawn,
+    configured,
+    log: (m) => process.stdout.write(m + "\n"),
+    binPath: process.argv[1],
+    viaOxtail: invokedViaOxtail(process.argv[1]),
+  });
+  if (!result.ok) {
+    process.stderr.write(`oxpit dock: ${result.error}\n`);
+    return 1;
+  }
+  return 0;
+}
+
 export async function runOxpit(argv: string[]): Promise<number> {
+  // `oxpit dock` SUBCOMMAND (assemble the cockpit) — intercept before the viewer flow
+  // and before parseStatusArgs (whose --help would otherwise swallow `dock --help`).
+  if (argv[0] === "dock") return runDockCockpit(argv.slice(1));
+
   const a = parseStatusArgs(argv);
   if (a.help) {
     process.stdout.write(USAGE + "\n");
