@@ -83,6 +83,10 @@ import {
     const { runDiagnose } = await import("./diagnose.js");
     process.exit(runDiagnose(process.env.MCP_TRACE_FILE));
   }
+  if (sub === "token-budget") {
+    const { runTokenBudget } = await import("./token-budget.js");
+    process.exit(await runTokenBudget(process.argv.slice(3)));
+  }
   if (sub === "status") {
     const { runStatus } = await import("./oxpit/cli.js");
     process.exit(runStatus(process.argv.slice(3)));
@@ -1170,11 +1174,22 @@ function inboxBoxes(ownPid: number, sessionId: string | null | undefined): mailb
 server.registerTool(
   "send_message",
   {
+    // Restructured into a wake decision-tree (token-budget audit, 2026-06-28):
+    // -519 chars / ~-140 tok vs the prior single-paragraph form, with the
+    // hooked/hookless asymmetry, the full wake_status union, the reply-default
+    // gating, and the delivery_outlook stranding signal all preserved (two
+    // independent adversarial reviewers + accuracy-vs-code check, both cleared).
     description: [
-      "Fire-and-forget message to a peer in the same project root. Target: a tmux session name OR a client_session_id (UUID). Async via the peer's mailbox — delivered mid-turn (PreToolUse hook) or next-turn (read_my_messages); cross-project targets are rejected.",
-      "A plain message does NOT wake a HOOKED peer (one whose Claude Code hooks deliver mail at its next turn) — pass wake:\"auto\" to nudge it via per-client send-keys, state-gated (skipped if the peer is mid-turn). A plain message TO A HOOKLESS peer (Codex, or Claude without hooks: no activity marker) DOES fire that wake automatically (wake_reason:\"hookless_default\"): such a peer has no passive delivery, so a plain send would otherwise be a black hole — wake-or-never. EXCEPTION (wake-on-reply): when you set reply_to, this auto-wakes the requester by default so your answer doesn't strand them idle — pass wake:\"off\" to suppress (also the explicit fire-and-forget opt-out for the hookless-default wake). The reply-default wake is strictly gated: it fires only for a FRESHLY-IDLE requester (one whose Claude Code hooks maintain a fresh idle marker), with a per-target rate limit and a one-wake dedupe; env kill-switch OXTAIL_AUTOWAKE=off. A requester with no idle marker (Codex, or Claude without the hooks) returns skipped_no_fresh_idle on the reply path and is NOT auto-woken — use explicit wake:\"auto\" for those. Response carries wake_status (\"fired\" | \"fired_unconfirmed\" (the hookless_default / wake:auto fire to a Codex-or-markerless peer — keystrokes sent, pickup NOT confirmed, so not proof of delivery; the durable obligation + the peer's next read_my_messages are the guarantee) | \"skipped_busy\" | \"skipped_debounced\" | \"skipped_no_fresh_idle\" | \"skipped_rate_limited\" | \"skipped_deduped\" | \"skipped_store_error\" | \"skipped_no_target\" | \"disabled\") and, on the reply path, wake_reason:\"reply_to_default\" — or wake_reason:\"late_reply_to_pending\" when this reply answers an ask_peer that had timed out (durably pulls the requester back regardless of the fresh-idle window; \"late_reply_to_pending_suppressed\" if you passed wake:\"off\"). DELIVERY OUTLOOK: a plain send (wake unset, no reply_to) to a CLAIMED, HOOKED peer that won't read it this turn returns delivery_outlook:\"stranded_until_read\" (idle/stale-busy, read only at its next turn or a wake) plus a hint to the right verb (ask_peer / action_required / wake); omitted when the peer is mid-turn (its hooks deliver), when you woke it, or when it was hookless-default woken.",
-      "Body is verbatim — wrap in <system-reminder>...</system-reminder> yourself if you want that framing. When replying to ask_peer, include reply_to: request_id from the inbound message. For a blocking send-and-wait, use ask_peer instead.",
-    ].join(" "),
+      "Fire-and-forget async message to a peer in the same project root (cross-project rejected). Target: tmux session name OR client_session_id (UUID). Read via the peer's mailbox — mid-turn (PreToolUse hook) or next-turn (read_my_messages).",
+      "WAKE (a send-keys nudge so an idle peer reads now):",
+      "- Plain send to a HOOKED peer (its hooks deliver mail): NO wake — pass wake:\"auto\" to nudge it (skipped if it's mid-turn).",
+      "- Plain send to a HOOKLESS peer (Codex, or Claude with no activity marker): auto-wakes (wake_reason hookless_default) — it has no passive delivery, so a plain send would else be a black hole (wake-or-never).",
+      "- reply_to set: auto-wakes the requester by default (wake-on-reply) so your answer doesn't strand them. Strictly gated — fires only for a FRESHLY-IDLE requester (fresh hook idle-marker), with per-target rate-limit + one-wake dedupe; kill-switch OXTAIL_AUTOWAKE=off. A requester with no fresh marker (Codex / hookless) returns skipped_no_fresh_idle and is NOT woken — use wake:\"auto\" for those.",
+      "- wake:\"off\": pure fire-and-forget — suppresses both the reply-default and hookless-default wakes.",
+      "Response wake_status: \"fired\" | \"fired_unconfirmed\" (keystrokes sent to a hookless peer — open-loop, NOT proof of pickup; the peer's next read_my_messages is the guarantee) | \"skipped_busy\" | \"skipped_debounced\" | \"skipped_no_fresh_idle\" | \"skipped_rate_limited\" | \"skipped_deduped\" | \"skipped_store_error\" | \"skipped_no_target\" | \"disabled\". On the reply path also wake_reason \"reply_to_default\" — or \"late_reply_to_pending\" when this reply answers a timed-out ask_peer (pulls the requester back regardless of the idle window; \"late_reply_to_pending_suppressed\" if you passed wake:\"off\").",
+      "delivery_outlook: a plain send (wake unset, no reply_to) to a CLAIMED HOOKED peer that won't read this turn returns \"stranded_until_read\" plus a hint to the right verb (ask_peer / action_required / wake); omitted when the peer is mid-turn, when you woke it, or on a hookless-default wake.",
+      "Body is sent verbatim — wrap in <system-reminder>...</system-reminder> yourself for that framing. When answering ask_peer, set reply_to to the inbound request_id. For a blocking send-and-wait, use ask_peer instead.",
+    ].join("\n"),
     inputSchema: {
       target: z
         .string()
