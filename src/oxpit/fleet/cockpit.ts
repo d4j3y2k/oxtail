@@ -190,6 +190,11 @@ export async function runCockpitDock(
   // 1. Stand up the session (unless it already exists).
   if (!existed) {
     if (willSpawn) {
+      // Transparency, not a gate: say what's about to launch (real agents, takes a
+      // beat) and the escape — so the spawn never LOOKS hung (→ a panic re-run that
+      // collides on the repo lock) and an unexpected fleet is never a silent surprise.
+      const names = spec.windows.map((w) => w.name).join(", ");
+      opts.log?.(`  spawning ${spec.windows.length} agents (${names}) — real agent launches, ~${spec.windows.length * 8}s. ⌃C to cancel · --no-spawn for just the dock`);
       // spawnFleet can THROW (FleetBusyError when another op holds this repo's fleet
       // lock — e.g. a second `oxpit dock` while the first is still launching agents —
       // or a tmux failure). Catch it so the verb reports a clean line, never a raw
