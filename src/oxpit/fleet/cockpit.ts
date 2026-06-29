@@ -117,7 +117,7 @@ function buildPlan(args: {
 }
 
 // Resolve the first (main) window name of an existing session — the dock's home.
-function firstWindowOf(run: TmuxRun, sessionName: string, fallback: string): string {
+export function firstWindowOf(run: TmuxRun, sessionName: string, fallback: string): string {
   try {
     const out = run(["list-windows", "-t", sessionName, "-F", "#{window_name}"]);
     const first = out.split("\n").map((l) => l.trim()).filter(Boolean)[0];
@@ -219,49 +219,76 @@ export async function runCockpitDock(
     }
   }
 
+  // 2+3. Weld the dock onto the main window and land the user on the cockpit.
+  const weld = weldDockAndAttach(sessionName, firstWindow, repoRoot, { run, inTmux, dockRows, dockCmd, attachFn: opts.attachFn });
+  if (weld.error) return { ...base, spawned, ok: false, error: weld.error };
+  return { ...base, ok: true, spawned, dockAdded: weld.dockAdded, attachMode: weld.attachMode };
+}
+
+export interface WeldOptions {
+  run?: TmuxRun;
+  inTmux?: boolean;
+  dockRows?: number;
+  dockCmd: string;
+  attachFn?: (session: string) => void;
+}
+
+export interface WeldResult {
+  dockAdded: boolean;
+  attachMode: "attach" | "switch" | "none";
+  error?: string;
+}
+
+// Weld the dock strip onto `sessionName:firstWindow` (idempotent via @oxpit_dock) and
+// land the user on the cockpit — move the current client (inside tmux) or block-attach
+// the terminal (bare). The shared tail of `oxpit dock`: used both by the one-shot
+// runCockpitDock AND by the TUI's config-editor → spawn → cockpit handoff (which runs
+// it AFTER tearing the TUI down, so the terminal is clean before a bare attach).
+export function weldDockAndAttach(
+  sessionName: string,
+  firstWindow: string,
+  repoRoot: string,
+  opts: WeldOptions,
+): WeldResult {
+  const run = opts.run ?? defaultRun;
+  const inTmux = opts.inTmux ?? Boolean(process.env.TMUX);
+  const dockRows = opts.dockRows ?? 8;
   const target = `${sessionName}:${firstWindow}`;
 
-  // 2. Weld the dock strip onto the main window (idempotent via @oxpit_dock).
   let dockAdded = false;
   if (!dockPresent(run, target)) {
     const topPane = topPaneOf(run, target);
     try {
       // -d keeps the ORIGINAL (agent) pane active so the user lands on the agent, not
       // the dock. The trailing string is the shell command tmux runs in the new pane.
-      const dockPane = run(["split-window", "-v", "-d", "-l", String(dockRows), "-t", target, "-c", repoRoot, "-P", "-F", "#{pane_id}", dockCmd]).trim();
+      const dockPane = run(["split-window", "-v", "-d", "-l", String(dockRows), "-t", target, "-c", repoRoot, "-P", "-F", "#{pane_id}", opts.dockCmd]).trim();
       if (dockPane) run(["set-option", "-p", "-t", dockPane, "@oxpit_dock", "1"]);
       if (topPane) run(["select-pane", "-t", topPane]);
       dockAdded = true;
     } catch (e) {
-      return { ...base, spawned, ok: false, error: `dock split failed: ${e instanceof Error ? e.message : String(e)}` };
+      return { dockAdded: false, attachMode: "none", error: `dock split failed: ${e instanceof Error ? e.message : String(e)}` };
     }
   }
 
-  // 3. Land on the cockpit. select the main window first, then attach (bare) or move
-  // the current client (inside tmux).
   try {
     run(["select-window", "-t", target]);
   } catch {
     // non-fatal — attach still lands on the session's active window
   }
 
-  let attachMode: CockpitResult["attachMode"] = "none";
   if (inTmux) {
     try {
       run(["switch-client", "-t", sessionName]);
-      attachMode = "switch";
+      return { dockAdded, attachMode: "switch" };
     } catch (e) {
-      return { ...base, spawned, dockAdded, ok: false, error: `switch-client failed: ${e instanceof Error ? e.message : String(e)}` };
-    }
-  } else {
-    attachMode = "attach";
-    const attach = opts.attachFn ?? ((s: string) => execFileSync("tmux", ["attach-session", "-t", s], { stdio: "inherit" }));
-    try {
-      attach(sessionName); // blocks until the user detaches
-    } catch {
-      // tmux attach returning non-zero (e.g. detached) is normal; not an error.
+      return { dockAdded, attachMode: "none", error: `switch-client failed: ${e instanceof Error ? e.message : String(e)}` };
     }
   }
-
-  return { ...base, ok: true, spawned, dockAdded, attachMode };
+  const attach = opts.attachFn ?? ((s: string) => execFileSync("tmux", ["attach-session", "-t", s], { stdio: "inherit" }));
+  try {
+    attach(sessionName); // blocks until the user detaches
+  } catch {
+    // tmux attach returning non-zero (e.g. detached) is normal; not an error.
+  }
+  return { dockAdded, attachMode: "attach" };
 }

@@ -19,12 +19,12 @@ import { ANIM_FRAMES, attentionLine, BACKGROUND_ROW_CAP, commsBodyLines, compute
 import { buildCommsLog, type CommsMessage } from "./comms.js";
 import { agentKey, capturePaneActivity, type AgentActivity, type PaneActivity } from "./activity.js";
 import { clipToWidth, scrubBufferText } from "./format.js";
-import { jumpToAgent } from "./jump.js";
+import { jumpToAgent, realTmux } from "./jump.js";
 import { NUDGE_TEXT, sendOperatorMessage } from "./operator.js";
 import { formatAttachmentNote, stageAttachment, type StagedAttachment } from "./attachments.js";
 import { captureClipboardImage } from "./clipboard.js";
 import { parseStatusArgs, USAGE } from "./cli.js";
-import { invokedViaOxtail, runCockpitDock } from "./fleet/cockpit.js";
+import { dockPaneCommand, firstWindowOf, invokedViaOxtail, runCockpitDock, weldDockAndAttach } from "./fleet/cockpit.js";
 import { loadFleetConfig, modelOptionsForAgent, validateFleetSpec, writeFleetScaffold } from "./fleet/spec.js";
 import { renderSpawnPlan, spawnFleet, tmuxSessionExists, tmuxSessionName } from "./fleet/spawn.js";
 import { killManagedWindow, readPaneMarker } from "./fleet/ownership.js";
@@ -172,6 +172,28 @@ async function runDockCockpit(argv: string[]): Promise<number> {
   // shell+dock; otherwise auto (spawn iff a real fleet.json configured it).
   const spawn = has("--spawn") ? true : has("--no-spawn") ? false : undefined;
 
+  // Config-first (the default for a NEW fleet): open the fleet editor so the user
+  // reviews/edits the spec, then `y` applies → spawn (or sync) → weld dock → attach.
+  // Skipped for: an existing session (just dock in — the fast path), a bare shell
+  // (--no-spawn), an explicit --session name, --go/-y (straight to launch), --dry-run,
+  // or no TTY. Those fall through to the one-shot runCockpitDock below.
+  const sessionName = valOf("--session") ?? tmuxSessionName(cfg.spec.name);
+  const willSpawn = spawn ?? configured;
+  const haveTTY = Boolean(process.stdout.isTTY && process.stdin.isTTY);
+  const editorFirst =
+    !dryRun && willSpawn && haveTTY && !has("--go") && !has("-y") && !has("--no-spawn") &&
+    valOf("--session") === undefined && !tmuxSessionExists(sessionName);
+  if (editorFirst) {
+    return runInteractive({
+      buildOpts: { allProjects: false, projectRoot },
+      color: !process.env.NO_COLOR,
+      client: undefined,
+      dock: false,
+      openEditorOnStart: true,
+      cockpitLaunch: { repoRoot: projectRoot, dockRows: dockRows ?? 8 },
+    });
+  }
+
   if (!dryRun) {
     process.stdout.write(`oxpit dock → assembling cockpit "${valOf("--session") ?? cfg.spec.name}"…\n`);
   }
@@ -249,6 +271,11 @@ type InteractiveOpts = {
   // Dock mode (`--dock`): paint the compact one-line-per-agent strip (renderDock)
   // instead of the full table — for a short bottom tmux pane. Same data + keys.
   dock: boolean;
+  // `oxpit dock` config-first flow: open the fleet editor immediately on launch, and
+  // when the user's edit applies + the fleet spawns/syncs, weld the dock + attach the
+  // user to the new cockpit (then this TUI tears down). Unset for the normal cockpit.
+  openEditorOnStart?: boolean;
+  cockpitLaunch?: { repoRoot: string; dockRows: number };
 };
 
 function runInteractive(opts: InteractiveOpts): Promise<number> {
@@ -1417,6 +1444,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
             setStatus(
               ok(`✓ spawned "${r.sessionName}" — ${up}/${r.results.length} windows up [${r.fleetId}]`, opts.color),
             );
+            if (opts.cockpitLaunch) return enterCockpit(r.sessionName); // `oxpit dock` → weld dock + attach
             refresh(true); // surface the new fleet in the cockpit
           } else {
             setStatus(warn(`spawn failed: ${r.error ?? "see per-window results"}`, opts.color));
@@ -1544,6 +1572,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
           const driftMsg = drift ? ` · ${drift} appeared-since, skipped (re-run)` : "";
           if (r.ok) {
             setStatus(ok(`✓ synced "${sessionName}" — +${added} added · ~${r.kept.length} kept · -${removed} removed${driftMsg}`, opts.color));
+            if (opts.cockpitLaunch) return enterCockpit(sessionName); // `oxpit dock` → weld dock + attach
           } else {
             // codex: surface the degraded/skip reason, not just "failed".
             const firstBad =
@@ -1960,7 +1989,10 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       composeInsert(scrubBufferText(s, false));
     }
 
-    function teardown(code: number): void {
+    // `afterRestore` runs AFTER the terminal is restored (alt-screen off, raw mode off)
+    // but BEFORE the promise resolves — the seam the cockpit handoff uses to attach
+    // from a clean terminal (a bare `tmux attach` blocks here until the user detaches).
+    function teardown(code: number, afterRestore?: () => void): void {
       if (torndown) return;
       torndown = true;
       if (debounceTimer) clearTimeout(debounceTimer);
@@ -1987,7 +2019,33 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       }
       stdin.pause();
       stdout.write(FOCUS_OFF + PASTE_OFF + CURSOR_SHOW + ALT_OFF);
+      if (afterRestore) {
+        try {
+          afterRestore();
+        } catch {
+          // a failed handoff must not wedge the exit — the terminal is already restored
+        }
+      }
       resolve(code);
+    }
+
+    // `oxpit dock` handoff: after the editor-driven spawn/sync succeeds, tear this TUI
+    // down (clean terminal) and — in the post-restore seam — weld the dock onto the new
+    // session's main window and move the user into it. The dock pane re-invokes this
+    // same binary with --dock; the main window is resolved live (spawn names it from the
+    // spec, sync keeps the session's own first window).
+    function enterCockpit(sessionName: string): void {
+      const cl = opts.cockpitLaunch;
+      if (!cl) return refresh(true);
+      const firstWindow = firstWindowOf(realTmux, sessionName, "main");
+      const dockCmd = dockPaneCommand({
+        execPath: process.execPath,
+        binPath: process.argv[1] ?? "",
+        viaOxtail: invokedViaOxtail(process.argv[1]),
+      });
+      teardown(0, () => {
+        weldDockAndAttach(sessionName, firstWindow, cl.repoRoot, { run: realTmux, dockRows: cl.dockRows, dockCmd });
+      });
     }
 
     // Last line of defense: ANY uncaught throw/rejection (a render edge case, an
@@ -2258,6 +2316,9 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       // later does the first selected-pane capture. Bursts start on events (move /
       // status change), so there's no continuous animation timer running at rest.
       refresh(true);
+      // `oxpit dock` config-first: drop straight into the fleet editor so the user
+      // reviews/edits the spec, then `y` applies → spawn/sync → enterCockpit.
+      if (opts.openEditorOnStart) openFleetEditor();
     } catch (e) {
       onFatal(e);
     }
