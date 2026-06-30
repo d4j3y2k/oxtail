@@ -231,7 +231,7 @@ export async function runCockpitDock(
   }
 
   // 2+3. Weld the dock onto the main window and land the user on the cockpit.
-  const weld = weldDockAndAttach(sessionName, firstWindow, repoRoot, { run, inTmux, dockRows, dockCmd, attachFn: opts.attachFn });
+  const weld = weldDockAndAttach(sessionName, firstWindow, repoRoot, { run, inTmux, dockRows, dockCmd, attachFn: opts.attachFn, log: opts.log });
   if (weld.error) return { ...base, spawned, ok: false, error: weld.error };
   return { ...base, ok: true, spawned, dockAdded: weld.dockAdded, attachMode: weld.attachMode };
 }
@@ -247,12 +247,122 @@ export interface WeldOptions {
   // scales panes proportionally to the terminal — so a fixed-row dock would balloon.
   termRows?: number;
   termCols?: number;
+  // Surface non-fatal weld notes (e.g. the flip-key clobber warning) to the user.
+  log?: (m: string) => void;
 }
 
 export interface WeldResult {
   dockAdded: boolean;
   attachMode: "attach" | "switch" | "none";
   error?: string;
+}
+
+// ── the agent↔dock FLIP KEY (C-]) ───────────────────────────────────────────────
+// One no-prefix root-table binding that toggles focus between the agent pane (top) and
+// the dock pane (bottom) of a cockpit window — the single-keystroke nav David wanted, in
+// macOS Terminal.app, with zero per-user config. Design verified end-to-end on tmux
+// 3.5a / Terminal.app (max): C-] is the right key — Terminal.app delivers the 0x1d byte
+// cleanly, macOS doesn't grab it, and nothing in the claude/codex TUIs binds it (Option
+// isn't Meta in Terminal.app, so M- bindings are dead; F-keys are a media-key landmine).
+// The root table intercepts C-] BEFORE either pane's app, so the same binding flips both
+// directions and the dock TUI needs no key handling. Installed at runtime (never written
+// to ~/.tmux.conf); the if-shell gate makes it a no-op outside cockpit windows, so it's
+// harmless to the user's other sessions on the server even though `bind -n` is global.
+export const FLIP_KEY = "C-]";
+// The toggle: ON the dock (@oxpit_dock pane) → select the agent ({top}); anywhere else in
+// a cockpit window → select the dock ({bottom}). The dock is always the bottom split, so
+// {top}/{bottom} stay correct even if the agent pane gets split (David splits panes) — a
+// blind `select-pane -t :.+` would become a multi-pane cycle there. The else-branch
+// re-sends C-] so a NON-cockpit window's app receives the byte untouched (passthrough).
+// Each nested if-shell sub-command is ONE argv element: there is no shell, so the quotes
+// below are literal bytes tmux re-parses, exactly as verified.
+const FLIP_THEN = `if-shell -F "#{@oxpit_dock}" "select-pane -t {top}" "select-pane -t {bottom}"`;
+export const FLIP_BIND_ARGV = [
+  "bind-key", "-n", FLIP_KEY,
+  "if-shell", "-F", "#{@oxpit_cockpit}", FLIP_THEN, `send-keys ${FLIP_KEY}`,
+];
+
+// The flip key is on unless OXTAIL_OXPIT_FLIP=off. Read where the binding is INSTALLED
+// (the `oxpit dock` process); the dock TUI can't see this env (it's a tmux-spawned child
+// with the server's env), so it gates its footer hint on the @oxpit_cockpit window option
+// instead — which weld sets only when this is on, keeping them a single source of truth.
+export function flipKeyEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.OXTAIL_OXPIT_FLIP !== "off";
+}
+
+// Classify the root-table binding for `key` so we NEVER clobber a foreign one. Lists
+// `list-keys -T root` UNFILTERED — the per-key form `list-keys -T root C-]` ERRORS on an
+// unbound key (tmux 3.5a: "unknown key", exit 1; codex), so the full table cleanly returns
+// "unbound" in the common case — and matches FLAG-ORDER-INSENSITIVELY: tmux can emit flags
+// before the table (`bind-key -r -T root C-] copy-mode`), which an anchored regex misses and
+// then clobbers (codex HIGH). "ours" requires BOTH our private option names in the command
+// (a foreign binding can't carry them; every version of our binding does). An unreadable
+// list-keys returns "unreadable" so the caller FAILS CLOSED instead of treating a transient
+// failure as "unbound" and overwriting whatever was there.
+export type RootBindingState =
+  | { state: "unbound" }
+  | { state: "foreign"; command: string }
+  | { state: "ours"; command: string }
+  | { state: "unreadable" };
+export function rootBinding(run: TmuxRun, key: string): RootBindingState {
+  let out: string;
+  try {
+    out = run(["list-keys", "-T", "root"]);
+  } catch {
+    return { state: "unreadable" };
+  }
+  for (const line of out.split("\n")) {
+    // bind-key [<flags>] -T root <key> <command> — `.*?` skips any flags before `-T root`.
+    const m = line.match(/^\s*bind-key\b.*?\s-T\s+root\s+(\S+)\s+(.+)$/);
+    if (m && m[1] === key) {
+      const command = m[2].trim();
+      const ours = command.includes("@oxpit_cockpit") && command.includes("@oxpit_dock");
+      return ours ? { state: "ours", command } : { state: "foreign", command };
+    }
+  }
+  return { state: "unbound" };
+}
+
+// Resolve the flip key for this weld and report whether it is AVAILABLE — so the per-window
+// @oxpit_cockpit mark and the dock's footer hint track the binding's REAL state (a mark on a
+// window where C-] isn't our flip would render a hint that lies; codex MED). Effects by case:
+//   • flip ON  + unbound/ours  → (re)install our binding → available
+//   • flip ON  + FOREIGN       → leave it + warn → unavailable (never clobber; codex HIGH)
+//   • flip ON  + unreadable    → fail closed + warn → unavailable
+//   • flip OFF                 → a REAL kill switch: unbind OUR binding if present (a foreign
+//                                one is left alone) → unavailable; the caller then UNSETS the
+//                                window marks, so a re-weld with =off fully disables (codex LOW)
+// Best-effort throughout: a tmux that rejects a verb just leaves prefix-nav (C-b ↑/↓) working.
+export function resolveFlipKey(run: TmuxRun, flipOn: boolean, log?: (m: string) => void): boolean {
+  const b = rootBinding(run, FLIP_KEY);
+  if (!flipOn) {
+    if (b.state === "ours") {
+      try {
+        run(["unbind-key", "-n", FLIP_KEY]);
+      } catch {
+        // best-effort
+      }
+    }
+    return false;
+  }
+  if (b.state === "foreign") {
+    log?.(
+      `oxpit dock: Ctrl-] is already bound in tmux — leaving it, so the agent↔dock flip key is off. ` +
+        `Unbind it, or run with OXTAIL_OXPIT_FLIP=off to silence this.`,
+    );
+    return false;
+  }
+  if (b.state === "unreadable") {
+    log?.(`oxpit dock: couldn't read tmux key bindings — skipping the Ctrl-] flip key rather than risk clobbering an existing binding.`);
+    return false;
+  }
+  try {
+    run(FLIP_BIND_ARGV); // unbound or ours → (re)install
+    return true;
+  } catch (e) {
+    log?.(`oxpit dock: couldn't install the Ctrl-] flip key (${e instanceof Error ? e.message : String(e)}) — prefix nav (C-b ↑/↓) still flips panes`);
+    return false;
+  }
 }
 
 // Weld the dock strip onto `sessionName:firstWindow` (idempotent via @oxpit_dock) and
@@ -306,11 +416,26 @@ export function weldDockAndAttach(
   // agent's window and the fleet dock is right below it (oxpit's whole point: a persistent
   // cockpit, not a strip you lose the moment you tab away). Idempotent per-window via
   // @oxpit_dock; best-effort — one window failing to split doesn't abort the rest.
+  // Resolve the flip key ONCE up front (install / skip-foreign / fail-closed / kill-switch)
+  // BEFORE marking any window, so @oxpit_cockpit tracks the binding's REAL availability.
+  const flipAvailable = resolveFlipKey(run, flipKeyEnabled(), opts.log);
   const dockPaneIds: string[] = [];
   let anyDock = false;
   let firstErr: unknown = null;
   for (const w of windowNamesOf(run, sessionName)) {
     const target = `${sessionName}:${w}`;
+    // @oxpit_cockpit marks a window where the C-] flip key is LIVE — the if-shell gate AND the
+    // dock's footer hint both read it, so it must track the binding's real availability (a mark
+    // without the binding renders a hint that lies; codex MED). SET when available, UNSET
+    // otherwise (off / foreign / failed) so a re-weld can't strand a stale mark (codex LOW). On
+    // EVERY window BEFORE the dock-present early-out (a re-weld of an older dock converges) and
+    // BEFORE the split (so the dock TUI reads it the moment it boots — no marker boot race).
+    try {
+      if (flipAvailable) run(["set-option", "-w", "-t", target, "@oxpit_cockpit", "1"]);
+      else run(["set-option", "-w", "-u", "-t", target, "@oxpit_cockpit"]);
+    } catch {
+      // best-effort — a tmux that rejects the window option just skips the hint there
+    }
     if (dockPresent(run, target)) {
       anyDock = true; // already docked (re-run) — leave it
       continue;

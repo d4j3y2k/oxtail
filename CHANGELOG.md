@@ -8,6 +8,23 @@ behavioral changes). Dates are release dates of the published npm tag.
 The hook protocol has its own version (`HOOK_MARKER_VERSION`); when it bumps,
 re-run `npx oxtail install-hook`. The current hook version is noted per release.
 
+## [0.29.0] — 2026-06-30
+
+**One keystroke flips between the agent and its dock — Ctrl-], set up for you.**
+- `oxpit dock` now binds **Ctrl-]** to flip focus between the agent pane (top) and the dock
+  pane (bottom) of the current cockpit window — the single-key nav that makes living in the
+  dock effortless. It works in macOS Terminal.app out of the box: NO `~/.tmux.conf` edits,
+  NO Terminal.app settings. The cockpit installs a tmux binding at assembly time (never
+  written to a config file), and a `⌃] flip` footer hint makes it discoverable.
+- Dock-aware + safe. The binding goes to the agent when you're on the dock and to the dock
+  otherwise (robust even if you split the agent pane); it's a no-op outside cockpit windows,
+  so Ctrl-] passes straight through to your other tmux sessions untouched. It never clobbers
+  an existing Ctrl-] binding (detects and skips, with a warning), and `OXTAIL_OXPIT_FLIP=off`
+  disables the whole thing. Prefix nav (`C-b ↑/↓`) still works too.
+- Why Ctrl-]: Terminal.app doesn't send Option as Meta (so `M-` bindings are dead) and the
+  F-keys collide with laptop media keys; Ctrl-] is delivered cleanly, isn't grabbed by
+  macOS, and isn't used by the claude/codex TUIs. Verified end-to-end on tmux 3.5a.
+
 ## [0.28.4] — 2026-06-30
 
 **The dock keeps the agent you landed on highlighted, even after you navigate.**

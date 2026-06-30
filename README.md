@@ -87,7 +87,7 @@ command = "npx"
 args = ["-y", "oxtail@latest"]
 ```
 
-> Pin a version (`oxtail@0.28.4`) for daily configs; `@latest` is fine for trying it
+> Pin a version (`oxtail@0.29.0`) for daily configs; `@latest` is fine for trying it
 > out. On Windows, wrap the command as `cmd /c npx -y oxtail@latest`.
 
 **2. (Claude Code) Install the hooks** so agents receive messages autonomously and
@@ -149,6 +149,11 @@ config (the editor grid), and on `y` it spawns the crew (each agent in its own t
 window), welds the dock strip onto the bottom of the main window, and attaches you — main
 agent on top, HUD below. The spawn shows a live checklist as each agent comes up. Run it
 again and it just re-attaches (it won't stack a second strip).
+
+Once you're in, **`Ctrl-]` flips between the agent and the dock** below it — a single
+keystroke, set up for you (works in macOS Terminal.app, no config). It only acts inside
+cockpit windows and never clobbers an existing binding; `OXTAIL_OXPIT_FLIP=off` disables
+it. (Prefix nav, `C-b ↑/↓`, still works too.)
 
 ```sh
 oxpit dock                 # config → y → spawn fleet + dock + attach
