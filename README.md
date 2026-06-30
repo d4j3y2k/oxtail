@@ -60,6 +60,17 @@ from that loop:
 
 ## Quick start
 
+**Fastest — one command does steps 1 & 2:**
+
+```sh
+npm i -g oxtail && oxtail setup
+```
+
+`oxtail setup` registers the oxtail MCP server with Claude Code (`~/.claude.json`) and
+Codex CLI (`~/.codex/config.toml`), installs the message hook, and checks your
+prerequisites (tmux, the claude/codex CLIs) — idempotent, backs up each file first,
+`--dry-run` to preview. Then jump to step 3. Prefer to do it by hand? The manual steps:
+
 **1. Register oxtail with your agent client.** It's fetched from npm on first use.
 
 Claude Code — add to `~/.claude.json` (global) or a project's `.mcp.json`:
