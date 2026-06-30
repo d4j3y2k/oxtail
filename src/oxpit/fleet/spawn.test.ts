@@ -101,6 +101,25 @@ test("live SPAWN creates the session + windows, then ensures each SEQUENTIALLY",
   });
 });
 
+test("onWindowDone fires per window IN ORDER with each window's ok (live progress)", async () => {
+  await withHome(async () => {
+    const done: Array<[string, boolean]> = [];
+    await spawnFleet(spec, "/repo", {
+      dryRun: false,
+      run: (args) => (args[0] === "new-session" ? "%10\n" : args[0] === "new-window" ? "%11\n" : ""),
+      ensure: async ({ window }) => ({
+        window: window.name,
+        occupancy: "empty-shell",
+        action: "launched",
+        ok: window.name !== "codex", // codex "fails" to prove ok is reported per-window
+        sessionId: `sid-${window.name}`,
+      } satisfies EnsureWindowResult),
+      onWindowDone: (name, ok) => done.push([name, ok]),
+    });
+    assert.deepEqual(done, [["main", true], ["codex", false]], "in spec order, each window's ok");
+  });
+});
+
 test("a window whose pane can't be resolved is reported, not skipped silently", async () => {
   await withHome(async () => {
     const res = await spawnFleet(spec, "/repo", {

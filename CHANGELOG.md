@@ -8,6 +8,40 @@ behavioral changes). Dates are release dates of the published npm tag.
 The hook protocol has its own version (`HOOK_MARKER_VERSION`); when it bumps,
 re-run `npx oxtail install-hook`. The current hook version is noted per release.
 
+## [0.27.0] — 2026-06-29
+
+**`oxpit dock` — assemble the whole cockpit in one command.** The natural front door
+to a fleet: run `oxpit dock` in your project and it opens your fleet config, you hit
+`y`, and it spawns the crew (each agent in a tmux window), welds the live dock strip
+(`oxpit --dock`) onto the bottom of the main window, and drops you in — main agent on
+top, the HUD below, jump to any peer with `⏎`. One command, you're in the cockpit.
+
+**`oxtail setup` — one-command onboarding.** New companion to `oxpit dock`: a new
+machine (or an upgrade) gets ready in one step. It registers the oxtail MCP server with
+Claude Code (`~/.claude.json`) and Codex CLI (`~/.codex/config.toml`), installs the
+message-delivery hook, and checks the external prerequisites (tmux, the claude/codex
+CLIs) with clear next-steps. Idempotent and non-destructive: it only *adds* an entry
+when it's missing (an existing one is left untouched), backs up each file to
+`<file>.oxtail-bak` before its first edit, and `--dry-run` previews everything. So the
+new-user path is now: `npm i -g oxtail` → `oxtail setup` → `oxpit dock`.
+
+- **Config-first.** On a new fleet, `oxpit dock` opens the fleet editor (the grid with
+  model/effort pickers) so you review or tweak the spec before launch; `y` applies →
+  spawn (or sync an existing session) → weld dock → attach. An already-running session
+  skips the editor and just docks you in (instant). `--no-spawn` gives a bare shell +
+  dock; `--go`/`-y` skips the editor; `--dry-run` prints the plan; `--rows`/`--session`/
+  `--project` tune it.
+- **Watch the crew come up.** The spawn launches agents sequentially (each waits for its
+  launch artifact), so instead of a static line that reads as hung, the overlay shows a
+  live checklist — `✓ main · ✓ max · ⠹ codex launching… · ◦ test` — ticking as each
+  agent lands (spawn engine gained an `onWindowDone` progress callback).
+- **Safe + idempotent.** Reuses the existing spawn lifecycle (refuse-to-clobber + the
+  per-repo lock); the dock pane is marked `@oxpit_dock` so re-running attaches instead of
+  stacking a second strip; a busy fleet lock now surfaces a clean "another op in progress"
+  line instead of a raw stack trace. Bare terminal → `attach`; inside tmux → `switch-client`.
+
+No hook-protocol change (`HOOK_MARKER_VERSION` unchanged).
+
 ## [0.26.0] — 2026-06-29
 
 **The dock becomes a real cockpit.** `oxpit --dock` renders the fleet as a thin

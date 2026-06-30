@@ -19,11 +19,12 @@ import { ANIM_FRAMES, attentionLine, BACKGROUND_ROW_CAP, commsBodyLines, compute
 import { buildCommsLog, type CommsMessage } from "./comms.js";
 import { agentKey, capturePaneActivity, type AgentActivity, type PaneActivity } from "./activity.js";
 import { clipToWidth, scrubBufferText } from "./format.js";
-import { jumpToAgent } from "./jump.js";
+import { jumpToAgent, realTmux } from "./jump.js";
 import { NUDGE_TEXT, sendOperatorMessage } from "./operator.js";
 import { formatAttachmentNote, stageAttachment, type StagedAttachment } from "./attachments.js";
 import { captureClipboardImage } from "./clipboard.js";
 import { parseStatusArgs, USAGE } from "./cli.js";
+import { dockPaneCommand, firstWindowOf, invokedViaOxtail, runCockpitDock, weldDockAndAttach } from "./fleet/cockpit.js";
 import { loadFleetConfig, modelOptionsForAgent, validateFleetSpec, writeFleetScaffold } from "./fleet/spec.js";
 import { renderSpawnPlan, spawnFleet, tmuxSessionExists, tmuxSessionName } from "./fleet/spawn.js";
 import { killManagedWindow, readPaneMarker } from "./fleet/ownership.js";
@@ -35,6 +36,8 @@ import { inferProjectRoot, safeRealpath } from "../scope.js";
 
 const ALT_ON = "\x1b[?1049h";
 const ALT_OFF = "\x1b[?1049l";
+// Braille spinner frames for the live spawn-progress indicator.
+const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const CURSOR_HIDE = "\x1b[?25l";
 const CURSOR_SHOW = "\x1b[?25h";
 const HOME = "\x1b[H";
@@ -128,7 +131,96 @@ export function stepInput(
   return { state: { pasting, pasteBuf }, actions };
 }
 
+const DOCK_USAGE = `oxpit dock — assemble (or attach to) the fleet cockpit in one command
+
+Spawns your fleet (each agent in a tmux window), welds the live dock strip
+(oxpit --dock) as a short bottom pane in the MAIN window, and attaches you.
+Re-running just attaches (it never stacks a second strip). With no fleet.json
+it gives you a working shell + dock instead of spawning agents.
+
+  oxpit dock                 spawn (if a fleet.json exists) + dock + attach
+  oxpit dock --dry-run       print the exact plan, change nothing
+  oxpit dock --spawn         spawn the default fleet even without a fleet.json
+  oxpit dock --no-spawn      just a working shell + dock (don't spawn agents)
+  oxpit dock --rows N        dock pane height (default 8)
+  oxpit dock --session NAME  override the tmux session name
+  oxpit dock --project PATH  scope to a specific project root
+  -h, --help                 this help`;
+
+// `oxpit dock` — the cockpit-assembly verb (distinct from the `--dock` render flag).
+// Resolves the fleet spec, then spawns + docks + attaches via the cockpit engine.
+async function runDockCockpit(argv: string[]): Promise<number> {
+  if (argv.includes("-h") || argv.includes("--help")) {
+    process.stdout.write(DOCK_USAGE + "\n");
+    return 0;
+  }
+  const has = (name: string) => argv.includes(name);
+  const valOf = (name: string): string | undefined => {
+    const i = argv.indexOf(name);
+    return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
+  };
+  const dryRun = has("--dry-run") || has("-n");
+  const rowsRaw = valOf("--rows");
+  const dockRows = rowsRaw ? Math.max(4, Number.parseInt(rowsRaw, 10) || 8) : undefined;
+  const projectRoot = valOf("--project") ?? process.cwd();
+
+  const cfg = loadFleetConfig(projectRoot);
+  if (!cfg.ok) {
+    process.stderr.write(`oxpit dock: ${cfg.error}\n`);
+    return 1;
+  }
+  const configured = cfg.source === "project" || cfg.source === "global";
+  // --spawn forces the fleet (even from the built-in default); --no-spawn forces a bare
+  // shell+dock; otherwise auto (spawn iff a real fleet.json configured it).
+  const spawn = has("--spawn") ? true : has("--no-spawn") ? false : undefined;
+
+  // Config-first (the default for a NEW fleet): open the fleet editor so the user
+  // reviews/edits the spec, then `y` applies → spawn (or sync) → weld dock → attach.
+  // Skipped for: an existing session (just dock in — the fast path), a bare shell
+  // (--no-spawn), an explicit --session name, --go/-y (straight to launch), --dry-run,
+  // or no TTY. Those fall through to the one-shot runCockpitDock below.
+  const sessionName = valOf("--session") ?? tmuxSessionName(cfg.spec.name);
+  const willSpawn = spawn ?? configured;
+  const haveTTY = Boolean(process.stdout.isTTY && process.stdin.isTTY);
+  const editorFirst =
+    !dryRun && willSpawn && haveTTY && !has("--go") && !has("-y") && !has("--no-spawn") &&
+    valOf("--session") === undefined && !tmuxSessionExists(sessionName);
+  if (editorFirst) {
+    return runInteractive({
+      buildOpts: { allProjects: false, projectRoot },
+      color: !process.env.NO_COLOR,
+      client: undefined,
+      dock: false,
+      openEditorOnStart: true,
+      cockpitLaunch: { repoRoot: projectRoot, dockRows: dockRows ?? 8 },
+    });
+  }
+
+  if (!dryRun) {
+    process.stdout.write(`oxpit dock → assembling cockpit "${valOf("--session") ?? cfg.spec.name}"…\n`);
+  }
+  const result = await runCockpitDock(cfg.spec, projectRoot, {
+    dryRun,
+    sessionName: valOf("--session"),
+    dockRows,
+    spawn,
+    configured,
+    log: (m) => process.stdout.write(m + "\n"),
+    binPath: process.argv[1],
+    viaOxtail: invokedViaOxtail(process.argv[1]),
+  });
+  if (!result.ok) {
+    process.stderr.write(`oxpit dock: ${result.error}\n`);
+    return 1;
+  }
+  return 0;
+}
+
 export async function runOxpit(argv: string[]): Promise<number> {
+  // `oxpit dock` SUBCOMMAND (assemble the cockpit) — intercept before the viewer flow
+  // and before parseStatusArgs (whose --help would otherwise swallow `dock --help`).
+  if (argv[0] === "dock") return runDockCockpit(argv.slice(1));
+
   const a = parseStatusArgs(argv);
   if (a.help) {
     process.stdout.write(USAGE + "\n");
@@ -181,6 +273,11 @@ type InteractiveOpts = {
   // Dock mode (`--dock`): paint the compact one-line-per-agent strip (renderDock)
   // instead of the full table — for a short bottom tmux pane. Same data + keys.
   dock: boolean;
+  // `oxpit dock` config-first flow: open the fleet editor immediately on launch, and
+  // when the user's edit applies + the fleet spawns/syncs, weld the dock + attach the
+  // user to the new cockpit (then this TUI tears down). Unset for the normal cockpit.
+  openEditorOnStart?: boolean;
+  cockpitLaunch?: { repoRoot: string; dockRows: number };
 };
 
 function runInteractive(opts: InteractiveOpts): Promise<number> {
@@ -231,6 +328,12 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       | { lines: string[]; canSpawn: boolean; spec: FleetSpec; sessionName: string }
       | null = null;
     let spawnBusy = false;
+    // Live spawn progress: which windows have finished launching (name→ok), an animation
+    // frame, and the spinner timer — so the (sequential, ~minutes) spawn shows the crew
+    // coming up one by one instead of a static "spawning…" that reads as hung.
+    const spawnDone = new Map<string, boolean>();
+    let spawnSpinFrame = 0;
+    let spawnTimer: NodeJS.Timeout | null = null;
     // SYNC overlay: the editor's `y` routes here when the target session already EXISTS
     // (converge it) vs SPAWN for a new one. Read-only preview → deliberate confirm (a
     // capital `Y` when it deletes, `y` when purely additive). syncBusy locks it in flight.
@@ -1329,35 +1432,60 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (!spawnView || spawnBusy || !spawnView.canSpawn) return;
       const { spec, sessionName } = spawnView;
       spawnBusy = true;
-      spawnView = {
-        ...spawnView,
-        lines: [
-          ...spawnView.lines,
-          "",
-          dim(`  spawning "${sessionName}"… creating the session, launching agents sequentially`, opts.color),
-        ],
-      };
+      // Start the live progress: clear the done-set + spin the indicator so the
+      // sequential, slow spawn shows the crew coming up rather than reading as hung.
+      spawnDone.clear();
+      spawnSpinFrame = 0;
+      if (spawnTimer) clearInterval(spawnTimer);
+      spawnTimer = setInterval(() => {
+        if (torndown) return;
+        spawnSpinFrame++;
+        paint();
+      }, 120);
       paint();
-      spawnFleet(spec, snapshot.project_root, { dryRun: false, sessionName })
+      spawnFleet(spec, snapshot.project_root, {
+        dryRun: false,
+        sessionName,
+        onWindowDone: (w, wok) => {
+          spawnDone.set(w, wok);
+          paint(); // tick the checklist as each agent lands
+        },
+      })
         .then((r) => {
           spawnBusy = false;
           spawnOpen = false;
           spawnView = null;
-          if (torndown) return;
-          if (r.ok) {
-            const up = r.results.filter((x) => x.ok).length;
-            setStatus(
-              ok(`✓ spawned "${r.sessionName}" — ${up}/${r.results.length} windows up [${r.fleetId}]`, opts.color),
-            );
-            refresh(true); // surface the new fleet in the cockpit
-          } else {
-            setStatus(warn(`spawn failed: ${r.error ?? "see per-window results"}`, opts.color));
+          if (spawnTimer) {
+            clearInterval(spawnTimer);
+            spawnTimer = null;
           }
+          if (torndown) return;
+          const up = r.results.filter((x) => x.ok).length;
+          if (r.ok) {
+            setStatus(ok(`✓ spawned "${r.sessionName}" — ${up}/${r.results.length} windows up [${r.fleetId}]`, opts.color));
+          } else if (r.error) {
+            // HARD failure (session never created — refuse-to-clobber / creation throw).
+            setStatus(warn(`spawn failed: ${r.error}`, opts.color));
+          } else {
+            // PARTIAL: the session exists, some agents didn't launch. Still a usable cockpit.
+            setStatus(warn(`spawned "${r.sessionName}" — ${up}/${r.results.length} up, some agents failed (see panes)`, opts.color));
+          }
+          // `oxpit dock`: a CREATED session (full OR partial) is a usable cockpit — weld +
+          // attach, matching the one-shot path. Only a hard failure (no session, r.error)
+          // stays in the viewer. The dock itself shows which agents came up.
+          if (opts.cockpitLaunch && !r.error) {
+            return enterCockpit(r.sessionName, spec.windows[0]?.name ?? "main");
+          }
+          refresh(true); // surface the new fleet in the cockpit
         })
         .catch((e) => {
           spawnBusy = false;
           spawnOpen = false;
           spawnView = null;
+          if (spawnTimer) {
+            clearInterval(spawnTimer);
+            spawnTimer = null;
+          }
           if (torndown) return;
           setStatus(warn(`spawn error: ${e instanceof Error ? e.message : e}`, opts.color));
         });
@@ -1369,16 +1497,42 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     function spawnFrame(width: number, rows: number): string {
       if (!spawnView) return "";
       const d = (s: string) => dim(s, opts.color);
-      const prompt = spawnBusy
-        ? d("  working… (Ctrl-C aborts the cockpit)")
-        : spawnView.canSpawn
-          ? warn("  press y to SPAWN · any other key to go back", opts.color)
-          : warn("  press any key to go back", opts.color);
+      const b = (s: string) => (opts.color ? `\x1b[1m\x1b[36m${s}\x1b[0m` : s);
+      const wrapW = Math.max(8, width);
+      // While the (sequential, slow) spawn runs, show a LIVE checklist — the crew coming
+      // up one by one (✓ done · spinner launching · ◦ pending) — so the wait reads as
+      // progress, not a hang. Replaces the static plan preview until it resolves.
+      if (spawnBusy) {
+        const spin = SPINNER[spawnSpinFrame % SPINNER.length];
+        const wins = spawnView.spec.windows;
+        const upCount = [...spawnDone.values()].filter(Boolean).length;
+        let activeShown = false;
+        const checklist = wins.map((w) => {
+          if (spawnDone.has(w.name)) {
+            return spawnDone.get(w.name) ? d(`    ✓ ${w.name}`) : warn(`    ✗ ${w.name}`, opts.color);
+          }
+          if (!activeShown) {
+            activeShown = true;
+            return `    ${spin} ${w.name} — launching…`;
+          }
+          return d(`    ◦ ${w.name}`);
+        });
+        const body = [
+          b(`  ${spin} spawning "${spawnView.sessionName}" — ${upCount}/${wins.length} agents up`),
+          "",
+          ...checklist,
+          "",
+          d("  working… (⌃C exits — a partial fleet may remain; re-run to finish)"),
+        ];
+        return body.slice(0, Math.max(1, rows)).map((l) => clipToWidth(l, wrapW) + CLEAR_EOL).join("\n");
+      }
+      const prompt = spawnView.canSpawn
+        ? warn("  press y to SPAWN · any other key to go back", opts.color)
+        : warn("  press any key to go back", opts.color);
       // WRAP the (plain) plan lines so long recipe steps aren't clipped off the right
       // edge; colored header/source lines have ANSI codes → pass them through to the
       // ANSI-aware clip (they're short and never need wrapping). Continuation lines are
       // indented so a wrapped step reads as one logical line.
-      const wrapW = Math.max(8, width);
       const wrapped = spawnView.lines.flatMap((l) => {
         if (l.includes("\x1b") || l.length <= wrapW) return [l];
         // wrap to width-2 so the 2-space continuation indent never pushes past the edge
@@ -1486,6 +1640,9 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
               "see results";
             setStatus(warn(`sync incomplete: ${firstBad}${driftMsg}`, opts.color));
           }
+          // `oxpit dock`: the session ALREADY exists for a sync (we're converging it), so
+          // it's a usable cockpit on full OR partial — weld + attach either way.
+          if (opts.cockpitLaunch) return enterCockpit(sessionName, spec.windows[0]?.name ?? "main");
           refresh(true); // surface the converged (or partial) fleet
         })
         .catch((e) => {
@@ -1892,11 +2049,15 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       composeInsert(scrubBufferText(s, false));
     }
 
-    function teardown(code: number): void {
+    // `afterRestore` runs AFTER the terminal is restored (alt-screen off, raw mode off)
+    // but BEFORE the promise resolves — the seam the cockpit handoff uses to attach
+    // from a clean terminal (a bare `tmux attach` blocks here until the user detaches).
+    function teardown(code: number, afterRestore?: () => void): void {
       if (torndown) return;
       torndown = true;
       if (debounceTimer) clearTimeout(debounceTimer);
       if (slowTick) clearInterval(slowTick);
+      if (spawnTimer) clearInterval(spawnTimer);
       stopAnim();
       for (const w of watchers) {
         try {
@@ -1919,7 +2080,38 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       }
       stdin.pause();
       stdout.write(FOCUS_OFF + PASTE_OFF + CURSOR_SHOW + ALT_OFF);
+      if (afterRestore) {
+        try {
+          afterRestore();
+        } catch {
+          // a failed handoff must not wedge the exit — the terminal is already restored
+        }
+      }
       resolve(code);
+    }
+
+    // `oxpit dock` handoff: after the editor-driven spawn/sync succeeds, tear this TUI
+    // down (clean terminal) and — in the post-restore seam — weld the dock onto the new
+    // session's main window and move the user into it. The dock pane re-invokes this
+    // same binary with --dock; the main window is resolved live (spawn names it from the
+    // spec, sync keeps the session's own first window).
+    function enterCockpit(sessionName: string, fallbackWindow = "main"): void {
+      const cl = opts.cockpitLaunch;
+      if (!cl) return refresh(true);
+      // Resolve the main window live; the fallback (only used if list-windows throws —
+      // a vanished session) is the spec's first window so the dock targets a real name.
+      const firstWindow = firstWindowOf(realTmux, sessionName, fallbackWindow);
+      const dockCmd = dockPaneCommand({
+        execPath: process.execPath,
+        binPath: process.argv[1] ?? "",
+        viaOxtail: invokedViaOxtail(process.argv[1]),
+      });
+      teardown(0, () => {
+        // The terminal is restored here, so a weld/attach failure is surfaced on stderr
+        // (never swallowed — the one-shot path does the same; v0.25.0 silent-drift lesson).
+        const w = weldDockAndAttach(sessionName, firstWindow, cl.repoRoot, { run: realTmux, dockRows: cl.dockRows, dockCmd });
+        if (w.error) process.stderr.write(`oxpit dock: ${w.error}\n`);
+      });
     }
 
     // Last line of defense: ANY uncaught throw/rejection (a render edge case, an
@@ -2190,6 +2382,9 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       // later does the first selected-pane capture. Bursts start on events (move /
       // status change), so there's no continuous animation timer running at rest.
       refresh(true);
+      // `oxpit dock` config-first: drop straight into the fleet editor so the user
+      // reviews/edits the spec, then `y` applies → spawn/sync → enterCockpit.
+      if (opts.openEditorOnStart) openFleetEditor();
     } catch (e) {
       onFatal(e);
     }

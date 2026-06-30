@@ -51,9 +51,13 @@ status flags:
   --project PATH      scope to a specific project root
   -h, --help          this help
 
-oxpit keys:  ↑/k ↓/j move · ⏎ jump · n nudge · m message · l comms-log · w thread · r refresh · ? help · ⌃C quit
-oxpit flags: --no-color, --all, --project PATH, --client NAME (which tmux
-             client the jump drives when several are attached)`;
+oxpit keys:  ↑/k ↓/j move · ⏎ jump · n nudge · m message · l comms-log · w thread · d dock/full · r refresh · ? help · ⌃C quit
+oxpit flags: --dock (compact strip view), --no-color, --all, --project PATH,
+             --client NAME (which tmux client the jump drives when several attached)
+
+oxpit dock — assemble the whole cockpit in one command: spawn the fleet + weld the
+             live dock strip to the bottom of the main window + attach you. Re-running
+             just attaches. \`oxpit dock --help\` for flags.`;
 
 export function parseStatusArgs(argv: string[]): StatusArgs {
   const a: StatusArgs = {

@@ -67,6 +67,10 @@ import {
 // the script's async work.
 {
   const sub = process.argv[2];
+  if (sub === "setup") {
+    const { runSetup } = await import("./setup.js");
+    process.exit(await runSetup(process.argv.slice(3)));
+  }
   if (sub === "install-hook") {
     const url = new URL("../scripts/install-hook.mjs", import.meta.url).href;
     const mod = (await import(url)) as { install: () => Promise<void> };

@@ -61,6 +61,9 @@ export interface SpawnOptions {
   ensureDeps?: EnsureWindowDeps;
   now?: () => number;
   log?: (msg: string) => void;
+  // Fires after EACH window's launch resolves (in order), so a caller can show live
+  // "watch the crew come up" progress — the spawn is sequential and can take ~minutes.
+  onWindowDone?: (windowName: string, ok: boolean) => void;
 }
 
 export interface SpawnWindowPlan {
@@ -167,6 +170,7 @@ export async function spawnFleet(
           sessionId: null,
           reason: `could not resolve pane for ${sessionName}:${window.name}`,
         });
+        opts.onWindowDone?.(window.name, false);
         continue; // keep going so the operator sees every window's outcome
       }
       const res = await ensure(
@@ -174,6 +178,7 @@ export async function spawnFleet(
         { run, now: opts.now, log: opts.log, ...opts.ensureDeps },
       );
       results.push(res);
+      opts.onWindowDone?.(window.name, res.ok);
     }
     return { fleetId, sessionName, dryRun: false, plan, results, ok: results.every((r) => r.ok) };
   });

@@ -60,6 +60,17 @@ from that loop:
 
 ## Quick start
 
+**Fastest — one command does steps 1 & 2:**
+
+```sh
+npm i -g oxtail && oxtail setup
+```
+
+`oxtail setup` registers the oxtail MCP server with Claude Code (`~/.claude.json`) and
+Codex CLI (`~/.codex/config.toml`), installs the message hook, and checks your
+prerequisites (tmux, the claude/codex CLIs) — idempotent, backs up each file first,
+`--dry-run` to preview. Then jump to step 3. Prefer to do it by hand? The manual steps:
+
 **1. Register oxtail with your agent client.** It's fetched from npm on first use.
 
 Claude Code — add to `~/.claude.json` (global) or a project's `.mcp.json`:
@@ -76,7 +87,7 @@ command = "npx"
 args = ["-y", "oxtail@latest"]
 ```
 
-> Pin a version (`oxtail@0.26.0`) for daily configs; `@latest` is fine for trying it
+> Pin a version (`oxtail@0.27.0`) for daily configs; `@latest` is fine for trying it
 > out. On Windows, wrap the command as `cmd /c npx -y oxtail@latest`.
 
 **2. (Claude Code) Install the hooks** so agents receive messages autonomously and
@@ -94,7 +105,7 @@ asymmetry?](docs/protocol.md#mid-turn-vs-next-turn-delivery-the-asymmetry))
 
 ```sh
 npx oxtail oxpit       # live interactive cockpit
-npx oxtail oxpit --dock # compact one-line-per-agent strip for a short bottom pane
+oxpit dock             # one command: spawn the fleet + dock strip + drop you in
 npx oxtail status      # print once and exit (scriptable, --json)
 ```
 
@@ -129,11 +140,26 @@ one-line-per-agent strip sized for a short bottom tmux pane — an always-on HUD
 under wherever you work, so a peer waiting on you (`🙋`) is always in view. Press `d` to
 expand to the full table and back. Every interactive flow — message, nudge, the fleet
 editor, spawn/sync/reset previews — adapts to the squashed space rather than clipping its
-controls. To pin it beneath your current window:
+controls.
+
+### One command: `oxpit dock`
+
+`oxpit dock` assembles the whole cockpit for you. In a project it opens your fleet
+config (the editor grid), and on `y` it spawns the crew (each agent in its own tmux
+window), welds the dock strip onto the bottom of the main window, and attaches you — main
+agent on top, HUD below. The spawn shows a live checklist as each agent comes up. Run it
+again and it just re-attaches (it won't stack a second strip).
 
 ```sh
-tmux split-window -v -l 8 'oxpit --dock'   # an 8-row dock strip at the bottom
+oxpit dock                 # config → y → spawn fleet + dock + attach
+oxpit dock --no-spawn      # just a working shell + dock (no agents)
+oxpit dock --go            # skip the editor, spawn straight away
+oxpit dock --dry-run       # print the plan, change nothing
 ```
+
+A new project with no `fleet.json` gets a working shell + dock; define a fleet (via the
+`S` editor, saved to `.oxtail/fleet.json`) and `oxpit dock` brings the whole crew up. To
+pin a dock manually instead: `tmux split-window -v -l 8 'oxpit --dock'`.
 
 **Monitoring is read-only by default** — the cockpit never drains a mailbox or takes a
 lock, and infers liveness, work, and waits from observed facts rather than
