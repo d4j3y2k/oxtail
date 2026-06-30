@@ -1460,16 +1460,23 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
             spawnTimer = null;
           }
           if (torndown) return;
+          const up = r.results.filter((x) => x.ok).length;
           if (r.ok) {
-            const up = r.results.filter((x) => x.ok).length;
-            setStatus(
-              ok(`✓ spawned "${r.sessionName}" — ${up}/${r.results.length} windows up [${r.fleetId}]`, opts.color),
-            );
-            if (opts.cockpitLaunch) return enterCockpit(r.sessionName); // `oxpit dock` → weld dock + attach
-            refresh(true); // surface the new fleet in the cockpit
+            setStatus(ok(`✓ spawned "${r.sessionName}" — ${up}/${r.results.length} windows up [${r.fleetId}]`, opts.color));
+          } else if (r.error) {
+            // HARD failure (session never created — refuse-to-clobber / creation throw).
+            setStatus(warn(`spawn failed: ${r.error}`, opts.color));
           } else {
-            setStatus(warn(`spawn failed: ${r.error ?? "see per-window results"}`, opts.color));
+            // PARTIAL: the session exists, some agents didn't launch. Still a usable cockpit.
+            setStatus(warn(`spawned "${r.sessionName}" — ${up}/${r.results.length} up, some agents failed (see panes)`, opts.color));
           }
+          // `oxpit dock`: a CREATED session (full OR partial) is a usable cockpit — weld +
+          // attach, matching the one-shot path. Only a hard failure (no session, r.error)
+          // stays in the viewer. The dock itself shows which agents came up.
+          if (opts.cockpitLaunch && !r.error) {
+            return enterCockpit(r.sessionName, spec.windows[0]?.name ?? "main");
+          }
+          refresh(true); // surface the new fleet in the cockpit
         })
         .catch((e) => {
           spawnBusy = false;
@@ -1515,7 +1522,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
           "",
           ...checklist,
           "",
-          d("  working… ⌃C aborts"),
+          d("  working… (⌃C exits — a partial fleet may remain; re-run to finish)"),
         ];
         return body.slice(0, Math.max(1, rows)).map((l) => clipToWidth(l, wrapW) + CLEAR_EOL).join("\n");
       }
@@ -1623,7 +1630,6 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
           const driftMsg = drift ? ` · ${drift} appeared-since, skipped (re-run)` : "";
           if (r.ok) {
             setStatus(ok(`✓ synced "${sessionName}" — +${added} added · ~${r.kept.length} kept · -${removed} removed${driftMsg}`, opts.color));
-            if (opts.cockpitLaunch) return enterCockpit(sessionName); // `oxpit dock` → weld dock + attach
           } else {
             // codex: surface the degraded/skip reason, not just "failed".
             const firstBad =
@@ -1634,6 +1640,9 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
               "see results";
             setStatus(warn(`sync incomplete: ${firstBad}${driftMsg}`, opts.color));
           }
+          // `oxpit dock`: the session ALREADY exists for a sync (we're converging it), so
+          // it's a usable cockpit on full OR partial — weld + attach either way.
+          if (opts.cockpitLaunch) return enterCockpit(sessionName, spec.windows[0]?.name ?? "main");
           refresh(true); // surface the converged (or partial) fleet
         })
         .catch((e) => {
@@ -2086,17 +2095,22 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     // session's main window and move the user into it. The dock pane re-invokes this
     // same binary with --dock; the main window is resolved live (spawn names it from the
     // spec, sync keeps the session's own first window).
-    function enterCockpit(sessionName: string): void {
+    function enterCockpit(sessionName: string, fallbackWindow = "main"): void {
       const cl = opts.cockpitLaunch;
       if (!cl) return refresh(true);
-      const firstWindow = firstWindowOf(realTmux, sessionName, "main");
+      // Resolve the main window live; the fallback (only used if list-windows throws —
+      // a vanished session) is the spec's first window so the dock targets a real name.
+      const firstWindow = firstWindowOf(realTmux, sessionName, fallbackWindow);
       const dockCmd = dockPaneCommand({
         execPath: process.execPath,
         binPath: process.argv[1] ?? "",
         viaOxtail: invokedViaOxtail(process.argv[1]),
       });
       teardown(0, () => {
-        weldDockAndAttach(sessionName, firstWindow, cl.repoRoot, { run: realTmux, dockRows: cl.dockRows, dockCmd });
+        // The terminal is restored here, so a weld/attach failure is surfaced on stderr
+        // (never swallowed — the one-shot path does the same; v0.25.0 silent-drift lesson).
+        const w = weldDockAndAttach(sessionName, firstWindow, cl.repoRoot, { run: realTmux, dockRows: cl.dockRows, dockCmd });
+        if (w.error) process.stderr.write(`oxpit dock: ${w.error}\n`);
       });
     }
 

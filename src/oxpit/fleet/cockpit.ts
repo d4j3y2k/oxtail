@@ -166,7 +166,11 @@ export async function runCockpitDock(
   });
 
   const existed = sessionExistsFn(run, sessionName);
-  const firstWindow = existed ? firstWindowOf(run, sessionName, spec.windows[0]?.name ?? "main") : willSpawn ? spec.windows[0].name : "main";
+  const firstWindow = existed
+    ? firstWindowOf(run, sessionName, spec.windows[0]?.name ?? "main")
+    : willSpawn
+      ? spec.windows[0]?.name ?? "main"
+      : "main";
 
   const plan = buildPlan({ spec, sessionName, sessionExisted: existed, willSpawn, firstWindow, dockRows, dockCmd, inTmux, repoRoot });
 
@@ -194,7 +198,7 @@ export async function runCockpitDock(
       // beat) and the escape — so the spawn never LOOKS hung (→ a panic re-run that
       // collides on the repo lock) and an unexpected fleet is never a silent surprise.
       const names = spec.windows.map((w) => w.name).join(", ");
-      opts.log?.(`  spawning ${spec.windows.length} agents (${names}) — real agent launches, ~${spec.windows.length * 8}s. ⌃C to cancel · --no-spawn for just the dock`);
+      opts.log?.(`  spawning ${spec.windows.length} agents (${names}) — real agent launches, ~${spec.windows.length * 8}s. ⌃C exits · --no-spawn for just the dock`);
       // spawnFleet can THROW (FleetBusyError when another op holds this repo's fleet
       // lock — e.g. a second `oxpit dock` while the first is still launching agents —
       // or a tmux failure). Catch it so the verb reports a clean line, never a raw
