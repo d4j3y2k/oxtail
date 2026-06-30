@@ -651,6 +651,14 @@ function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
 // tiebreak (two agents sharing a window, or no window info). Trouble is still
 // surfaced — by the attention line, glyphs, and badges — just not by reordering.
 function compareByWindow(a: FleetAgent, b: FleetAgent): number {
+  // ⚫DEAD agents sink to the BOTTOM so live ones stay on top (David: dead breadcrumbs from
+  // prior fleet restarts were burying the active session). Dead is TERMINAL, so this never
+  // causes the live active↔idle re-shuffle the window-order sort below avoids — an agent
+  // crosses this boundary once, when it dies. Kept (not hidden): a dead row still carries its
+  // ✉stranded-mail / ⚑stranded-work signal — operator-ack-to-clear, never a silent TTL delete.
+  const aDead = a.liveness === "dead";
+  const bDead = b.liveness === "dead";
+  if (aDead !== bDead) return aDead ? 1 : -1;
   const aHas = a.window_index != null;
   const bHas = b.window_index != null;
   if (aHas !== bHas) return aHas ? -1 : 1; // windowed agents before pane-less ones

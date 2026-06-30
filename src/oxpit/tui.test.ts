@@ -189,3 +189,22 @@ test("resolveDockAutoSelect: REGRESSION — repeated navigate→leave→return n
   assert.equal(st.selectedKey, "s-main", "still snaps home — no cumulative drift");
 });
 
+test("resolveDockAutoSelect: prefers a LIVE agent over a dead breadcrumb, regardless of order", () => {
+  // A window can carry dead breadcrumbs sharing its name (David's screenshot: cursor on a
+  // dead `main`). Auto-select must pick the LIVE one independent of the snapshot sort order —
+  // max's decouple, so a future re-sort can't silently bring the dead-wins bug back.
+  const a = (session_id: string, liveness: FleetAgent["liveness"]): FleetAgent =>
+    ({ session_id, server_pid: 1, window_name: "main", liveness }) as FleetAgent;
+  const live = a("s-live", "idle");
+  const dead = a("s-dead", "dead");
+  const pick = (agents: FleetAgent[]) =>
+    resolveDockAutoSelect(
+      { selectedKey: null, dockAutoSelect: true },
+      { windowName: "main", windowActive: true },
+      agents,
+    ).selectedKey;
+  assert.equal(pick([dead, live]), "s-live", "dead listed first → still picks the live main");
+  assert.equal(pick([live, dead]), "s-live", "live first → picks the live main");
+  assert.equal(pick([dead]), "s-dead", "only dead share the name → falls back to it");
+});
+

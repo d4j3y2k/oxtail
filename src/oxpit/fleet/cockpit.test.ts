@@ -311,10 +311,10 @@ test("runCockpitDock: installs the flip key once + SETs @oxpit_cockpit on every 
     [
       "bind-key", "-n", "C-]",
       "if-shell", "-F", "#{@oxpit_cockpit}",
-      'if-shell -F "#{@oxpit_dock}" "select-pane -t {top}" "select-pane -t {bottom}"',
+      'if-shell -F "#{@oxpit_dock}" "select-pane -U" "select-pane -D"',
       "send-keys C-]",
     ],
-    "the empirically-verified dock-aware toggle argv",
+    "the brace-free dock-aware toggle argv (-U/-D; {top}/{bottom} mis-parse as command blocks)",
   );
 });
 
