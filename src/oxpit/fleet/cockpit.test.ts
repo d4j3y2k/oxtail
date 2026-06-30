@@ -134,6 +134,27 @@ test("runCockpitDock: in-tmux switches the client instead of attaching", async (
   assert.equal(attachCalled, false, "did not block-attach inside tmux");
 });
 
+test("runCockpitDock: welds a dock into EVERY window (omnipresent HUD) + pins each height", async () => {
+  const rec = recorder(); // list-windows → main / max / codex (3 windows)
+  const live = new Set<string>();
+  await runCockpitDock(SPEC, "/repo", baseOpts({
+    run: rec.run,
+    inTmux: true,
+    spawn: true,
+    sessionExistsFn: (_run, name) => live.has(name),
+    spawnFleetFn: async (_s, _r, o) => {
+      live.add(o!.sessionName!);
+      return { fleetId: "f", sessionName: o!.sessionName!, dryRun: false, plan: [], results: [], ok: true };
+    },
+  }));
+  const splits = rec.calls.filter((c) => c[0] === "split-window");
+  assert.equal(splits.length, 3, "one dock split per window — the cockpit is omnipresent");
+  const marks = rec.calls.filter((c) => c[0] === "set-option" && c.includes("@oxpit_dock"));
+  assert.equal(marks.length, 3, "each dock marked");
+  const resizes = rec.calls.filter((c) => c[0] === "resize-pane");
+  assert.equal(resizes.length, 3, "each dock pinned to height after switch-client");
+});
+
 test("runCockpitDock: existing session + dock present → idempotent (no re-spawn, no second strip)", async () => {
   const rec = recorder({ dock: true });
   let spawnCalled = false;
