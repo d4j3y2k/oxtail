@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { stepInput, type InputAction, type PasteState } from "./tui.js";
+import { resolveDockAutoSelect, stepInput, type InputAction, type PasteState } from "./tui.js";
+import type { FleetAgent } from "./snapshot.js";
 
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
@@ -96,5 +97,95 @@ test("stepInput: under-cap unterminated paste keeps buffering (no premature flus
   assert.deepEqual(actions, [], "nothing flushed yet — still mid-paste");
   assert.equal(state.pasting, true);
   assert.equal(state.pasteBuf, "small");
+});
+
+// ── resolveDockAutoSelect: the cockpit dock's window-local auto-selection ─────────
+// Regression cover for the jump-highlight DRIFT: each per-window dock is its own
+// process; the original closure latched auto-select OFF on the first cursor move and
+// never re-armed it, so revisiting a navigated window showed the stale pick a row off.
+const agent = (session_id: string, window_name: string | null): FleetAgent =>
+  ({ session_id, server_pid: 1, window_name }) as FleetAgent;
+const FLEET = [agent("s-main", "main"), agent("s-max", "max"), agent("s-codex", "codex")];
+
+test("resolveDockAutoSelect: armed + active snaps the selection to this window's own agent", () => {
+  const r = resolveDockAutoSelect(
+    { selectedKey: "s-codex", dockAutoSelect: true },
+    { windowName: "main", windowActive: true },
+    FLEET,
+  );
+  assert.equal(r.selectedKey, "s-main");
+  assert.equal(r.dockAutoSelect, true);
+});
+
+test("resolveDockAutoSelect: a cursor move STICKS while you're viewing the window (no re-arm)", () => {
+  // latch off (you moved) + window active (you're viewing it) → selection unchanged so
+  // you can pick a jump target; nothing re-arms it out from under you.
+  const r = resolveDockAutoSelect(
+    { selectedKey: "s-max", dockAutoSelect: false },
+    { windowName: "main", windowActive: true },
+    FLEET,
+  );
+  assert.equal(r.selectedKey, "s-max", "the moved-to pick stays put");
+  assert.equal(r.dockAutoSelect, false);
+});
+
+test("resolveDockAutoSelect: leaving the window RE-ARMS and re-snaps to its own agent (the drift fix)", () => {
+  // moved (latch off, selection=s-max) then switched away (window inactive): must re-arm
+  // AND snap back to this window's agent so returning shows s-main, not the stale s-max.
+  const r = resolveDockAutoSelect(
+    { selectedKey: "s-max", dockAutoSelect: false },
+    { windowName: "main", windowActive: false },
+    FLEET,
+  );
+  assert.equal(r.selectedKey, "s-main", "re-snapped to this window's own agent");
+  assert.equal(r.dockAutoSelect, true, "auto-select re-armed for the return");
+});
+
+test("resolveDockAutoSelect: tmux unreadable leaves the selection untouched", () => {
+  const r = resolveDockAutoSelect({ selectedKey: "s-max", dockAutoSelect: false }, null, FLEET);
+  assert.equal(r.selectedKey, "s-max");
+  assert.equal(r.dockAutoSelect, false);
+});
+
+test("resolveDockAutoSelect: an unmatched window name re-arms but doesn't change the selection", () => {
+  const r = resolveDockAutoSelect(
+    { selectedKey: "s-max", dockAutoSelect: false },
+    { windowName: "ghost", windowActive: false },
+    FLEET,
+  );
+  assert.equal(r.selectedKey, "s-max", "no agent owns 'ghost' → selection unchanged");
+  assert.equal(r.dockAutoSelect, true, "still re-armed (level rule keys on window_active alone)");
+});
+
+test("resolveDockAutoSelect: REGRESSION — repeated navigate→leave→return never drifts", () => {
+  // Drives the exact multi-step the shipped bug failed: the old one-way latch left a
+  // revisited window a row off, worse each cycle. Simulate one dock's lifecycle.
+  let st: { selectedKey: string | null; dockAutoSelect: boolean } = {
+    selectedKey: null,
+    dockAutoSelect: true,
+  };
+  const tick = (windowName: string, windowActive: boolean) =>
+    (st = resolveDockAutoSelect(st, { windowName, windowActive }, FLEET));
+
+  tick("main", true); // startup in main's window
+  assert.equal(st.selectedKey, "s-main");
+
+  // user moves the cursor to pick a jump target (emulate move() clearing the latch)
+  st = { selectedKey: "s-max", dockAutoSelect: false };
+  tick("main", true); // still viewing main → pick STICKS
+  assert.equal(st.selectedKey, "s-max");
+
+  tick("main", false); // switched away → re-arm + re-snap to main in the background
+  assert.equal(st.selectedKey, "s-main");
+  assert.equal(st.dockAutoSelect, true);
+
+  tick("main", true); // come back → already home, no drift
+  assert.equal(st.selectedKey, "s-main");
+
+  // second cycle — the OLD latch stayed off forever and drifted right here
+  st = { selectedKey: "s-codex", dockAutoSelect: false };
+  tick("main", false);
+  tick("main", true);
+  assert.equal(st.selectedKey, "s-main", "still snaps home — no cumulative drift");
 });
 
