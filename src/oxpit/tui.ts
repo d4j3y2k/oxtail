@@ -171,7 +171,15 @@ export function resolveDockAutoSelect(
   if (!dockAutoSelect) return { selectedKey: cur.selectedKey, dockAutoSelect };
   let selectedKey = cur.selectedKey;
   if (tmux.windowName) {
-    const a = agents.find((ag) => ag.window_name === tmux.windowName);
+    // Prefer a LIVE agent for this window — a window can carry dead breadcrumbs from prior
+    // fleet incarnations that share its name, and a first-match find would pick a ⚫dead one
+    // (David's screenshot: the cursor sat on a dead `main`). Make the live-preference EXPLICIT
+    // here rather than leaning on the snapshot's dead-to-bottom sort: that keeps auto-select
+    // correct even if the fleet is later re-ordered (e.g. back to pure window_index) — max's
+    // decouple, so the dead-wins bug can't silently return behind a sort change.
+    const a =
+      agents.find((ag) => ag.window_name === tmux.windowName && ag.liveness !== "dead") ??
+      agents.find((ag) => ag.window_name === tmux.windowName);
     if (a) selectedKey = agentKey(a);
   }
   return { selectedKey, dockAutoSelect };

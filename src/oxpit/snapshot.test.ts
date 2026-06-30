@@ -90,6 +90,44 @@ function buildOne(entry: RegistryEntry): FleetAgent {
   return snap.agents[0];
 }
 
+test("ordering: ⚫dead agents sink below live ones (live keep window order)", () => {
+  // Dead breadcrumbs from prior fleet restarts must not bury the live session (David).
+  const ALIVE = 111111;
+  const DEAD = 222222;
+  const mk = (sid: string, pane: string, pid: number) =>
+    makeEntry({ server_pid: pid, tmux_pane: pane, client: { session_id: sid } as never });
+  const entries = [
+    mk("a-main", "%0", ALIVE), // win 0, live
+    mk("d-old1", "%1", DEAD), // win 1, dead — interleaved by window index
+    mk("a-cdx", "%2", ALIVE), // win 2, live
+    mk("d-old2", "%3", DEAD), // win 3, dead
+  ];
+  const paneInfo = new Map([
+    ["%0", { name: "main", activity_at: null, window_index: 0 }],
+    ["%1", { name: "old1", activity_at: null, window_index: 1 }],
+    ["%2", { name: "cdx", activity_at: null, window_index: 2 }],
+    ["%3", { name: "old2", activity_at: null, window_index: 3 }],
+  ]);
+  const snap = buildSnapshot({
+    readEntries: () => entries,
+    allProjects: true,
+    nowMs: NOW_MS,
+    checkProcSig: false,
+    selfSessionId: null,
+    isAlive: (pid) => pid === ALIVE, // only the ALIVE-pid agents are live
+    resolvePaneInfo: () => paneInfo,
+    classifyBackground: false, // keep everyone in `agents` (don't split off background)
+  });
+  const order = snap.agents.map((a) => a.short_id);
+  const lastLive = Math.max(...snap.agents.flatMap((a, i) => (a.liveness !== "dead" ? [i] : [])));
+  const firstDead = Math.min(...snap.agents.flatMap((a, i) => (a.liveness === "dead" ? [i] : [])));
+  assert.ok(lastLive < firstDead, `all live before all dead — got ${order.join(", ")}`);
+  // live retain window order (main@0 before cdx@2) despite the dead rows that sit between
+  // them by window index — i.e. dead-to-bottom reordered them, not just a stable pass.
+  assert.deepEqual(order.slice(0, 2), ["a-main", "a-cdx"], "live at top in window order");
+  assert.deepEqual(order.slice(2), ["d-old1", "d-old2"], "dead at bottom in window order");
+});
+
 test("liveness: fresh transcript ⇒ active", () => {
   withHome((home) => {
     const tx = writeTranscript(home, "tx-active.jsonl", 5);

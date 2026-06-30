@@ -269,14 +269,17 @@ export interface WeldResult {
 // to ~/.tmux.conf); the if-shell gate makes it a no-op outside cockpit windows, so it's
 // harmless to the user's other sessions on the server even though `bind -n` is global.
 export const FLIP_KEY = "C-]";
-// The toggle: ON the dock (@oxpit_dock pane) → select the agent ({top}); anywhere else in
-// a cockpit window → select the dock ({bottom}). The dock is always the bottom split, so
-// {top}/{bottom} stay correct even if the agent pane gets split (David splits panes) — a
-// blind `select-pane -t :.+` would become a multi-pane cycle there. The else-branch
-// re-sends C-] so a NON-cockpit window's app receives the byte untouched (passthrough).
-// Each nested if-shell sub-command is ONE argv element: there is no shell, so the quotes
-// below are literal bytes tmux re-parses, exactly as verified.
-const FLIP_THEN = `if-shell -F "#{@oxpit_dock}" "select-pane -t {top}" "select-pane -t {bottom}"`;
+// The toggle: ON the dock (@oxpit_dock pane) → select the pane UP (the agent above);
+// anywhere else in a cockpit window → select the pane DOWN (the dock below). DIRECTIONAL
+// `-U`/`-D`, NOT `select-pane -t {top}`/`{bottom}`: tmux's command parser treats `{...}` as
+// a command BLOCK when it RE-PARSES this binding string, so `{bottom}` ran as the command
+// "bottom" ("unknown command: bottom") and the flip silently did nothing — the v0.29.0 bug.
+// `-U`/`-D` are brace-free and verified to toggle through the re-parse. The dock is the
+// bottom split, so for the 2-pane cockpit window this is exactly agent↔dock; if the agent
+// pane is split it steps toward the dock/agent. The else-branch re-sends C-] so a NON-cockpit
+// window's app receives the byte untouched (passthrough). Each nested if-shell sub-command is
+// ONE argv element — no shell, so the quotes are literal bytes tmux re-parses.
+const FLIP_THEN = `if-shell -F "#{@oxpit_dock}" "select-pane -U" "select-pane -D"`;
 export const FLIP_BIND_ARGV = [
   "bind-key", "-n", FLIP_KEY,
   "if-shell", "-F", "#{@oxpit_cockpit}", FLIP_THEN, `send-keys ${FLIP_KEY}`,

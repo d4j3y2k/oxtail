@@ -8,6 +8,18 @@ behavioral changes). Dates are release dates of the published npm tag.
 The hook protocol has its own version (`HOOK_MARKER_VERSION`); when it bumps,
 re-run `npx oxtail install-hook`. The current hook version is noted per release.
 
+## [0.29.1] — 2026-06-30
+
+**Hotfix: the Ctrl-] flip key now actually flips, and ⚫dead rows sink to the bottom.**
+- Fixed the `Ctrl-]` flip key, which did nothing in v0.29.0 (it reported `unknown command:
+  bottom`). tmux's command parser treats `{bottom}`/`{top}` as command BLOCKS when it
+  re-parses the binding string, so `select-pane -t {bottom}` tried to run "bottom" as a
+  command. The binding now uses brace-free directional `select-pane -U`/`-D` — still
+  dock-aware, verified to toggle through the re-parse.
+- The cockpit (dock + full table) now sorts ⚫dead agents to the BOTTOM, so the live sessions
+  stay at the top instead of being buried by dead breadcrumbs from earlier fleet restarts.
+  Dead rows are kept, not hidden — they still carry their stranded-mail / stranded-work signal.
+
 ## [0.29.0] — 2026-06-30
 
 **One keystroke flips between the agent and its dock — Ctrl-], set up for you.**
