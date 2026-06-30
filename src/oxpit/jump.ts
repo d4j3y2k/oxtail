@@ -172,15 +172,6 @@ export function chooseClient(
 ): { client: string | null; ambiguous: boolean; candidates?: string[] } {
   if (explicit) return { client: explicit, ambiguous: false };
   if (clients.length === 0) return { client: null, ambiguous: false };
-  // Dock-cockpit case: if our OWN client is already viewing the target's session (you're
-  // in the cockpit and pressing ⏎ to walk to an agent in it), move US — the jump is "take
-  // this view to the agent," not "drag a different terminal." This runs before the
-  // exclude-self path below (which is for oxpit-in-a-side-tab, moving your work-client),
-  // so a second attached client (e.g. a remote-control client) can't make it ambiguous.
-  if (selfClient) {
-    const selfRow = clients.find((c) => c.name === selfClient);
-    if (selfRow && selfRow.session === targetSession) return { client: selfClient, ambiguous: false };
-  }
   const others = clients.filter((c) => c.name !== selfClient);
   if (others.length === 0) return { client: selfClient, ambiguous: false }; // only us
   // Prefer clients already on the target's session — those follow cleanly to the
@@ -229,10 +220,31 @@ export type JumpDeps = {
   // select-pane / switch-client. Lets a caller preview a jump, and lets the live
   // switch-client path be verified against a real fleet without disturbing it.
   dryRun?: boolean;
+  // Dock-cockpit nav (`oxpit --dock`'s ⏎): instead of moving a client INTO the agent
+  // (switch-client), switch the agent's WINDOW and land on THAT window's dock pane — so
+  // you stay "in the dock" while the agent above you changes. Every cockpit window has a
+  // dock (@oxpit_dock), so this keeps the persistent-cockpit feel: ⏎ flips the agent,
+  // never teleports you out of oxpit.
+  dockLocal?: boolean;
   // injectable for tests
   resolveEntry?: (agent: FleetAgent) => RegistryEntry | null;
   verifyPane?: (entry: RegistryEntry) => string | null;
 };
+
+// The dock pane (@oxpit_dock) in the same window as `paneInWindow` (a tmux pane target
+// resolves to its window for list-panes), or null if that window has no dock.
+function dockPaneInWindow(run: TmuxRunner, paneInWindow: string): string | null {
+  try {
+    const out = run(["list-panes", "-t", paneInWindow, "-F", "#{pane_id}=#{@oxpit_dock}"]);
+    for (const line of out.split("\n")) {
+      const [pid, mark] = line.trim().split("=");
+      if (mark === "1" && pid) return pid;
+    }
+  } catch {
+    // fall through — caller lands on the agent pane
+  }
+  return null;
+}
 
 // Single-quote a value for a PASTE-able shell command (the manual fallback strings).
 // Embedded single quotes are escaped the POSIX way ('\'' ) so an exotic session name
@@ -268,6 +280,23 @@ export function jumpToAgent(agent: FleetAgent, deps: JumpDeps = {}): JumpResult 
   const loc = listPanes(run).find((p) => p.pane === pane);
   if (!loc) {
     return { ok: false, reason: `pane ${pane} not found in tmux` };
+  }
+
+  // Dock-cockpit ⏎: switch the agent's WINDOW and land on that window's dock pane — you
+  // stay in the dock while the agent above changes. No client logic (so a 2nd attached
+  // client can't make it ambiguous) and no teleport into the agent pane.
+  if (deps.dockLocal) {
+    const dock = dockPaneInWindow(run, pane);
+    if (deps.dryRun) {
+      return { ok: true, pane: dock ?? pane, session: loc.session, window: loc.window, client: null, dryRun: true };
+    }
+    try {
+      run(["select-window", "-t", pane]); // a pane target selects its window
+      run(["select-pane", "-t", dock ?? pane]);
+    } catch (e) {
+      return { ok: false, reason: `dock jump failed: ${e instanceof Error ? e.message : String(e)}` };
+    }
+    return { ok: true, pane: dock ?? pane, session: loc.session, window: loc.window, client: null };
   }
 
   // Decide which attached tmux client to drive BEFORE mutating anything. This works

@@ -1012,7 +1012,9 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         return;
       }
       const agent = snapshot.agents[idx];
-      const r = jumpToAgent(agent, { client: opts.client });
+      // In the dock (the persistent cockpit), ⏎ flips the agent's WINDOW under you and
+      // keeps you in that window's dock — you never get teleported into the agent pane.
+      const r = jumpToAgent(agent, { client: opts.client, dockLocal: opts.dock });
       if (r.ok) {
         setStatus(
           ok(`→ jumped to ${agent.short_id} (${r.session}${r.client ? ` · ${r.client}` : ""})`, opts.color),
