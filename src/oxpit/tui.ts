@@ -328,17 +328,16 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       }
     }
     let dockAutoSelect = selfManagedDock; // until the user moves the cursor
-    // The agentKey of the agent in the SAME window as this dock pane (the window's other,
-    // un-@oxpit_dock pane), matched to the live fleet. null until that agent registers.
+    // The agentKey of the agent in the SAME tmux window as this dock pane. Matched by
+    // WINDOW NAME (each fleet agent lives in a window named after it) — robust vs. the
+    // pane-id matching, which drifted the selection one agent off. null until it registers.
     const dockWindowAgentKey = (): string | null => {
       if (!dockSelfPane) return null;
       try {
-        for (const line of realTmux(["list-panes", "-t", dockSelfPane, "-F", "#{pane_id} #{@oxpit_dock}"]).split("\n")) {
-          const [pid, mark] = line.trim().split(" ");
-          if (pid && pid !== dockSelfPane && mark !== "1") {
-            const a = snapshot.agents.find((ag) => ag.tmux_pane === pid);
-            if (a) return agentKey(a);
-          }
+        const win = realTmux(["display-message", "-t", dockSelfPane, "-p", "#{window_name}"]).trim();
+        if (win) {
+          const a = snapshot.agents.find((ag) => ag.window_name === win);
+          if (a) return agentKey(a);
         }
       } catch {
         // ignore
@@ -944,7 +943,8 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         // it. Runs in OUR process after the window settled, so it can't lose the race the
         // weld-side resize did. Converges: resize → SIGWINCH → repaint → rows == want.
         if (selfManagedDock && dockSelfPane) {
-          const want = Math.min(Math.max(3, snapshot.agents.length + 2), DOCK_MAX_ROWS);
+          // header + agents + footer is +2; +2 more for a little breathing room (David).
+          const want = Math.min(Math.max(4, snapshot.agents.length + 4), DOCK_MAX_ROWS);
           // Shrink-only: pin it snug when tmux gave us too much (the half-screen bug), and
           // keep it snug if the window later grows; never fight a user who wants it taller.
           if (rows > want) {

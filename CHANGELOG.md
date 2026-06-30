@@ -8,6 +8,15 @@ behavioral changes). Dates are release dates of the published npm tag.
 The hook protocol has its own version (`HOOK_MARKER_VERSION`); when it bumps,
 re-run `npx oxtail install-hook`. The current hook version is noted per release.
 
+## [0.28.3] — 2026-06-30
+
+**Dock height + the selector lands on the agent you jumped to.**
+- The self-sized dock gets a couple rows of breathing room (header + agents + footer, plus
+  ~2) instead of hugging the content exactly.
+- Fixed an off-by-one where jumping into a window highlighted the agent before/after the
+  one you landed on: the window\u2019s agent is now matched by WINDOW NAME (each fleet agent
+  lives in a window named after it) rather than pane id, which was drifting the selection.
+
 ## [0.28.2] — 2026-06-30
 
 **Dock self-sizes + remembers the window you jumped to.** Two more cockpit polish items:
