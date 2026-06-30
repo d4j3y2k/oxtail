@@ -8,6 +8,15 @@ behavioral changes). Dates are release dates of the published npm tag.
 The hook protocol has its own version (`HOOK_MARKER_VERSION`); when it bumps,
 re-run `npx oxtail install-hook`. The current hook version is noted per release.
 
+## [0.28.0] — 2026-06-30
+
+**The dock is omnipresent.** `oxpit dock` now welds the dock strip into **every** window
+of the cockpit, not just the main one — so when you switch to any agent (max, codex, …)
+the fleet HUD is right there below it. That is the point of oxpit: a *persistent* cockpit
+you never tab away from, not a strip that vanishes when you leave the main window. One
+lightweight `oxpit --dock` process per window; idempotent (re-running never stacks a second
+strip in a window that has one).
+
 ## [0.27.2] — 2026-06-30
 
 **Fixes from live `oxpit dock` use.** Two cockpit bugs that surfaced on a fresh machine:

@@ -116,15 +116,22 @@ function buildPlan(args: {
   return lines;
 }
 
+// All window names of a session, in index order. Targeted by `session:window` (window
+// names are unique within an oxpit-spawned fleet — one per spec entry).
+export function windowNamesOf(run: TmuxRun, sessionName: string): string[] {
+  try {
+    return run(["list-windows", "-t", sessionName, "-F", "#{window_name}"])
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 // Resolve the first (main) window name of an existing session — the dock's home.
 export function firstWindowOf(run: TmuxRun, sessionName: string, fallback: string): string {
-  try {
-    const out = run(["list-windows", "-t", sessionName, "-F", "#{window_name}"]);
-    const first = out.split("\n").map((l) => l.trim()).filter(Boolean)[0];
-    return first || fallback;
-  } catch {
-    return fallback;
-  }
+  return windowNamesOf(run, sessionName)[0] || fallback;
 }
 
 // Does the window already carry an oxpit dock pane (so re-running just attaches)?
@@ -262,7 +269,6 @@ export function weldDockAndAttach(
   const run = opts.run ?? defaultRun;
   const inTmux = opts.inTmux ?? Boolean(process.env.TMUX);
   const dockRows = opts.dockRows ?? 8;
-  const target = `${sessionName}:${firstWindow}`;
   const termRows = opts.termRows ?? process.stdout.rows;
   const termCols = opts.termCols ?? process.stdout.columns;
 
@@ -277,24 +283,42 @@ export function weldDockAndAttach(
     }
   }
 
-  let dockAdded = false;
-  let dockPaneId = "";
-  if (!dockPresent(run, target)) {
+  // Weld a dock strip into EVERY window so the cockpit HUD is OMNIPRESENT — switch to any
+  // agent's window and the fleet dock is right below it (oxpit's whole point: a persistent
+  // cockpit, not a strip you lose the moment you tab away). Idempotent per-window via
+  // @oxpit_dock; best-effort — one window failing to split doesn't abort the rest.
+  const dockPaneIds: string[] = [];
+  let anyDock = false;
+  let firstErr: unknown = null;
+  for (const w of windowNamesOf(run, sessionName)) {
+    const target = `${sessionName}:${w}`;
+    if (dockPresent(run, target)) {
+      anyDock = true; // already docked (re-run) — leave it
+      continue;
+    }
     const topPane = topPaneOf(run, target);
     try {
-      // -d keeps the ORIGINAL (agent) pane active so the user lands on the agent, not
-      // the dock. The trailing string is the shell command tmux runs in the new pane.
-      dockPaneId = run(["split-window", "-v", "-d", "-l", String(dockRows), "-t", target, "-c", repoRoot, "-P", "-F", "#{pane_id}", opts.dockCmd]).trim();
-      if (dockPaneId) run(["set-option", "-p", "-t", dockPaneId, "@oxpit_dock", "1"]);
+      // -d keeps the ORIGINAL (agent) pane active so each window lands on its agent, dock
+      // below. The trailing string is the shell command tmux runs in the new pane.
+      const dp = run(["split-window", "-v", "-d", "-l", String(dockRows), "-t", target, "-c", repoRoot, "-P", "-F", "#{pane_id}", opts.dockCmd]).trim();
+      if (dp) {
+        run(["set-option", "-p", "-t", dp, "@oxpit_dock", "1"]);
+        dockPaneIds.push(dp);
+        anyDock = true;
+      }
       if (topPane) run(["select-pane", "-t", topPane]);
-      dockAdded = true;
     } catch (e) {
-      return { dockAdded: false, attachMode: "none", error: `dock split failed: ${e instanceof Error ? e.message : String(e)}` };
+      firstErr ??= e; // record, but keep docking the other windows
     }
   }
+  if (!anyDock && firstErr) {
+    return { dockAdded: false, attachMode: "none", error: `dock split failed: ${firstErr instanceof Error ? firstErr.message : String(firstErr)}` };
+  }
+  const dockAdded = dockPaneIds.length > 0;
 
+  // Land on the main window (each window's agent pane is already active from above).
   try {
-    run(["select-window", "-t", target]);
+    run(["select-window", "-t", `${sessionName}:${firstWindow}`]);
   } catch {
     // non-fatal — attach still lands on the session's active window
   }
@@ -302,12 +326,11 @@ export function weldDockAndAttach(
   if (inTmux) {
     try {
       run(["switch-client", "-t", sessionName]);
-      // The window is now at the client's REAL size — pin the dock to dockRows (the
-      // detached split was relative to tmux's ~24-row default and got scaled up on
-      // attach, so the strip would otherwise be ~half the terminal).
-      if (dockPaneId) {
+      // Windows are now at the client's REAL size — pin EVERY dock to dockRows (each was
+      // split relative to tmux's ~24-row default and got scaled up proportionally on attach).
+      for (const dp of dockPaneIds) {
         try {
-          run(["resize-pane", "-t", dockPaneId, "-y", String(dockRows)]);
+          run(["resize-pane", "-t", dp, "-y", String(dockRows)]);
         } catch {
           // best-effort — a tmux that rejects resize-pane -y leaves the proportional size
         }
