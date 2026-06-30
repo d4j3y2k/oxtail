@@ -8,6 +8,19 @@ behavioral changes). Dates are release dates of the published npm tag.
 The hook protocol has its own version (`HOOK_MARKER_VERSION`); when it bumps,
 re-run `npx oxtail install-hook`. The current hook version is noted per release.
 
+## [0.27.2] — 2026-06-30
+
+**Fixes from live `oxpit dock` use.** Two cockpit bugs that surfaced on a fresh machine:
+- **Dock pane was ~half the terminal.** The dock split happens on a detached session at
+  tmux's default ~24 rows, then attaching scales the panes proportionally to the real
+  terminal — so a fixed-row dock ballooned. The height is now pinned to the real size
+  (`resize-pane` after switch-client; pre-sized session for a bare attach).
+- **`⏎` jump failed with "multiple terminals could be moved."** The client picker was
+  built for oxpit-in-a-side-tab (move your *other* work-client), so it excluded your own
+  client — and a second attached client (e.g. a remote-control client) made it ambiguous.
+  Now, when your own client is already viewing the cockpit session, `⏎` moves *you* to the
+  agent (the dock-cockpit case), unambiguously.
+
 ## [0.27.1] — 2026-06-30
 
 **Fix: `oxpit dock` in a fresh project gave an empty dock instead of the spawn flow.**

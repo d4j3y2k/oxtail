@@ -172,6 +172,15 @@ export function chooseClient(
 ): { client: string | null; ambiguous: boolean; candidates?: string[] } {
   if (explicit) return { client: explicit, ambiguous: false };
   if (clients.length === 0) return { client: null, ambiguous: false };
+  // Dock-cockpit case: if our OWN client is already viewing the target's session (you're
+  // in the cockpit and pressing ⏎ to walk to an agent in it), move US — the jump is "take
+  // this view to the agent," not "drag a different terminal." This runs before the
+  // exclude-self path below (which is for oxpit-in-a-side-tab, moving your work-client),
+  // so a second attached client (e.g. a remote-control client) can't make it ambiguous.
+  if (selfClient) {
+    const selfRow = clients.find((c) => c.name === selfClient);
+    if (selfRow && selfRow.session === targetSession) return { client: selfClient, ambiguous: false };
+  }
   const others = clients.filter((c) => c.name !== selfClient);
   if (others.length === 0) return { client: selfClient, ambiguous: false }; // only us
   // Prefer clients already on the target's session — those follow cleanly to the

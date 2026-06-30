@@ -90,6 +90,18 @@ test("chooseClient: prefers the target-session client, ignores unrelated session
   assert.deepEqual(r, { client: "work", ambiguous: false });
 });
 
+test("chooseClient: dock-cockpit — self ON the target session moves self, even with another client", () => {
+  // The dock-cockpit case: you ARE the client viewing the cockpit session, and ⏎ should
+  // walk YOU to an agent in that same session. A second attached client (a remote-control
+  // client) must NOT make it ambiguous — previously it did ("multiple terminals").
+  const clients = [
+    { name: "me", tty: "/t0", session: "strudel" }, // viewing the cockpit
+    { name: "remote-ctl", tty: "/t1", session: "strudel" }, // also attached
+  ];
+  const r = chooseClient(clients, "me", undefined, "strudel");
+  assert.deepEqual(r, { client: "me", ambiguous: false }, "moves self, not ambiguous");
+});
+
 test("chooseClient: only self attached ⇒ drive self", () => {
   const r = chooseClient([{ name: "self", tty: "/t", session: "s" }], "self", undefined, "s");
   assert.deepEqual(r, { client: "self", ambiguous: false });
