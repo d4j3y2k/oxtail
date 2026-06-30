@@ -38,6 +38,9 @@ const ALT_ON = "\x1b[?1049h";
 const ALT_OFF = "\x1b[?1049l";
 // Braille spinner frames for the live spawn-progress indicator.
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+// Cap for a self-sizing cockpit dock pane (header + agents + footer). A big fleet windows
+// with "⋯ N more" markers beyond this rather than letting the dock eat the whole window.
+const DOCK_MAX_ROWS = 12;
 const CURSOR_HIDE = "\x1b[?25l";
 const CURSOR_SHOW = "\x1b[?25h";
 const HOME = "\x1b[H";
@@ -307,6 +310,49 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     // strip live, same process — seeded by `--dock` but mutable so the cockpit can
     // collapse to a HUD and lean back out to detail without a quit-and-relaunch.
     let dock = opts.dock;
+    // Cockpit-dock self-management. When this oxpit IS a welded cockpit dock pane
+    // (@oxpit_dock=1 on our own $TMUX_PANE), two behaviors kick in:
+    //   • self-size: shrink our pane to fit the fleet (header + agents + footer) so it's
+    //     a snug strip regardless of what proportional height tmux handed us — this runs
+    //     in OUR process after the window has settled, so the agent's startup re-layout
+    //     can't beat it (the bug the weld-side resize kept losing).
+    //   • auto-select: highlight the agent in OUR OWN window, so jumping into a window
+    //     lands with that agent selected (until you move the cursor yourself).
+    const dockSelfPane = opts.dock ? process.env.TMUX_PANE ?? "" : "";
+    let selfManagedDock = false;
+    if (dockSelfPane) {
+      try {
+        selfManagedDock = realTmux(["show-options", "-t", dockSelfPane, "-pqv", "@oxpit_dock"]).trim() === "1";
+      } catch {
+        // not in a managed cockpit dock — leave self-management off
+      }
+    }
+    let dockAutoSelect = selfManagedDock; // until the user moves the cursor
+    // The agentKey of the agent in the SAME window as this dock pane (the window's other,
+    // un-@oxpit_dock pane), matched to the live fleet. null until that agent registers.
+    const dockWindowAgentKey = (): string | null => {
+      if (!dockSelfPane) return null;
+      try {
+        for (const line of realTmux(["list-panes", "-t", dockSelfPane, "-F", "#{pane_id} #{@oxpit_dock}"]).split("\n")) {
+          const [pid, mark] = line.trim().split(" ");
+          if (pid && pid !== dockSelfPane && mark !== "1") {
+            const a = snapshot.agents.find((ag) => ag.tmux_pane === pid);
+            if (a) return agentKey(a);
+          }
+        }
+      } catch {
+        // ignore
+      }
+      return null;
+    };
+    // Snap the selection to this dock's own window-agent (re-tried each refresh until it
+    // registers), unless the user has taken the cursor over.
+    const applyDockAutoSelect = (): void => {
+      if (!dockAutoSelect) return;
+      const k = dockWindowAgentKey();
+      if (k) selectedKey = k;
+    };
+    applyDockAutoSelect();
     let logFilterSelf = false; // scope the log to the fleet-selected agent
     // `b` expands the detached-background section into its individual rows (default
     // collapsed to a count header). Detached processes are never navigable, so this is
@@ -893,6 +939,22 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       // own header + footer). slice(0, rows) is the overflow backstop — a fleet
       // taller than the pane truncates rather than wrapping into a repaint desync.
       if (dock) {
+        // Self-size a welded cockpit dock to fit its content (header + agents + footer),
+        // capped, so it's a snug strip rather than whatever proportional height tmux gave
+        // it. Runs in OUR process after the window settled, so it can't lose the race the
+        // weld-side resize did. Converges: resize → SIGWINCH → repaint → rows == want.
+        if (selfManagedDock && dockSelfPane) {
+          const want = Math.min(Math.max(3, snapshot.agents.length + 2), DOCK_MAX_ROWS);
+          // Shrink-only: pin it snug when tmux gave us too much (the half-screen bug), and
+          // keep it snug if the window later grows; never fight a user who wants it taller.
+          if (rows > want) {
+            try {
+              realTmux(["resize-pane", "-t", dockSelfPane, "-y", String(want)]);
+            } catch {
+              // best-effort
+            }
+          }
+        }
         const dockBody = renderDock(snapshot, {
           color: opts.color,
           width,
@@ -962,6 +1024,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       // sticky activityCache still backs the renderer's toolActivity overlay (a torn/
       // degraded read blips the badge off for one tick instead of forking truth).
       snapshot = buildSnapshot({ ...opts.buildOpts, checkProcSig: full, readActivity: true });
+      applyDockAutoSelect(); // re-snap to our window-agent once it registers (until the user moves)
       activityCache = new Map(snapshot.agents.map((a) => [agentKey(a), a.activity]));
       // Burst any agent whose liveness CHANGED since the last build ("becomes awake",
       // goes idle, dies). prevLiveness starts empty so the first build never bursts.
@@ -991,6 +1054,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
 
     function move(delta: number): void {
       if (snapshot.agents.length === 0) return;
+      dockAutoSelect = false; // you've taken the cursor — stop snapping to the window-agent
       let idx = selectedIndex();
       if (idx < 0) idx = 0;
       idx = (idx + delta + snapshot.agents.length) % snapshot.agents.length;

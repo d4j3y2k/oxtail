@@ -8,6 +8,17 @@ behavioral changes). Dates are release dates of the published npm tag.
 The hook protocol has its own version (`HOOK_MARKER_VERSION`); when it bumps,
 re-run `npx oxtail install-hook`. The current hook version is noted per release.
 
+## [0.28.2] — 2026-06-30
+
+**Dock self-sizes + remembers the window you jumped to.** Two more cockpit polish items:
+- **The dock pane now sizes ITSELF** to fit the fleet (header + agents + footer, capped),
+  in its own process after the window has settled \u2014 so the half-screen ballooning is gone
+  for good (the earlier weld-side resize kept losing a race with the foreground agent\u2019s
+  startup re-layout). Shrink-only: snug when tmux over-allocates, never fights a bigger pane.
+- **Each window\u2019s dock highlights that window\u2019s agent.** Jump to a window and its agent is
+  already selected (re-resolved until it registers), so you can keep navigating from where
+  you are instead of the cursor snapping back to the top \u2014 until you move it yourself.
+
 ## [0.28.1] — 2026-06-30
 
 **Cockpit nav: `\u23ce` keeps you in the dock; main-window dock sized right.** Two follow-ups to
