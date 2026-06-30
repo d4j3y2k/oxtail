@@ -36,6 +36,8 @@ import { inferProjectRoot, safeRealpath } from "../scope.js";
 
 const ALT_ON = "\x1b[?1049h";
 const ALT_OFF = "\x1b[?1049l";
+// Braille spinner frames for the live spawn-progress indicator.
+const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const CURSOR_HIDE = "\x1b[?25l";
 const CURSOR_SHOW = "\x1b[?25h";
 const HOME = "\x1b[H";
@@ -326,6 +328,12 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       | { lines: string[]; canSpawn: boolean; spec: FleetSpec; sessionName: string }
       | null = null;
     let spawnBusy = false;
+    // Live spawn progress: which windows have finished launching (name→ok), an animation
+    // frame, and the spinner timer — so the (sequential, ~minutes) spawn shows the crew
+    // coming up one by one instead of a static "spawning…" that reads as hung.
+    const spawnDone = new Map<string, boolean>();
+    let spawnSpinFrame = 0;
+    let spawnTimer: NodeJS.Timeout | null = null;
     // SYNC overlay: the editor's `y` routes here when the target session already EXISTS
     // (converge it) vs SPAWN for a new one. Read-only preview → deliberate confirm (a
     // capital `Y` when it deletes, `y` when purely additive). syncBusy locks it in flight.
@@ -1424,20 +1432,33 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (!spawnView || spawnBusy || !spawnView.canSpawn) return;
       const { spec, sessionName } = spawnView;
       spawnBusy = true;
-      spawnView = {
-        ...spawnView,
-        lines: [
-          ...spawnView.lines,
-          "",
-          dim(`  spawning "${sessionName}"… creating the session, launching agents sequentially`, opts.color),
-        ],
-      };
+      // Start the live progress: clear the done-set + spin the indicator so the
+      // sequential, slow spawn shows the crew coming up rather than reading as hung.
+      spawnDone.clear();
+      spawnSpinFrame = 0;
+      if (spawnTimer) clearInterval(spawnTimer);
+      spawnTimer = setInterval(() => {
+        if (torndown) return;
+        spawnSpinFrame++;
+        paint();
+      }, 120);
       paint();
-      spawnFleet(spec, snapshot.project_root, { dryRun: false, sessionName })
+      spawnFleet(spec, snapshot.project_root, {
+        dryRun: false,
+        sessionName,
+        onWindowDone: (w, wok) => {
+          spawnDone.set(w, wok);
+          paint(); // tick the checklist as each agent lands
+        },
+      })
         .then((r) => {
           spawnBusy = false;
           spawnOpen = false;
           spawnView = null;
+          if (spawnTimer) {
+            clearInterval(spawnTimer);
+            spawnTimer = null;
+          }
           if (torndown) return;
           if (r.ok) {
             const up = r.results.filter((x) => x.ok).length;
@@ -1454,6 +1475,10 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
           spawnBusy = false;
           spawnOpen = false;
           spawnView = null;
+          if (spawnTimer) {
+            clearInterval(spawnTimer);
+            spawnTimer = null;
+          }
           if (torndown) return;
           setStatus(warn(`spawn error: ${e instanceof Error ? e.message : e}`, opts.color));
         });
@@ -1465,16 +1490,42 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     function spawnFrame(width: number, rows: number): string {
       if (!spawnView) return "";
       const d = (s: string) => dim(s, opts.color);
-      const prompt = spawnBusy
-        ? d("  working… (Ctrl-C aborts the cockpit)")
-        : spawnView.canSpawn
-          ? warn("  press y to SPAWN · any other key to go back", opts.color)
-          : warn("  press any key to go back", opts.color);
+      const b = (s: string) => (opts.color ? `\x1b[1m\x1b[36m${s}\x1b[0m` : s);
+      const wrapW = Math.max(8, width);
+      // While the (sequential, slow) spawn runs, show a LIVE checklist — the crew coming
+      // up one by one (✓ done · spinner launching · ◦ pending) — so the wait reads as
+      // progress, not a hang. Replaces the static plan preview until it resolves.
+      if (spawnBusy) {
+        const spin = SPINNER[spawnSpinFrame % SPINNER.length];
+        const wins = spawnView.spec.windows;
+        const upCount = [...spawnDone.values()].filter(Boolean).length;
+        let activeShown = false;
+        const checklist = wins.map((w) => {
+          if (spawnDone.has(w.name)) {
+            return spawnDone.get(w.name) ? d(`    ✓ ${w.name}`) : warn(`    ✗ ${w.name}`, opts.color);
+          }
+          if (!activeShown) {
+            activeShown = true;
+            return `    ${spin} ${w.name} — launching…`;
+          }
+          return d(`    ◦ ${w.name}`);
+        });
+        const body = [
+          b(`  ${spin} spawning "${spawnView.sessionName}" — ${upCount}/${wins.length} agents up`),
+          "",
+          ...checklist,
+          "",
+          d("  working… ⌃C aborts"),
+        ];
+        return body.slice(0, Math.max(1, rows)).map((l) => clipToWidth(l, wrapW) + CLEAR_EOL).join("\n");
+      }
+      const prompt = spawnView.canSpawn
+        ? warn("  press y to SPAWN · any other key to go back", opts.color)
+        : warn("  press any key to go back", opts.color);
       // WRAP the (plain) plan lines so long recipe steps aren't clipped off the right
       // edge; colored header/source lines have ANSI codes → pass them through to the
       // ANSI-aware clip (they're short and never need wrapping). Continuation lines are
       // indented so a wrapped step reads as one logical line.
-      const wrapW = Math.max(8, width);
       const wrapped = spawnView.lines.flatMap((l) => {
         if (l.includes("\x1b") || l.length <= wrapW) return [l];
         // wrap to width-2 so the 2-space continuation indent never pushes past the edge
@@ -1997,6 +2048,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       torndown = true;
       if (debounceTimer) clearTimeout(debounceTimer);
       if (slowTick) clearInterval(slowTick);
+      if (spawnTimer) clearInterval(spawnTimer);
       stopAnim();
       for (const w of watchers) {
         try {
