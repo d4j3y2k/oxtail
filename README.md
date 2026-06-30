@@ -87,7 +87,7 @@ command = "npx"
 args = ["-y", "oxtail@latest"]
 ```
 
-> Pin a version (`oxtail@0.27.0`) for daily configs; `@latest` is fine for trying it
+> Pin a version (`oxtail@0.27.1`) for daily configs; `@latest` is fine for trying it
 > out. On Windows, wrap the command as `cmd /c npx -y oxtail@latest`.
 
 **2. (Claude Code) Install the hooks** so agents receive messages autonomously and
@@ -157,9 +157,10 @@ oxpit dock --go            # skip the editor, spawn straight away
 oxpit dock --dry-run       # print the plan, change nothing
 ```
 
-A new project with no `fleet.json` gets a working shell + dock; define a fleet (via the
-`S` editor, saved to `.oxtail/fleet.json`) and `oxpit dock` brings the whole crew up. To
-pin a dock manually instead: `tmux split-window -v -l 8 'oxpit --dock'`.
+A new project with no `fleet.json` still opens the editor seeded with a default fleet
+(main/max/codex) — tweak it or just hit `y` to spawn; `w` saves it to `.oxtail/fleet.json`
+for next time. Want just a dock with no agents? `oxpit dock --no-spawn`. To pin a dock
+manually instead: `tmux split-window -v -l 8 'oxpit --dock'`.
 
 **Monitoring is read-only by default** — the cockpit never drains a mailbox or takes a
 lock, and infers liveness, work, and waits from observed facts rather than

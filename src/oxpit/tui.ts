@@ -174,16 +174,17 @@ async function runDockCockpit(argv: string[]): Promise<number> {
   // shell+dock; otherwise auto (spawn iff a real fleet.json configured it).
   const spawn = has("--spawn") ? true : has("--no-spawn") ? false : undefined;
 
-  // Config-first (the default for a NEW fleet): open the fleet editor so the user
+  // Config-first (the default for any NEW session): open the fleet editor so the user
   // reviews/edits the spec, then `y` applies → spawn (or sync) → weld dock → attach.
-  // Skipped for: an existing session (just dock in — the fast path), a bare shell
-  // (--no-spawn), an explicit --session name, --go/-y (straight to launch), --dry-run,
-  // or no TTY. Those fall through to the one-shot runCockpitDock below.
+  // This fires even with NO fleet.json — the editor is seeded with the built-in default
+  // fleet (main/max/codex), so a fresh project gets the spawn-a-crew flow, not a silent
+  // empty dock. Skipped for: an existing session (just dock in — the fast path), a bare
+  // shell (--no-spawn), an explicit --session name, --go/-y (straight to launch),
+  // --dry-run, or no TTY. Those fall through to the one-shot runCockpitDock below.
   const sessionName = valOf("--session") ?? tmuxSessionName(cfg.spec.name);
-  const willSpawn = spawn ?? configured;
   const haveTTY = Boolean(process.stdout.isTTY && process.stdin.isTTY);
   const editorFirst =
-    !dryRun && willSpawn && haveTTY && !has("--go") && !has("-y") && !has("--no-spawn") &&
+    !dryRun && haveTTY && !has("--go") && !has("-y") && !has("--no-spawn") &&
     valOf("--session") === undefined && !tmuxSessionExists(sessionName);
   if (editorFirst) {
     return runInteractive({

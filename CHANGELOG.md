@@ -8,6 +8,16 @@ behavioral changes). Dates are release dates of the published npm tag.
 The hook protocol has its own version (`HOOK_MARKER_VERSION`); when it bumps,
 re-run `npx oxtail install-hook`. The current hook version is noted per release.
 
+## [0.27.1] — 2026-06-30
+
+**Fix: `oxpit dock` in a fresh project gave an empty dock instead of the spawn flow.**
+A project with no `.oxtail/fleet.json` fell through to "bare shell + dock" — nothing
+spawned, the strip read "no agents in this project yet," and a new user hit a dead end.
+Now `oxpit dock` opens the fleet editor seeded with the built-in **default fleet**
+(main/max/codex) for *any* new session, so a fresh project gets the review-then-`y`-spawn
+flow exactly like a configured one (`w` in the editor saves it to `.oxtail/fleet.json`).
+`oxpit dock --no-spawn` remains the bare shell + dock; `--go` still skips the editor.
+
 ## [0.27.0] — 2026-06-29
 
 **`oxpit dock` — assemble the whole cockpit in one command.** The natural front door
