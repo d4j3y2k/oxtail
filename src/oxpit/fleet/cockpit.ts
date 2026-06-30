@@ -235,6 +235,11 @@ export interface WeldOptions {
   dockRows?: number;
   dockCmd: string;
   attachFn?: (session: string) => void;
+  // The REAL terminal size (defaults to process.stdout). Used to pin the dock height:
+  // the split happens on a detached session at tmux's default ~80x24, and attaching
+  // scales panes proportionally to the terminal — so a fixed-row dock would balloon.
+  termRows?: number;
+  termCols?: number;
 }
 
 export interface WeldResult {
@@ -258,15 +263,29 @@ export function weldDockAndAttach(
   const inTmux = opts.inTmux ?? Boolean(process.env.TMUX);
   const dockRows = opts.dockRows ?? 8;
   const target = `${sessionName}:${firstWindow}`;
+  const termRows = opts.termRows ?? process.stdout.rows;
+  const termCols = opts.termCols ?? process.stdout.columns;
+
+  // For a BARE attach, pre-size the detached session to the real terminal BEFORE the
+  // split (we can't resize after the blocking attach), so `-l dockRows` is already
+  // correct and attaching doesn't rescale it. Inside tmux we fix it after switch-client.
+  if (!inTmux && termRows && termCols) {
+    try {
+      run(["resize-window", "-t", sessionName, "-x", String(termCols), "-y", String(termRows)]);
+    } catch {
+      // older tmux without resize-window — the post-attach proportions are the fallback
+    }
+  }
 
   let dockAdded = false;
+  let dockPaneId = "";
   if (!dockPresent(run, target)) {
     const topPane = topPaneOf(run, target);
     try {
       // -d keeps the ORIGINAL (agent) pane active so the user lands on the agent, not
       // the dock. The trailing string is the shell command tmux runs in the new pane.
-      const dockPane = run(["split-window", "-v", "-d", "-l", String(dockRows), "-t", target, "-c", repoRoot, "-P", "-F", "#{pane_id}", opts.dockCmd]).trim();
-      if (dockPane) run(["set-option", "-p", "-t", dockPane, "@oxpit_dock", "1"]);
+      dockPaneId = run(["split-window", "-v", "-d", "-l", String(dockRows), "-t", target, "-c", repoRoot, "-P", "-F", "#{pane_id}", opts.dockCmd]).trim();
+      if (dockPaneId) run(["set-option", "-p", "-t", dockPaneId, "@oxpit_dock", "1"]);
       if (topPane) run(["select-pane", "-t", topPane]);
       dockAdded = true;
     } catch (e) {
@@ -283,6 +302,16 @@ export function weldDockAndAttach(
   if (inTmux) {
     try {
       run(["switch-client", "-t", sessionName]);
+      // The window is now at the client's REAL size — pin the dock to dockRows (the
+      // detached split was relative to tmux's ~24-row default and got scaled up on
+      // attach, so the strip would otherwise be ~half the terminal).
+      if (dockPaneId) {
+        try {
+          run(["resize-pane", "-t", dockPaneId, "-y", String(dockRows)]);
+        } catch {
+          // best-effort — a tmux that rejects resize-pane -y leaves the proportional size
+        }
+      }
       return { dockAdded, attachMode: "switch" };
     } catch (e) {
       return { dockAdded, attachMode: "none", error: `switch-client failed: ${e instanceof Error ? e.message : String(e)}` };
