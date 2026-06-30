@@ -363,11 +363,22 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     //     lands with that agent selected (until you move the cursor yourself).
     const dockSelfPane = opts.dock ? process.env.TMUX_PANE ?? "" : "";
     let selfManagedDock = false;
+    // Whether the agent↔dock flip key (C-]) is installed for this cockpit — read from the
+    // @oxpit_cockpit WINDOW option (set by the weld) rather than the OXTAIL_OXPIT_FLIP env,
+    // because this dock is a tmux-spawned child that inherits the server env, not the
+    // `oxpit dock` process's. Gates the "⌃] flip" footer hint so it shows iff the binding
+    // was actually installed (single source of truth with the weld).
+    let flipHintOn = false;
     if (dockSelfPane) {
       try {
         selfManagedDock = realTmux(["show-options", "-t", dockSelfPane, "-pqv", "@oxpit_dock"]).trim() === "1";
       } catch {
         // not in a managed cockpit dock — leave self-management off
+      }
+      try {
+        flipHintOn = realTmux(["show-options", "-t", dockSelfPane, "-wqv", "@oxpit_cockpit"]).trim() === "1";
+      } catch {
+        // can't read the window option — leave the hint off
       }
     }
     let dockAutoSelect = selfManagedDock; // re-armed whenever this dock's window isn't active
@@ -1039,6 +1050,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
           // Surface a live confirm/feedback line in the strip's footer (the full table
           // rides these on its own footer; the dock has no other seam).
           dockStatus: Date.now() < statusUntil && status ? status : undefined,
+          flipHint: flipHintOn, // "⌃] flip" hint iff the cockpit installed the flip key
         })
           .split("\n")
           .slice(0, rows)
@@ -2251,7 +2263,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       teardown(0, () => {
         // The terminal is restored here, so a weld/attach failure is surfaced on stderr
         // (never swallowed — the one-shot path does the same; v0.25.0 silent-drift lesson).
-        const w = weldDockAndAttach(sessionName, firstWindow, cl.repoRoot, { run: realTmux, dockRows: cl.dockRows, dockCmd });
+        const w = weldDockAndAttach(sessionName, firstWindow, cl.repoRoot, { run: realTmux, dockRows: cl.dockRows, dockCmd, log: (m) => process.stderr.write(m + "\n") });
         if (w.error) process.stderr.write(`oxpit dock: ${w.error}\n`);
       });
     }

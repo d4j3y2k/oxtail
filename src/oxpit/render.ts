@@ -55,6 +55,11 @@ export type RenderOptions = {
   // again") and feedback are visible in the strip — the full table rides these on its
   // footer, but the dock has no other seam to surface them.
   dockStatus?: string;
+  // DOCK mode only: surface the "⌃] flip" hint in the footer — the agent↔dock flip key
+  // the cockpit installs. The TUI passes this from a show-options read of @oxpit_cockpit
+  // (a tmux-spawned dock child can't see the install-side OXTAIL_OXPIT_FLIP env), so the
+  // hint shows iff the binding was actually installed.
+  flipHint?: boolean;
 };
 
 // Cap on background rows rendered when the section is expanded, so a runaway process
@@ -847,7 +852,13 @@ export function renderDock(s: FleetSnapshot, opts: RenderOptions = {}): string {
   lines.push(
     opts.dockStatus
       ? clipToWidth("  " + opts.dockStatus, width)
-      : clipToWidth(paint("  ⏎ jump · m msg · n nudge · l log · d full · r refresh · ⌃C quit", C.dim), width),
+      : clipToWidth(
+          paint(
+            `  ⏎ jump${opts.flipHint ? " · ⌃] flip" : ""} · m msg · n nudge · l log · d full · ⌃C quit`,
+            C.dim,
+          ),
+          width,
+        ),
   );
   return lines.join("\n");
 }

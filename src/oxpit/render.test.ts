@@ -950,3 +950,11 @@ test("renderDock: dockStatus replaces the footer hints", () => {
   assert.ok(out.includes("press y to confirm"), "status shown");
   assert.ok(!out.includes("⏎ jump"), "key hints replaced by the status line");
 });
+
+test("renderDock: flipHint shows the ⌃] flip hint iff the cockpit installed the flip key", () => {
+  const on = renderDock(dockFleet(2), { color: false, width: 100, maxAgentRows: 6, flipHint: true });
+  const off = renderDock(dockFleet(2), { color: false, width: 100, maxAgentRows: 6, flipHint: false });
+  assert.ok(on.includes("⌃] flip"), "hint present when the flip key is installed");
+  assert.ok(!off.includes("⌃] flip"), "hint absent when flip is off (the default RenderOptions)");
+  assert.ok(on.includes("⏎ jump") && off.includes("⏎ jump"), "the rest of the footer is unchanged");
+});

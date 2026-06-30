@@ -2,7 +2,10 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import {
   dockPaneCommand,
+  flipKeyEnabled,
   invokedViaOxtail,
+  resolveFlipKey,
+  rootBinding,
   runCockpitDock,
   shouldSpawn,
   type CockpitOptions,
@@ -49,7 +52,7 @@ test("shouldSpawn: explicit flag wins; else auto from `configured`", () => {
 
 // ── runCockpitDock executor (injected tmux recorder) ────────────────────────────
 type Rec = { run: (args: string[]) => string; calls: string[][] };
-function recorder(opts: { dock?: boolean; firstPane?: string } = {}): Rec {
+function recorder(opts: { dock?: boolean; firstPane?: string; rootKeys?: string } = {}): Rec {
   const calls: string[][] = [];
   const run = (args: string[]): string => {
     calls.push(args);
@@ -59,6 +62,7 @@ function recorder(opts: { dock?: boolean; firstPane?: string } = {}): Rec {
       if (f.includes("@oxpit_dock")) return opts.dock ? "%1=1" : "%1=";
       return opts.firstPane ?? "%1";
     }
+    if (args[0] === "list-keys") return opts.rootKeys ?? ""; // flip-key clobber probe
     if (args[0] === "split-window") return "%9";
     return "";
   };
@@ -112,7 +116,10 @@ test("runCockpitDock: fresh + configured spawns the fleet, welds dock, bare-atta
   const split = find(rec.calls, "split-window")!;
   assert.ok(split.includes("-d") && split.includes("-l") && split.includes("9"), "split is detached + sized");
   assert.equal(split[split.length - 1], "'/n' '/x/oxpit-bin.js' --dock", "dock pane runs the renderer");
-  assert.ok(find(rec.calls, "set-option")?.includes("@oxpit_dock"), "dock pane marked");
+  assert.ok(
+    rec.calls.some((c) => c[0] === "set-option" && c.includes("@oxpit_dock")),
+    "dock pane marked", // filter, not first — @oxpit_cockpit is now set earlier in the loop
+  );
   assert.equal(attached, "proj", "attached to the cockpit session");
   assert.ok(!find(rec.calls, "switch-client"), "no switch-client in a bare terminal");
 });
@@ -201,4 +208,151 @@ test("runCockpitDock: aborts if the fleet spawn fails to create the session", as
   assert.equal(r.ok, false);
   assert.match(r.error ?? "", /did not create session/);
   assert.ok(!find(rec.calls, "split-window"), "no dock split after a failed spawn");
+});
+
+// ── the agent↔dock FLIP KEY (C-]) ───────────────────────────────────────────────
+test("flipKeyEnabled: on by default, off only via OXTAIL_OXPIT_FLIP=off", () => {
+  assert.equal(flipKeyEnabled({}), true);
+  assert.equal(flipKeyEnabled({ OXTAIL_OXPIT_FLIP: "off" }), false);
+  assert.equal(flipKeyEnabled({ OXTAIL_OXPIT_FLIP: "on" }), true, "any non-'off' value is on");
+});
+
+const OURS_BINDING = "bind-key -T root C-] if-shell @oxpit_cockpit @oxpit_dock select-pane\n";
+
+test("rootBinding: classifies unbound / ours / foreign / unreadable", () => {
+  const ours = () => "bind-key -T root C-b send-prefix\n" + OURS_BINDING;
+  assert.equal(rootBinding(ours, "C-]").state, "ours");
+  assert.equal(rootBinding(ours, "C-x").state, "unbound", "an unbound key");
+  assert.equal(rootBinding(() => "bind-key -T root C-] copy-mode\n", "C-]").state, "foreign");
+  const thrower = () => {
+    throw new Error("no server running");
+  };
+  assert.equal(rootBinding(thrower, "C-]").state, "unreadable", "a failed list-keys fails closed");
+});
+
+test("rootBinding: a foreign binding with flags BEFORE -T root is still detected (no clobber)", () => {
+  // tmux 3.5a lists `bind-key -T root -r C-] copy-mode` as `bind-key -r -T root C-] copy-mode`
+  // — the -r flag precedes -T root. An anchored regex misses it and then clobbers the binding.
+  const run = () => "bind-key -r -T root C-]                    copy-mode\n";
+  assert.equal(rootBinding(run, "C-]").state, "foreign", "flag-order-insensitive match");
+});
+
+test("resolveFlipKey: ON+unbound installs and reports available", () => {
+  const calls: string[][] = [];
+  const run = (a: string[]) => (calls.push(a), ""); // empty list-keys = unbound
+  assert.equal(resolveFlipKey(run, true), true);
+  assert.ok(calls.some((c) => c[0] === "bind-key"), "installed the binding");
+});
+
+test("resolveFlipKey: ON+foreign warns, never binds, reports unavailable", () => {
+  const calls: string[][] = [];
+  const warns: string[] = [];
+  const run = (a: string[]) => (calls.push(a), a[0] === "list-keys" ? "bind-key -r -T root C-] copy-mode\n" : "");
+  assert.equal(resolveFlipKey(run, true, (m) => warns.push(m)), false);
+  assert.ok(!calls.some((c) => c[0] === "bind-key"), "never clobbers a foreign binding");
+  assert.ok(warns.some((w) => /already bound/.test(w)));
+});
+
+test("resolveFlipKey: ON+unreadable fails closed (no bind, unavailable, warns)", () => {
+  const calls: string[][] = [];
+  const warns: string[] = [];
+  const run = (a: string[]) => {
+    calls.push(a);
+    if (a[0] === "list-keys") throw new Error("can't read");
+    return "";
+  };
+  assert.equal(resolveFlipKey(run, true, (m) => warns.push(m)), false);
+  assert.ok(!calls.some((c) => c[0] === "bind-key"), "fail-closed: no install on an unreadable probe");
+  assert.ok(warns.some((w) => /couldn't read/.test(w)));
+});
+
+test("resolveFlipKey: OFF is a real kill switch — unbinds OURS, leaves a foreign binding alone", () => {
+  const oursCalls: string[][] = [];
+  const oursRun = (a: string[]) => (oursCalls.push(a), a[0] === "list-keys" ? OURS_BINDING : "");
+  assert.equal(resolveFlipKey(oursRun, false), false);
+  assert.ok(oursCalls.some((c) => c[0] === "unbind-key" && c.includes("C-]")), "removes our own binding");
+
+  const fgnCalls: string[][] = [];
+  const fgnRun = (a: string[]) => (fgnCalls.push(a), a[0] === "list-keys" ? "bind-key -T root C-] copy-mode\n" : "");
+  resolveFlipKey(fgnRun, false);
+  assert.ok(!fgnCalls.some((c) => c[0] === "unbind-key"), "never unbinds a foreign binding");
+});
+
+// Spawn the fleet so the weld runs the full window loop + the flip-key resolve.
+function spawnedOpts(rec: Rec, over: Partial<CockpitOptions> = {}): CockpitOptions {
+  const live = new Set<string>();
+  return baseOpts({
+    run: rec.run,
+    inTmux: true,
+    spawn: true,
+    sessionExistsFn: (_r, n) => live.has(n),
+    spawnFleetFn: async (_s, _r, o) => {
+      live.add(o!.sessionName!);
+      return { fleetId: "f", sessionName: o!.sessionName!, dryRun: false, plan: [], results: [], ok: true };
+    },
+    ...over,
+  });
+}
+// SET (`@oxpit_cockpit 1`) vs UNSET (`-u @oxpit_cockpit`) window-option calls.
+const setMark = (rec: Rec) =>
+  rec.calls.filter((c) => c[0] === "set-option" && c.includes("@oxpit_cockpit") && !c.includes("-u"));
+const unsetMark = (rec: Rec) =>
+  rec.calls.filter((c) => c[0] === "set-option" && c.includes("@oxpit_cockpit") && c.includes("-u"));
+
+test("runCockpitDock: installs the flip key once + SETs @oxpit_cockpit on every window", async () => {
+  const rec = recorder();
+  await runCockpitDock(SPEC, "/repo", spawnedOpts(rec));
+  assert.equal(setMark(rec).length, 3, "every window marked (set -w @oxpit_cockpit 1)");
+  assert.equal(unsetMark(rec).length, 0, "no unsets when the flip key is available");
+  const binds = rec.calls.filter((c) => c[0] === "bind-key");
+  assert.equal(binds.length, 1, "flip key bound exactly once, outside the loop");
+  assert.deepEqual(
+    binds[0],
+    [
+      "bind-key", "-n", "C-]",
+      "if-shell", "-F", "#{@oxpit_cockpit}",
+      'if-shell -F "#{@oxpit_dock}" "select-pane -t {top}" "select-pane -t {bottom}"',
+      "send-keys C-]",
+    ],
+    "the empirically-verified dock-aware toggle argv",
+  );
+});
+
+test("runCockpitDock: FOREIGN C-] (even with -r) → no bind, warn, marks UNSET so the hint can't lie", async () => {
+  const rec = recorder({ rootKeys: "bind-key -r -T root C-] copy-mode\n" });
+  const warnings: string[] = [];
+  await runCockpitDock(SPEC, "/repo", spawnedOpts(rec, { log: (m) => warnings.push(m) }));
+  assert.ok(!rec.calls.some((c) => c[0] === "bind-key"), "never overwrites a foreign C-]");
+  assert.equal(setMark(rec).length, 0, "no windows marked (the flip key isn't ours)");
+  assert.equal(unsetMark(rec).length, 3, "stale marks actively cleared (hint tracks reality)");
+  assert.ok(warnings.some((w) => /already bound/.test(w)), "warns about the skip");
+});
+
+test("runCockpitDock: re-installing OUR own C-] binding is idempotent (re-binds, marks set, no warn)", async () => {
+  const rec = recorder({ rootKeys: OURS_BINDING });
+  const warnings: string[] = [];
+  await runCockpitDock(SPEC, "/repo", spawnedOpts(rec, { log: (m) => warnings.push(m) }));
+  assert.equal(rec.calls.filter((c) => c[0] === "bind-key").length, 1, "re-binds our own");
+  assert.equal(setMark(rec).length, 3, "windows marked (flip available)");
+  assert.ok(!warnings.some((w) => /already bound/.test(w)), "no foreign-clobber warning for our own");
+});
+
+test("runCockpitDock: OXTAIL_OXPIT_FLIP=off → no bind, marks UNSET, unbinds our prior binding", async () => {
+  const prev = process.env.OXTAIL_OXPIT_FLIP;
+  process.env.OXTAIL_OXPIT_FLIP = "off";
+  try {
+    const rec = recorder({ rootKeys: OURS_BINDING }); // a cockpit previously welded with flip on
+    await runCockpitDock(SPEC, "/repo", spawnedOpts(rec));
+    assert.ok(!rec.calls.some((c) => c[0] === "bind-key"), "doesn't install when off");
+    assert.ok(
+      rec.calls.some((c) => c[0] === "unbind-key" && c.includes("C-]")),
+      "removes the prior binding (a real kill switch, not just install-time)",
+    );
+    assert.equal(setMark(rec).length, 0, "no windows marked when off");
+    assert.equal(unsetMark(rec).length, 3, "clears the stale @oxpit_cockpit marks");
+    assert.equal(rec.calls.filter((c) => c[0] === "split-window").length, 3, "docks still welded (flip is orthogonal)");
+  } finally {
+    if (prev === undefined) delete process.env.OXTAIL_OXPIT_FLIP;
+    else process.env.OXTAIL_OXPIT_FLIP = prev;
+  }
 });
