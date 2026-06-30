@@ -63,6 +63,15 @@ const WATCH_DIRS = ["sessions", "mailboxes", "received", "pending-ask"];
 const DEBOUNCE_MS = 200;
 const SLOW_TICK_MS = 1500;
 const ANIM_TICK_MS = Math.round(1000 / 6); // ~6fps selected-name animation (focus-gated; SPIKE)
+// How often a managed dock polls its own window_active to re-arm window-local auto-select
+// when you switch back to it. Runs ONLY while auto-select is off (you navigated a dock and
+// haven't returned) and self-stops the moment it re-arms, so it's not a steady idle poll.
+const DOCK_FOCUS_TICK_MS = 300;
+// Bound on the fast poll: each cursor move (re)arms it for this long, after which it
+// falls back to the 1.5s slow tick. Caps the cost of a move-then-sit (window stays active,
+// never re-arms) and of a persistently-null tmux read, so the poll can't spin a
+// display-message forever — the idle-cheap backstop (codex review).
+const DOCK_FOCUS_WINDOW_MS = 5000;
 const MAX_WAIT_ROWS = 8;
 const LOG_FETCH = 200; // comms messages pulled for the log view (windowed to fit)
 
@@ -132,6 +141,40 @@ export function stepInput(
     }
   }
   return { state: { pasting, pasteBuf }, actions };
+}
+
+// Pure resolver for a cockpit dock's WINDOW-LOCAL auto-selection. EXTRACTED + exported
+// so the drift fix is unit-tested: the original closure shipped a cumulative off-by-one
+// because nothing tested it. Each per-window dock is its OWN `oxpit --dock` process; the
+// old logic latched auto-select OFF the first time you moved the cursor in a dock and
+// NEVER re-armed it — so revisiting that window later showed the STALE pick (a row off
+// from the window's own agent), worse the more you navigated.
+//
+// Given the dock's current {selectedKey, dockAutoSelect}, a live tmux reading of its own
+// window, and the fleet, return the next state:
+//   • window NOT active (you're not viewing this dock right now) ⇒ RE-ARM auto-select.
+//     Keyed on window_active, so it's robust to HOW you left/returned (⏎ jump, the
+//     agent↔dock flip key, prefix-nav, a mouse click — none share one code path); and
+//     because a backgrounded dock re-snaps on EVERY refresh, the window already shows its
+//     own agent before you switch back to it (no post-switch flicker / refresh latency).
+//   • auto-select armed ⇒ snap the selection to the agent whose window_name matches this
+//     dock's window. A cursor move (move() clears the latch) sticks WHILE you're in the
+//     window (it stays active ⇒ no re-arm); leaving the window re-arms it.
+//   • tmux unreadable ⇒ leave the selection untouched.
+export function resolveDockAutoSelect(
+  cur: { selectedKey: string | null; dockAutoSelect: boolean },
+  tmux: { windowName: string | null; windowActive: boolean } | null,
+  agents: ReadonlyArray<FleetAgent>,
+): { selectedKey: string | null; dockAutoSelect: boolean } {
+  if (!tmux) return { selectedKey: cur.selectedKey, dockAutoSelect: cur.dockAutoSelect };
+  const dockAutoSelect = cur.dockAutoSelect || !tmux.windowActive;
+  if (!dockAutoSelect) return { selectedKey: cur.selectedKey, dockAutoSelect };
+  let selectedKey = cur.selectedKey;
+  if (tmux.windowName) {
+    const a = agents.find((ag) => ag.window_name === tmux.windowName);
+    if (a) selectedKey = agentKey(a);
+  }
+  return { selectedKey, dockAutoSelect };
 }
 
 const DOCK_USAGE = `oxpit dock — assemble (or attach to) the fleet cockpit in one command
@@ -327,31 +370,61 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         // not in a managed cockpit dock — leave self-management off
       }
     }
-    let dockAutoSelect = selfManagedDock; // until the user moves the cursor
-    // The agentKey of the agent in the SAME tmux window as this dock pane. Matched by
-    // WINDOW NAME (each fleet agent lives in a window named after it) — robust vs. the
-    // pane-id matching, which drifted the selection one agent off. null until it registers.
-    const dockWindowAgentKey = (): string | null => {
+    let dockAutoSelect = selfManagedDock; // re-armed whenever this dock's window isn't active
+    // Read this dock pane's window NAME (matches it to its window's agent) and whether
+    // that window is the one the user is currently VIEWING (window_active drives the
+    // auto-select re-arm), in ONE tmux call. null when not a managed dock / tmux unreadable.
+    const readDockTmux = (): { windowName: string | null; windowActive: boolean } | null => {
       if (!dockSelfPane) return null;
       try {
-        const win = realTmux(["display-message", "-t", dockSelfPane, "-p", "#{window_name}"]).trim();
-        if (win) {
-          const a = snapshot.agents.find((ag) => ag.window_name === win);
-          if (a) return agentKey(a);
-        }
+        const out = realTmux(["display-message", "-t", dockSelfPane, "-p", "#{window_name}\t#{window_active}"]).trim();
+        const tab = out.indexOf("\t");
+        const windowName = (tab >= 0 ? out.slice(0, tab) : out).trim() || null;
+        const windowActive = (tab >= 0 ? out.slice(tab + 1).trim() : "") === "1";
+        return { windowName, windowActive };
       } catch {
-        // ignore
+        return null;
       }
-      return null;
     };
-    // Snap the selection to this dock's own window-agent (re-tried each refresh until it
-    // registers), unless the user has taken the cursor over.
+    // Snap the selection to this dock's own window-agent, re-arming auto-select while the
+    // user isn't viewing this window — so a navigated-then-left dock reverts to its own
+    // agent on return instead of stranding the stale pick (the jump-highlight drift). The
+    // pure logic (+ its rationale) lives in resolveDockAutoSelect; this is the I/O wrapper.
     const applyDockAutoSelect = (): void => {
-      if (!dockAutoSelect) return;
-      const k = dockWindowAgentKey();
-      if (k) selectedKey = k;
+      if (!selfManagedDock) return;
+      const next = resolveDockAutoSelect({ selectedKey, dockAutoSelect }, readDockTmux(), snapshot.agents);
+      selectedKey = next.selectedKey;
+      dockAutoSelect = next.dockAutoSelect;
     };
     applyDockAutoSelect();
+    // While a managed dock's auto-select is OFF (you moved the cursor here to pick a jump
+    // target), poll our OWN window_active so we re-arm + re-snap PROMPTLY when you switch
+    // back — fs-watch + the 1.5s slow tick can miss a quick window bounce, leaving the dock
+    // a row off (the residual drift after the latch fix). Self-stopping THREE ways so it's
+    // idle-cheap: it clears the instant auto-select re-arms (you left → back to our own
+    // agent), on teardown, and — the backstop — once DOCK_FOCUS_WINDOW_MS elapses since the
+    // last move, so a move-then-SIT (window stays active, never re-arms) or a persistently
+    // failing tmux read can't spin a display-message forever; the slow tick takes over then.
+    let dockFocusTick: NodeJS.Timeout | null = null;
+    let dockFocusUntil = 0; // wall-clock deadline; the fast poll self-stops once past it
+    function stopDockFocusPoll(): void {
+      if (dockFocusTick) {
+        clearInterval(dockFocusTick);
+        dockFocusTick = null;
+      }
+    }
+    function ensureDockFocusPoll(): void {
+      if (torndown || !selfManagedDock) return;
+      dockFocusUntil = Date.now() + DOCK_FOCUS_WINDOW_MS; // each move (re)extends the window
+      if (dockFocusTick) return; // already polling — the refreshed deadline is enough
+      dockFocusTick = setInterval(() => {
+        if (torndown || Date.now() > dockFocusUntil) return stopDockFocusPoll();
+        const before = selectedKey;
+        applyDockAutoSelect();
+        if (selectedKey !== before) paint();
+        if (dockAutoSelect) stopDockFocusPoll(); // re-armed → nothing left to watch
+      }, DOCK_FOCUS_TICK_MS);
+    }
     let logFilterSelf = false; // scope the log to the fleet-selected agent
     // `b` expands the detached-background section into its individual rows (default
     // collapsed to a count header). Detached processes are never navigable, so this is
@@ -1055,6 +1128,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     function move(delta: number): void {
       if (snapshot.agents.length === 0) return;
       dockAutoSelect = false; // you've taken the cursor — stop snapping to the window-agent
+      ensureDockFocusPoll(); // watch for your return so we re-arm (no-op for a non-managed dock)
       let idx = selectedIndex();
       if (idx < 0) idx = 0;
       idx = (idx + delta + snapshot.agents.length) % snapshot.agents.length;
@@ -2126,6 +2200,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (slowTick) clearInterval(slowTick);
       if (spawnTimer) clearInterval(spawnTimer);
       stopAnim();
+      stopDockFocusPoll();
       for (const w of watchers) {
         try {
           w.close();

@@ -8,6 +8,21 @@ behavioral changes). Dates are release dates of the published npm tag.
 The hook protocol has its own version (`HOOK_MARKER_VERSION`); when it bumps,
 re-run `npx oxtail install-hook`. The current hook version is noted per release.
 
+## [0.28.4] — 2026-06-30
+
+**The dock keeps the agent you landed on highlighted, even after you navigate.**
+- Fixed a cumulative jump-highlight drift. Each per-window cockpit dock is its own
+  `oxpit --dock` process, and once you moved the cursor in one (to pick a jump target)
+  its window-local auto-select latched OFF and never re-armed — so returning to that
+  window later showed a stale selection a row off, worse the more you jumped. v0.28.3
+  fixed the window→agent _matching_; this fixes the _re-arm_ so the match keeps applying.
+- A dock now re-snaps to its OWN window's agent whenever you aren't viewing its window
+  (keyed on tmux `window_active`), so switching back to any window always lands on that
+  window's agent. A cursor move still sticks while you're in the window (you can pick a
+  jump target); leaving and returning resets it. A short, self-stopping focus poll closes
+  a quick window-bounce the 1.5s refresh tick used to miss. Idle-cheap: the poll runs only
+  while a dock is mid-navigation and stops the instant it re-arms.
+
 ## [0.28.3] — 2026-06-30
 
 **Dock height + the selector lands on the agent you jumped to.**
