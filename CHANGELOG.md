@@ -8,6 +8,20 @@ behavioral changes). Dates are release dates of the published npm tag.
 The hook protocol has its own version (`HOOK_MARKER_VERSION`); when it bumps,
 re-run `npx oxtail install-hook`. The current hook version is noted per release.
 
+## [0.28.1] — 2026-06-30
+
+**Cockpit nav: `\u23ce` keeps you in the dock; main-window dock sized right.** Two follow-ups to
+the omnipresent dock:
+- **`\u23ce` no longer teleports you into the agent pane.** Now that every window has a dock,
+  jumping switches to the agent\u2019s WINDOW but lands you on *that window\u2019s dock pane* \u2014 the agent
+  above you changes, you stay in the cockpit, and `\u23ce` again flips to the next. (Bypasses the
+  client picker entirely, so a second attached client \u2014 e.g. a remote-control client \u2014 can\u2019t
+  cause the \u201cmultiple terminals\u201d refusal either.)
+- **The main window\u2019s dock was still \u2248half the screen.** The detached split + proportional
+  rescale-on-attach was fought by the foreground agent\u2019s startup re-layout. The session is
+  now pre-sized to the real client size *before* splitting, so the dock is correct from the
+  start on every window.
+
 ## [0.28.0] — 2026-06-30
 
 **The dock is omnipresent.** `oxpit dock` now welds the dock strip into **every** window

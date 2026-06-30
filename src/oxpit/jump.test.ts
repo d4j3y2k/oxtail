@@ -90,18 +90,6 @@ test("chooseClient: prefers the target-session client, ignores unrelated session
   assert.deepEqual(r, { client: "work", ambiguous: false });
 });
 
-test("chooseClient: dock-cockpit — self ON the target session moves self, even with another client", () => {
-  // The dock-cockpit case: you ARE the client viewing the cockpit session, and ⏎ should
-  // walk YOU to an agent in that same session. A second attached client (a remote-control
-  // client) must NOT make it ambiguous — previously it did ("multiple terminals").
-  const clients = [
-    { name: "me", tty: "/t0", session: "strudel" }, // viewing the cockpit
-    { name: "remote-ctl", tty: "/t1", session: "strudel" }, // also attached
-  ];
-  const r = chooseClient(clients, "me", undefined, "strudel");
-  assert.deepEqual(r, { client: "me", ambiguous: false }, "moves self, not ambiguous");
-});
-
 test("chooseClient: only self attached ⇒ drive self", () => {
   const r = chooseClient([{ name: "self", tty: "/t", session: "s" }], "self", undefined, "s");
   assert.deepEqual(r, { client: "self", ambiguous: false });
@@ -321,4 +309,29 @@ test("jumpToAgent: an unrelated-session client does NOT cause ambiguity", () => 
   });
   assert.equal(r.ok, true);
   if (r.ok) assert.equal(r.client, "work"); // drove the oxtail/proj terminal, ignored 'other'
+});
+
+test("jumpToAgent: dockLocal — switches the agent's window + lands on its dock, no client switch", () => {
+  const calls: string[][] = [];
+  const run = (args: string[]): string => {
+    calls.push(args);
+    if (args[0] === "list-panes") {
+      const f = args[args.indexOf("-F") + 1] ?? "";
+      if (f.includes("@oxpit_dock")) return "%7=\n%9=1\n"; // agent %7 (no dock), dock %9
+      return "%7\tproj\t@2\n"; // listPanes: pane, session, window
+    }
+    if (args[0] === "list-clients") return "me\t/t0\tproj\nremote\t/t1\tproj\n"; // 2 clients
+    return "";
+  };
+  const r = jumpToAgent(agent(), {
+    run,
+    inTmux: true,
+    dockLocal: true,
+    resolveEntry: () => entry(),
+    verifyPane: () => "%7",
+  });
+  assert.equal(r.ok, true, "no 'multiple terminals' — client logic is bypassed");
+  assert.ok(calls.some((c) => c[0] === "select-window" && c.includes("%7")), "selects the agent's window");
+  assert.ok(calls.some((c) => c[0] === "select-pane" && c.includes("%9")), "lands on the dock pane, not the agent");
+  assert.ok(!calls.some((c) => c[0] === "switch-client"), "never switches the client — you stay in the dock");
 });

@@ -272,14 +272,33 @@ export function weldDockAndAttach(
   const termRows = opts.termRows ?? process.stdout.rows;
   const termCols = opts.termCols ?? process.stdout.columns;
 
-  // For a BARE attach, pre-size the detached session to the real terminal BEFORE the
-  // split (we can't resize after the blocking attach), so `-l dockRows` is already
-  // correct and attaching doesn't rescale it. Inside tmux we fix it after switch-client.
-  if (!inTmux && termRows && termCols) {
+  // Pre-size the detached session to the size it will ACTUALLY be when shown, BEFORE
+  // splitting — for a bare attach that's this terminal (process.stdout); inside tmux it's
+  // the current client (which can be bigger than our pane if oxpit ran in a split). When
+  // the splits happen at the final absolute size, attach/switch-client never scales the
+  // dock proportionally (the ballooning was worst on the ACTIVE window, where the agent's
+  // startup re-layout fought a post-attach resize). The resize-pane below is then just
+  // belt-and-suspenders.
+  let sizeRows = termRows;
+  let sizeCols = termCols;
+  if (inTmux) {
     try {
-      run(["resize-window", "-t", sessionName, "-x", String(termCols), "-y", String(termRows)]);
+      const [h, w] = run(["display-message", "-p", "#{client_height}\t#{client_width}"]).trim().split("\t");
+      const ph = Number.parseInt(h ?? "", 10);
+      const pw = Number.parseInt(w ?? "", 10);
+      if (ph > 0 && pw > 0) {
+        sizeRows = ph;
+        sizeCols = pw;
+      }
     } catch {
-      // older tmux without resize-window — the post-attach proportions are the fallback
+      // fall back to process.stdout dims
+    }
+  }
+  if (sizeRows && sizeCols) {
+    try {
+      run(["resize-window", "-t", sessionName, "-x", String(sizeCols), "-y", String(sizeRows)]);
+    } catch {
+      // older tmux without resize-window — the post-attach resize-pane is the fallback
     }
   }
 
