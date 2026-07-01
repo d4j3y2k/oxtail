@@ -59,6 +59,7 @@ import {
   wakeForSend,
   type WakeStatus,
 } from "./wake.js";
+import { recordWakeIntent, runSelfHealTick, SELF_WAKE_INTERVAL_MS } from "./self-heal.js";
 
 // CLI subcommand dispatch must run before any MCP setup so that
 // `npx oxtail install-hook` doesn't open an MCP transport or register a
@@ -641,7 +642,12 @@ const entry = buildEntry(client);
 maybeRecoverStickyClaim();
 register(entry);
 
+// Self-heal watchdog timer (assigned in the invokedDirectly block below). Module-
+// scoped so cleanup can clear it on every exit path.
+let selfHealTimer: ReturnType<typeof setInterval> | undefined;
+
 const cleanup = (): void => {
+  if (selfHealTimer) clearInterval(selfHealTimer);
   unregister(entry.server_pid);
 };
 process.on("exit", cleanup);
@@ -1256,6 +1262,9 @@ server.registerTool(
       action_required: obligationDurable,
     });
     const { wake_status, wake_reason, delivery_outlook } = await resolveSendWake(peer, effectiveWake, reply_to);
+    // Self-heal backstop: if a wake was intended but not confidently delivered,
+    // record a pending-wake so the recipient's own server can retry (§self-heal.ts).
+    recordWakeIntent(peer.client.session_id, msg.id, fromSessionId ?? null, wake_status);
     if (wake_status) {
       trace("wake_outcome", {
         via: wake_reason === "reply_to_default" ? "reply_default" : "send_message",
@@ -1446,6 +1455,7 @@ server.registerTool(
       source_message_id: message_id,
     });
     const { wake_status, wake_reason, delivery_outlook } = await resolveSendWake(peer, wake, replyTo);
+    recordWakeIntent(peer.client.session_id, msg.id, fromSessionId ?? null, wake_status);
     if (wake_status) {
       trace("wake_outcome", {
         via: wake_reason === "reply_to_default" ? "reply_default" : "reply_to_message",
@@ -1799,6 +1809,7 @@ async function closeObligation(
   // (reaches an idle markerless Codex requester too) unless the caller overrides.
   const effWake: "off" | "auto" | undefined = wake === undefined ? "auto" : wake;
   const { wake_status, wake_reason } = await resolveSendWake(peer, effWake, replyTo);
+  recordWakeIntent(peer.client.session_id, msg.id, fromSessionId ?? null, wake_status);
   if (wake_status) {
     trace("wake_outcome", {
       via: "complete_work",
@@ -2388,6 +2399,17 @@ if (invokedDirectly) {
     }, ORPHAN_WATCHDOG_MS);
     watchdog.unref?.();
   }
+
+  // Self-heal watchdog. From the ONE process guaranteed alive exactly when the bug
+  // exists (an idle recipient's own server), retry a wake-intended message whose
+  // wake didn't confidently land, so a dropped baton self-heals instead of stalling
+  // the fleet. Unref'd (the stdio transport already refs the loop; a ref'd timer
+  // would delay clean exit and risk the orphan pathology the reap above prevents).
+  // runSelfHealTick never throws; guard the promise anyway so a rejection can't crash.
+  selfHealTimer = setInterval(() => {
+    void runSelfHealTick(entry).catch((e) => trace("self_heal_tick_error", { error: String(e) }));
+  }, SELF_WAKE_INTERVAL_MS);
+  selfHealTimer.unref?.();
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

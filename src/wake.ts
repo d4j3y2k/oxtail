@@ -266,7 +266,7 @@ function activitySessionKey(sessionId: string): string {
   return sessionId.replace(/[^A-Za-z0-9_-]/g, "_");
 }
 
-function readActivity(sessionId: string | null): { status: string; ageMs: number } | null {
+export function readActivity(sessionId: string | null): { status: string; ageMs: number } | null {
   if (!sessionId) return null;
   try {
     const p = join(homedir(), ".oxtail", "activity", activitySessionKey(sessionId));
