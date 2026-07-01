@@ -8,6 +8,32 @@ behavioral changes). Dates are release dates of the published npm tag.
 The hook protocol has its own version (`HOOK_MARKER_VERSION`); when it bumps,
 re-run `npx oxtail install-hook`. The current hook version is noted per release.
 
+## [0.31.0] — 2026-07-01
+
+**A missed wake now self-heals — an idle agent never sits forever on undrained mail.**
+- Closes the recurring "dropped baton" stall: an agent hands work to a peer, goes idle
+  trusting "they'll wake me when done", the peer finishes — but the best-effort `tmux
+  send-keys` wake misses (strict fresh-idle gate, suppressed Enter, hookless open loop) —
+  and the whole fleet stalls until a human pokes it. The completion was already *durably*
+  in the mailbox; only the liveness nudge was lost.
+- The fix runs from the one process guaranteed alive exactly when the bug exists: the idle
+  recipient's **own MCP server**. When a wake-intended send (a completion / reply /
+  delegation) isn't confidently delivered, the sender records a durable `pending-wake`;
+  the recipient's server periodically checks its own records and, for any whose delivery
+  *receipt* hasn't appeared, re-nudges its own pane so `read_my_messages` drains the stuck
+  mail. Delivery is the truth; the wake is only the accelerator.
+- Strictly bounded so it can never storm: fires only for genuinely undelivered
+  *wake-intended* mail (never passive FYI sends), gated on the recipient actually being
+  idle, under a persistent per-session throttle + a per-attempt cap + a grace settle window
+  (the normal wake goes first) + consume-on-receipt. A no-op wake doesn't burn the cap.
+  Kill-switch: `OXTAIL_SELF_WAKE=off` (also honors `OXTAIL_AUTOWAKE=off`).
+- Known scope: a hookless Codex recipient (no idle marker) can't be confirmed idle, so it
+  isn't self-healed yet; and a target that never *replies* (vs a reply that never wakes) is
+  a separate follow-up. No hook-protocol change (`HOOK_MARKER_VERSION` unchanged, still 14).
+- Hardened via a 3-lens compile-sim adversarial pass (compiler / interpreter / symbolic):
+  no correctness bugs; four low-severity fixes applied (honest `fired` accounting,
+  crash-orphaned-temp isolation, atomic TTL-clock preservation, dual kill-switch).
+
 ## [0.30.0] — 2026-07-01
 
 **The cockpit stops drowning in dead sessions — ⚫dead rows fold into one line by default.**
