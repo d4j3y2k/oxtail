@@ -50,6 +50,13 @@ export type RenderOptions = {
   // Expand the detached-background section into its individual rows (TUI `b` toggle).
   // Default false: the section renders as a single collapsed count header.
   showBackground?: boolean;
+  // Collapse the ⚫dead-breadcrumb rows (exited / pid-reused sessions, sorted to the
+  // bottom) into ONE summary line instead of one row each — a declutter for a fleet
+  // buried under corpses from prior incarnations (David). Default false at the render
+  // layer (so `oxtail status` and existing callers are unchanged); the TUI opts in.
+  // deadCohortLine keeps the ✉mail / ⚑work counts visible, so it never silently hides
+  // undrained mail — it's a VIEW fold, not a delete (operator-ack-to-clear owns removal).
+  collapseDead?: boolean;
   // DOCK mode only: a transient operator status/confirm line (already styled). When
   // set it REPLACES the dock footer key-hints, so confirms ("press y", "press K
   // again") and feedback are visible in the strip — the full table rides these on its
@@ -670,6 +677,22 @@ function renderBackgroundRow(a: FleetAgent, paint: Paint, label: string): string
   return paint(`     · ${id} ${type} ${status} ${bits.join("  ")}`, C.dim);
 }
 
+// One collapsed line standing in for the ⚫dead-breadcrumb rows when collapseDead folds
+// them away. Preserves the high-signal ✉undrained-mail and ⚑stranded-work counts (summed
+// across the dead cohort) so the fold is a declutter, NOT a silent hide of mail a dead
+// recipient never read. `hint` appends the reveal-key nudge. null when no dead agents.
+function deadCohortLine(s: FleetSnapshot, paint: Paint, hint: string): string | null {
+  const dead = s.agents.filter((a) => a.liveness === "dead");
+  if (dead.length === 0) return null;
+  const mail = dead.reduce((n, a) => n + a.unread, 0);
+  const work = dead.reduce((n, a) => n + a.open_work, 0);
+  const segs = [paint(`${GLYPH.dead} ${dead.length} dead`, C.gray)];
+  if (mail > 0) segs.push(paint(`✉${mail} mail`, C.yellow));
+  if (work > 0) segs.push(paint(`⚑${work} stranded`, C.red));
+  segs.push(paint(hint, C.dim));
+  return "  " + segs.join(paint(" · ", C.dim));
+}
+
 // Render the full snapshot to a string. `selected` highlights a TUI row.
 export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): string {
   const color = opts.color ?? false;
@@ -724,24 +747,35 @@ export function renderSnapshot(s: FleetSnapshot, opts: RenderOptions = {}): stri
         C.dim,
       ),
     );
-    const total = s.agents.length;
+    // When collapseDead folds the ⚫dead breadcrumbs, drop them from the rendered rows and
+    // stand ONE deadCohortLine in their place. Each row carries its ORIGINAL index, which is
+    // what renderAgentRow compares to `selected` for the › cursor — so the fold is correct
+    // without assuming dead are a contiguous suffix (robust to any snapshot ordering).
+    const collapsing = opts.collapseDead === true && s.agents.some((a) => a.liveness === "dead");
+    const rows = s.agents
+      .map((a, i) => ({ a, i }))
+      .filter((r) => !collapsing || r.a.liveness !== "dead");
+    const total = rows.length;
     const cap = opts.maxAgentRows && opts.maxAgentRows > 0 ? opts.maxAgentRows : total;
+    const emit = (r: { a: FleetAgent; i: number }): void => {
+      lines.push(renderAgentRow(r.a, r.i, paint, width, selected, rowLabel(r.a), labels, paneAct(r.a), resolveAct(r.a), opts.burstFrames?.get(agentKey(r.a))));
+    };
     if (total <= cap) {
-      for (let i = 0; i < total; i++) {
-        const a = s.agents[i];
-        lines.push(renderAgentRow(a, i, paint, width, selected, rowLabel(a), labels, paneAct(a), resolveAct(a), opts.burstFrames?.get(agentKey(a))));
-      }
+      for (const r of rows) emit(r);
     } else {
-      // Window that always keeps the selected row visible (centered when possible).
-      const sel = selected >= 0 ? selected : 0;
+      // Window that always keeps the selected row visible (centered when possible). `selPos`
+      // is the selected agent's position WITHIN the visible rows (not its snapshot index).
+      const selPos = rows.findIndex((r) => r.i === selected);
+      const sel = selPos >= 0 ? selPos : 0;
       const start = Math.max(0, Math.min(sel - Math.floor(cap / 2), total - cap));
       const end = start + cap;
       if (start > 0) lines.push(paint(`  ⋯ ${start} more above`, C.dim));
-      for (let i = start; i < end; i++) {
-        const a = s.agents[i];
-        lines.push(renderAgentRow(a, i, paint, width, selected, rowLabel(a), labels, paneAct(a), resolveAct(a), opts.burstFrames?.get(agentKey(a))));
-      }
+      for (let k = start; k < end; k++) emit(rows[k]);
       if (end < total) lines.push(paint(`  ⋯ ${total - end} more below`, C.dim));
+    }
+    if (collapsing) {
+      const dl = deadCohortLine(s, paint, "x to show");
+      if (dl) lines.push(dl);
     }
   }
 
@@ -840,12 +874,25 @@ export function renderDock(s: FleetSnapshot, opts: RenderOptions = {}): string {
   // bottom — the same idiom as the full table. windowWithMarkers reserves the marker
   // rows WITHIN the budget, so header + this section + footer never exceeds the pane and
   // the footer (which carries dockStatus confirms) is never the line that gets clipped.
-  const total = s.agents.length;
+  // collapseDead folds the ⚫dead breadcrumbs into one deadCohortLine (the dock is the
+  // tightest pane — 15 corpses would bury the live fleet entirely). Rows carry their
+  // ORIGINAL index (rowFor compares it to `sel` for the › cursor), so the fold is correct
+  // regardless of snapshot ordering.
+  const collapsing = opts.collapseDead === true && s.agents.some((a) => a.liveness === "dead");
+  const rows = s.agents
+    .map((a, i) => ({ a, i }))
+    .filter((r) => !collapsing || r.a.liveness !== "dead");
+  const total = rows.length;
   const cap = opts.maxAgentRows && opts.maxAgentRows > 0 ? opts.maxAgentRows : total;
-  const { start, end, above, below } = windowWithMarkers(total, sel >= 0 ? sel : 0, cap);
+  const selPos = rows.findIndex((r) => r.i === sel);
+  const { start, end, above, below } = windowWithMarkers(total, selPos >= 0 ? selPos : 0, cap);
   if (above > 0) lines.push(clipToWidth(paint(`  ⋯ ${above} more above`, C.dim), width));
-  for (let i = start; i < end; i++) lines.push(rowFor(s.agents[i], i));
+  for (let k = start; k < end; k++) lines.push(rowFor(rows[k].a, rows[k].i));
   if (below > 0) lines.push(clipToWidth(paint(`  ⋯ ${below} more below`, C.dim), width));
+  if (collapsing) {
+    const dl = deadCohortLine(s, paint, "x show");
+    if (dl) lines.push(clipToWidth(dl, width));
+  }
   // The footer is the dock's only seam for transient feedback: when the TUI hands us a
   // status/confirm line, show it INSTEAD of the key hints (it expires back to the hints
   // on the next tick) so "press y"/"press K again" prompts aren't invisible in the strip.
