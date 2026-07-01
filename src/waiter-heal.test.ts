@@ -11,7 +11,30 @@ import {
   listLivePendingAsks,
   recordPendingAsk,
 } from "./pending-ask.js";
-import { runWaiterHealTick, type WaiterHealDeps } from "./waiter-heal.js";
+import {
+  claimWaiterRepoke,
+  runWaiterHealTick,
+  WAITER_HEAL_THROTTLE_MS,
+  type WaiterHealDeps,
+} from "./waiter-heal.js";
+
+// Real-HOME isolation so ~/.oxtail/waiter-wake (the atomic claim store) resolves
+// under a temp dir (claimWaiterRepoke reads homedir()).
+function withHome<T>(fn: () => T): T {
+  const home = mkdtempSync(join(tmpdir(), "oxtail-waiterheal-home-"));
+  const prev = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    return fn();
+  } finally {
+    process.env.HOME = prev;
+    try {
+      rmSync(home, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+}
 
 function tmp(): string {
   return mkdtempSync(join(tmpdir(), "oxtail-waiterheal-"));
@@ -43,13 +66,14 @@ function bEntry(): RegistryEntry {
 const OK: ResolveOk = { ok: true, entry: bEntry() };
 const GONE: ResolveErr = { ok: false, error: "target-not-found" };
 
-// Build a deps bundle with an in-memory throttle (so within-tick per-target
-// coalescing is exercised) + a wake spy. Overridable per test.
+// Build a deps bundle with an in-memory ATOMIC claim (first claim per target wins,
+// the rest coalesce — models the real single-winner throttle for a window) + a wake
+// spy. Overridable per test.
 function mkDeps(
   dir: string,
   over: Partial<WaiterHealDeps> & { wakeStatus?: WakeStatus } = {},
-): { deps: WaiterHealDeps; wakeCalls: RegistryEntry[]; throttle: Map<string, number> } {
-  const throttle = new Map<string, number>();
+): { deps: WaiterHealDeps; wakeCalls: RegistryEntry[]; claimed: Set<string> } {
+  const claimed = new Set<string>();
   const wakeCalls: RegistryEntry[] = [];
   const wakeStatus = over.wakeStatus ?? "fired_unconfirmed";
   const deps: WaiterHealDeps = {
@@ -66,11 +90,15 @@ function mkDeps(
         wakeCalls.push(peer);
         return wakeStatus;
       }),
-    wokeRecently:
-      over.wokeRecently ?? ((t, now) => (throttle.has(t) ? now - throttle.get(t)! < 90_000 : false)),
-    stampWoke: over.stampWoke ?? ((t, now) => throttle.set(t, now)),
+    claim:
+      over.claim ??
+      ((t) => {
+        if (claimed.has(t)) return false;
+        claimed.add(t);
+        return true;
+      }),
   };
-  return { deps, wakeCalls, throttle };
+  return { deps, wakeCalls, claimed };
 }
 
 function seed(dir: string, at: number, over: { target?: string | null; messageId?: string } = {}): void {
@@ -117,11 +145,11 @@ test("attempts at cap → gaveUp, no re-poke (surfaced to operator, not poked fo
   try {
     seed(dir, NOW - GRACE_MS - 1000);
     const { deps, wakeCalls } = mkDeps(dir, { cap: 2 });
-    // Drive attempts up to the cap via successful fires, then one more tick.
-    await runWaiterHealTick(entryFor(OWNER), { ...deps, wokeRecently: () => false }); // attempt 1
-    await runWaiterHealTick(entryFor(OWNER), { ...deps, wokeRecently: () => false }); // attempt 2 == cap
+    // Drive attempts up to the cap via successful fires (claim always wins), then one more tick.
+    await runWaiterHealTick(entryFor(OWNER), { ...deps, claim: () => true }); // attempt 1
+    await runWaiterHealTick(entryFor(OWNER), { ...deps, claim: () => true }); // attempt 2 == cap
     const before = wakeCalls.length;
-    const r = await runWaiterHealTick(entryFor(OWNER), { ...deps, wokeRecently: () => false });
+    const r = await runWaiterHealTick(entryFor(OWNER), { ...deps, claim: () => true });
     assert.equal(r.gaveUp, 1, "record at cap is counted as gaveUp");
     assert.equal(r.fired, 0, "no fire at cap");
     assert.equal(wakeCalls.length, before, "no additional wake once capped");
@@ -134,10 +162,10 @@ test("per-target throttle suppresses a re-poke (single-winner / don't hammer B)"
   const dir = tmp();
   try {
     seed(dir, NOW - GRACE_MS - 1000);
-    const { deps, wakeCalls } = mkDeps(dir, { wokeRecently: () => true }); // already woken recently
+    const { deps, wakeCalls } = mkDeps(dir, { claim: () => false }); // lost the claim (sibling won)
     const r = await runWaiterHealTick(entryFor(OWNER), deps);
     assert.equal(r.fired, 0);
-    assert.equal(wakeCalls.length, 0, "throttled → no keystroke");
+    assert.equal(wakeCalls.length, 0, "claim lost → no keystroke");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -282,6 +310,21 @@ test("kill-switch (OXTAIL_SELF_WAKE=off) disables re-pokes entirely", async () =
     process.env.OXTAIL_SELF_WAKE = prev;
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// --- atomic single-winner claim (codex F3) -----------------------------------
+
+test("claimWaiterRepoke: ATOMIC single-winner — first wins, concurrent losers coalesce, re-won after the window", () => {
+  withHome(() => {
+    // Two "processes" claim the same target in the same window: exactly one wins.
+    assert.equal(claimWaiterRepoke(TARGET, NOW), true, "first claim wins");
+    assert.equal(claimWaiterRepoke(TARGET, NOW), false, "second (fresh claim exists) coalesces");
+    assert.equal(claimWaiterRepoke(TARGET, NOW + 1000), false, "still within window → coalesced");
+    // A different target is independent.
+    assert.equal(claimWaiterRepoke("other-target-session", NOW), true, "distinct target claims freely");
+    // Past the throttle window the slot is re-won (a later re-poke is allowed).
+    assert.equal(claimWaiterRepoke(TARGET, NOW + WAITER_HEAL_THROTTLE_MS + 1), true, "re-won after window");
+  });
 });
 
 test("a wake that throws is swallowed (never crashes the bare tick)", async () => {

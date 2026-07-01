@@ -1271,8 +1271,14 @@ server.registerTool(
     // so the expectation stores the delegation's msg_id (its delivery RECEIPT is the
     // watchdog's pre-/post-receipt pivot). RECORDED BEFORE deliver (record-before-append):
     // if the sender crashes right after enqueue, the record already exists to pull it back.
-    const delegationRequestId =
-      obligationDurable && fromSessionId ? randomBytes(8).toString("hex") : undefined;
+    // Gate: a real durable obligation, a claimed sender to own the expectation, AND
+    // the caller did NOT explicitly opt out of wakes. wake:"off" is fire-and-forget,
+    // so it must NOT earn a delayed waiter-heal re-poke either — recording an
+    // expectation there would fire a wake 4 min later and break the wake:"off"
+    // contract (codex F2), inconsistent with the late-reply path that consumes-but-
+    // does-not-wake under explicit off.
+    const wantWaiterExpectation = obligationDurable && !!fromSessionId && wake !== "off";
+    const delegationRequestId = wantWaiterExpectation ? randomBytes(8).toString("hex") : undefined;
     const delegationMsgId = delegationRequestId ? randomBytes(8).toString("hex") : undefined;
     if (delegationRequestId && delegationMsgId && fromSessionId) {
       recordPendingAsk(defaultPendingAskDir(), fromSessionId, delegationRequestId, Date.now(), {
@@ -1281,24 +1287,22 @@ server.registerTool(
         ownerEpoch: entry.started_at,
       });
     }
-    let msg: mailbox.Mailbox;
-    try {
-      msg = deliverToPeer(routeFor(peer), body, fromSessionId, {
-        reply_to,
-        source_message_id,
-        action_required: obligationDurable,
-        ...(delegationRequestId ? { request_id: delegationRequestId } : {}),
-        ...(delegationMsgId ? { id: delegationMsgId } : {}),
-      });
-    } catch (e) {
-      // H1 fail-loud: the durable-obligation ledger write failed, so delivery did NOT
-      // happen. Drop the just-recorded waiter expectation so the watchdog doesn't
-      // re-poke the peer for a delegation it never received; the sender retries (fresh ids).
-      if (delegationRequestId && fromSessionId) {
-        consumePendingAsk(defaultPendingAskDir(), fromSessionId, delegationRequestId);
-      }
-      throw e;
-    }
+    // NOTE (codex F1): the expectation is recorded BEFORE deliver and is deliberately
+    // NOT rolled back if deliverToPeer throws. deliverToPeer writes B's obligation
+    // ledger BEFORE the mailbox append, so a POST-ledger append failure leaves B with
+    // an OPEN obligation and no mailbox line/receipt/wake — the surviving expectation
+    // is exactly what lets waiter-heal re-poke B into read_my_messages/my_open_work to
+    // discover and act on it. A PRE-ledger failure (H1: ledger write aborted) leaves
+    // nothing on B; the orphan expectation then simply ages out via TTL after a few
+    // throttled no-op re-pokes (harmless, bounded). Either way the throw still
+    // propagates (H1 fail-loud → the sender sees the error and can retry).
+    const msg = deliverToPeer(routeFor(peer), body, fromSessionId, {
+      reply_to,
+      source_message_id,
+      action_required: obligationDurable,
+      ...(delegationRequestId ? { request_id: delegationRequestId } : {}),
+      ...(delegationMsgId ? { id: delegationMsgId } : {}),
+    });
     const { wake_status, wake_reason, delivery_outlook } = await resolveSendWake(peer, effectiveWake, reply_to);
     // Self-heal backstop: if a wake was intended but not confidently delivered,
     // record a pending-wake so the recipient's own server can retry (§self-heal.ts).

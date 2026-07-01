@@ -41,7 +41,7 @@
 // Module DAG (no cycles): pending-ask/wake/resolve-target/received (leaves) ← waiter-heal ← server.
 
 import { createHash } from "node:crypto";
-import { mkdirSync, statSync, writeFileSync, utimesSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, statSync, unlinkSync, utimesSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -94,42 +94,57 @@ export function waiterHealKillSwitchOff(env: NodeJS.ProcessEnv = process.env): b
   return selfWakeKillSwitchOff(env) || autowakeKillSwitchOff(env);
 }
 
-// ── Persistent per-target re-poke throttle ────────────────────────────────────
-// One re-poke per target-session per window, regardless of how many expectations
-// reference it or how many waiter processes tick concurrently. Separate namespace
-// from self-heal's ~/.oxtail/self-wake (that one is keyed on the OWN session's self-
-// nudge; this is keyed on the TARGET we're poking) so the two never interfere. mtime
-// is the source of truth. Best-effort; a store failure never blocks the poke.
+// ── Persistent per-target re-poke throttle (ATOMIC single-winner) ─────────────
+// One re-poke per target-session per window — regardless of how many expectations
+// reference it, how many dual-scope MCP children tick, OR how many distinct waiters
+// target the same B (one poke drains B's whole mailbox, so coalescing per-target is
+// correct, not lossy). Separate namespace from self-heal's ~/.oxtail/self-wake (keyed
+// on the OWN session's self-nudge; this is keyed on the TARGET) so the two never
+// interfere. mtime is the source of truth.
+//
+// This is an ATOMIC create-exclusive CLAIM (mirrors autowake.claimWake), NOT a
+// stat-then-write: a re-poke is a BLIND cross-agent keystroke, so a genuine
+// single-winner matters more than for self-heal's self-nudge (codex F3). Two
+// children/waiters cannot both win the same window. Fail-SAFE: a broken store returns
+// false (do NOT license an unthrottled blind fire).
 function waiterWakeDir(): string {
   return join(homedir(), ".oxtail", "waiter-wake");
 }
 function waiterWakePath(targetSessionId: string): string {
   return join(waiterWakeDir(), createHash("sha256").update(targetSessionId).digest("hex").slice(0, 32));
 }
-export function waiterWokeRecently(
+export function claimWaiterRepoke(
   targetSessionId: string,
   nowMs: number,
   throttleMs: number = WAITER_HEAL_THROTTLE_MS,
 ): boolean {
-  try {
-    return nowMs - statSync(waiterWakePath(targetSessionId)).mtimeMs < throttleMs;
-  } catch {
-    return false; // no record / store unusable — don't block the poke
-  }
-}
-export function stampWaiterWoke(targetSessionId: string, nowMs: number): void {
+  const p = waiterWakePath(targetSessionId);
   try {
     mkdirSync(waiterWakeDir(), { recursive: true, mode: 0o700 });
-    const p = waiterWakePath(targetSessionId);
-    writeFileSync(p, "", { mode: 0o600 });
+    try {
+      const st = statSync(p);
+      if (nowMs - st.mtimeMs < throttleMs) return false; // a fresh claim exists → throttled
+      unlinkSync(p); // stale → clear so the slot can be re-won this window
+    } catch (e) {
+      // ENOENT = no prior claim (the common path). Any OTHER error (couldn't unlink a
+      // stale claim on an unhealthy store) → propagate to the fail-safe catch below.
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    }
+    const fd = openSync(p, "wx"); // atomic create-exclusive — the single-winner gate
+    closeSync(fd);
     const t = nowMs / 1000;
     try {
-      utimesSync(p, t, t);
+      utimesSync(p, t, t); // mtime drives the throttle window
     } catch {
-      // best effort — mtime drives the throttle window
+      // best effort
     }
-  } catch {
-    // store unusable — throttle silently degrades (best-effort posture)
+    return true;
+  } catch (e) {
+    // EEXIST: a concurrent claimant won the race → coalesce (skip). Any other error:
+    // the store is unusable → FAIL-SAFE. A broken throttle must NOT green-light an
+    // unbounded blind cross-agent fire, so return false (no re-poke this tick).
+    if ((e as NodeJS.ErrnoException).code === "EEXIST") return false;
+    return false;
   }
 }
 
@@ -147,8 +162,9 @@ export type WaiterHealDeps = {
   ledgerReplyTargets?: (ownerSessionId: string) => string[];
   resolve?: (target: string, caller: RegistryEntry) => ReturnType<typeof resolveTarget>;
   wake?: (peer: RegistryEntry) => Promise<WakeStatus>;
-  wokeRecently?: (targetSessionId: string, nowMs: number) => boolean;
-  stampWoke?: (targetSessionId: string, nowMs: number) => void;
+  // Atomic per-target single-winner claim: true iff THIS caller may re-poke `target`
+  // this window (see claimWaiterRepoke). Injected in tests.
+  claim?: (targetSessionId: string, nowMs: number) => boolean;
   graceMs?: number;
   cap?: number;
 };
@@ -180,8 +196,7 @@ export async function runWaiterHealTick(
   const ledgerReplies = deps.ledgerReplyTargets ?? listLedgerReplyTargets;
   const resolve = deps.resolve ?? resolveTarget;
   const wake = deps.wake ?? wakeForSend;
-  const wokeRecently = deps.wokeRecently ?? waiterWokeRecently;
-  const stampWoke = deps.stampWoke ?? stampWaiterWoke;
+  const claim = deps.claim ?? claimWaiterRepoke;
   const graceMs = deps.graceMs ?? WAITER_HEAL_GRACE_MS;
   const cap = deps.cap ?? WAITER_HEAL_CAP;
 
@@ -230,10 +245,12 @@ export async function runWaiterHealTick(
       res.gaveUp++; // gave up re-poking; surfaced to the operator (TTL reclaims the record)
       continue;
     }
-    if (wokeRecently(r.target, nowMs)) continue; // per-target throttle + single-winner
-    // FIRE. Stamp the throttle BEFORE the keystrokes (single-winner vs a sibling /
-    // another waiter ticking now), then re-poke B's OWN pane via the verified resolver.
-    stampWoke(r.target, nowMs);
+    // ATOMIC single-winner claim: wins the right to re-poke B for one throttle window,
+    // or coalesces (a sibling / another waiter already claimed B, whose one poke drains
+    // B's whole mailbox). Claim BEFORE the keystrokes, like self-heal's stamp-before-fire.
+    if (!claim(r.target, nowMs)) continue;
+    // Re-poke B's OWN pane via the verified resolver (no stored pane; B's own fresh-busy
+    // gate inside wakeForSend still protects a mid-turn hooked B).
     let status: WakeStatus;
     try {
       status = await wake(resolved.entry);

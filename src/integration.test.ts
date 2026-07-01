@@ -10,7 +10,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { readAll, register, type RegistryEntry } from "./registry.js";
 import { drain, enqueue, mailboxSessionKey, recordDelivered } from "./mailbox.js";
 import { countOpenObligations, recordReceived } from "./received.js";
-import { recordPendingAsk } from "./pending-ask.js";
+import { defaultPendingAskDir, listLivePendingAsks, recordPendingAsk } from "./pending-ask.js";
 
 const SERVER_ENTRY = resolve(import.meta.dirname, "server.ts");
 const TSX_BIN = resolve(import.meta.dirname, "..", "node_modules", ".bin", "tsx");
@@ -1209,6 +1209,55 @@ test("send_message action_required: records a durable open obligation on the cla
       assert.equal(drained[0].action_required, true, "delivered envelope carries the flag");
       // The obligation lives in the ledger, independent of the (now-drained) mailbox.
       assert.equal(countOpenObligations(receiverSid), 1, "durable obligation recorded on the receiver");
+      // codex F2: an explicit wake:"off" is fire-and-forget, so it must NOT create a
+      // waiter-side expectation either (which would fire a delayed re-poke and break
+      // the wake:"off" contract). No pending-ask should exist.
+      assert.equal(
+        listLivePendingAsks(defaultPendingAskDir(), Date.now()).length,
+        0,
+        "wake:off action_required records NO waiter expectation",
+      );
+    } finally {
+      process.env.HOME = prev;
+    }
+  } finally {
+    await server.cleanup();
+  }
+});
+
+test("send_message action_required (default wake): records a two-sided waiter expectation on the SENDER", async () => {
+  const server = await spawnServer();
+  try {
+    const senderSid = "5e0de700-0000-0000-0000-00000000000a";
+    const receiverSid = "dec0e700-0000-0000-0000-00000000000b";
+    await callTool(server.client, "register_my_session", { session_id: senderSid });
+    seedPeerEntry(server.home, {
+      server_pid: process.pid,
+      session_id: receiverSid,
+      tmux_session: "the-worker",
+      cwd: server.home,
+      obligationsCapable: true,
+    });
+
+    // No wake override → the delegation defaults to wake:"auto" and earns a durable
+    // waiter expectation so waiter-heal can re-poke a silent receiver (scenario B).
+    const res = await callTool<any>(server.client, "send_message", {
+      target: receiverSid,
+      body: "please handle the migration",
+      action_required: true,
+    });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    assert.equal(res.obligation_durable, true);
+
+    const prev = process.env.HOME;
+    process.env.HOME = server.home;
+    try {
+      const asks = listLivePendingAsks(defaultPendingAskDir(), Date.now());
+      assert.equal(asks.length, 1, "one waiter expectation recorded for the sender");
+      assert.equal(asks[0].sessionId, senderSid, "owned by the SENDER (the blocked party)");
+      assert.equal(asks[0].target, receiverSid, "targets the receiver (who to re-poke)");
+      assert.equal(asks[0].messageId, res.message_id, "stores the delegation msg_id (the receipt pivot)");
+      assert.equal(asks[0].attempts, 0, "no re-pokes yet");
     } finally {
       process.env.HOME = prev;
     }
