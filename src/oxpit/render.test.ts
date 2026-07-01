@@ -566,6 +566,67 @@ test("render: no window markers when the fleet fits", () => {
   assert.ok(!/more (above|below)/.test(out));
 });
 
+// ── collapseDead: fold ⚫dead-breadcrumb rows into one summary line ──────────────
+const collapseFixture = () =>
+  snap([
+    agent({ short_id: "live0", session_id: "l0", liveness: "active" }),
+    agent({ short_id: "live1", session_id: "l1", liveness: "idle" }),
+    agent({ short_id: "deadaa", session_id: "d0", liveness: "dead", unread: 2 }),
+    agent({ short_id: "deadbb", session_id: "d1", liveness: "dead", unread: 3, open_work: 2 }),
+    agent({ short_id: "deadcc", session_id: "d2", liveness: "dead" }),
+  ]);
+
+test("render: collapseDead folds dead rows into one summary, live rows stay", () => {
+  const out = renderSnapshot(collapseFixture(), { color: false, collapseDead: true });
+  assert.match(out, /live0/);
+  assert.match(out, /live1/);
+  assert.ok(!/dead·gone/.test(out), "individual dead rows are folded away");
+  assert.ok(!/deadaa|deadbb|deadcc/.test(out), "dead short ids are not rendered as rows");
+  assert.match(out, /⚫ 3 dead/, "one summary line stands in for the 3 dead");
+  assert.match(out, /x to show/, "summary carries the reveal-key hint");
+});
+
+test("render: collapseDead summary preserves ✉mail and ⚑stranded counts (no silent hide)", () => {
+  const out = renderSnapshot(collapseFixture(), { color: false, collapseDead: true });
+  assert.match(out, /✉5 mail/, "sums unread across the dead cohort (2+3)");
+  assert.match(out, /⚑2 stranded/, "sums open_work across the dead cohort");
+});
+
+test("render: default (no collapseDead) still shows dead rows individually", () => {
+  const out = renderSnapshot(collapseFixture(), { color: false });
+  assert.match(out, /dead·gone/, "dead rows render individually when not folded");
+  assert.ok(!/x to show/.test(out), "no fold summary when the flag is off");
+});
+
+test("render: collapseDead is a no-op summary-wise when the fleet has no dead agents", () => {
+  const out = renderSnapshot(snap(manyAgents(3)), { color: false, collapseDead: true });
+  assert.ok(!/dead/.test(out), "no dead-summary line appears");
+  assert.match(out, /a0\b/);
+});
+
+test("render: collapseDead keeps the selected live row visible without dead eating the window", () => {
+  // 2 live + 6 dead, a tight window: folding must leave both live rows shown (the dead
+  // no longer consume the row budget) and no dead-driven 'more below'.
+  const agents = [
+    agent({ short_id: "keepme", session_id: "l0", liveness: "active" }),
+    agent({ short_id: "alsome", session_id: "l1", liveness: "idle" }),
+    ...manyAgents(6, (i) => ({ short_id: `dead${i}`, session_id: `d${i}`, liveness: "dead" })),
+  ];
+  const out = renderSnapshot(snap(agents), { color: false, collapseDead: true, maxAgentRows: 4, selected: 1 });
+  assert.match(out, /keepme/);
+  assert.match(out, /alsome/);
+  assert.match(out, /⚫ 6 dead/);
+  assert.ok(!/more below/.test(out), "the two live rows fit; no window overflow from dead");
+});
+
+test("renderDock: collapseDead folds dead breadcrumbs into a compact summary", () => {
+  const out = renderDock(collapseFixture(), { color: false, collapseDead: true });
+  assert.match(out, /live0/);
+  assert.ok(!/deadaa|deadbb|deadcc/.test(out), "dead rows folded in the dock too");
+  assert.match(out, /⚫ 3 dead/);
+  assert.match(out, /x show/, "dock uses the shorter reveal hint");
+});
+
 test("render: wait-graph caps body lines with a summary", () => {
   const agents = manyAgents(6, () => ({
     waiting: {

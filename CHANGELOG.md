@@ -8,6 +8,23 @@ behavioral changes). Dates are release dates of the published npm tag.
 The hook protocol has its own version (`HOOK_MARKER_VERSION`); when it bumps,
 re-run `npx oxtail install-hook`. The current hook version is noted per release.
 
+## [0.30.0] — 2026-07-01
+
+**The cockpit stops drowning in dead sessions — ⚫dead rows fold into one line by default.**
+- `oxpit` (dock + full table) now **folds the ⚫dead-breadcrumb rows into a single summary
+  line** instead of one row each: `⚫ 15 dead · ✉25 mail · ⚑1 stranded · x show`. A fleet
+  buried under corpses from prior incarnations (they survive GC because they still hold
+  undrained mail) no longer pushes the live agents off the strip. Press **`x`** to unfold /
+  refold them; the fold is on by default.
+- It's a declutter, **not a silent hide**: the summary keeps the ✉stranded-mail and
+  ⚑stranded-work counts (summed across the dead cohort), so undrained mail is never hidden —
+  it's a view fold, and operator-ack-to-clear still owns actual removal. The cursor walks only
+  the live agents while folded, and re-anchors to a live row if the selected agent dies.
+- The welded dock **self-shrinks** to a snug live strip when the dead are folded, rather than
+  pinning to its max height. `oxtail status` (the scriptable one-shot) stays full-fidelity —
+  folding is a cockpit-only affordance.
+- No hook-protocol change (`HOOK_MARKER_VERSION` unchanged, still 14).
+
 ## [0.29.1] — 2026-06-30
 
 **Hotfix: the Ctrl-] flip key now actually flips, and ⚫dead rows sink to the bottom.**

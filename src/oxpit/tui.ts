@@ -449,6 +449,12 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     // collapsed to a count header). Detached processes are never navigable, so this is
     // a pure view toggle — it never moves the fleet selection.
     let showBackground = false;
+    // `x` — fold the ⚫dead-breadcrumb rows into one summary line (default ON: David's
+    // fleet was buried under corpses from prior incarnations that survive GC because they
+    // still hold undrained mail). The summary keeps the ✉mail/⚑stranded counts, so this
+    // never hides the mail signal — it's a declutter. Live rows are the sorted prefix, so
+    // when it's on the cursor must stay within them (see move()).
+    let collapseDead = true;
     let logExpanded = false; // `w` — expand the cursor'd message's full body
     let logCursorFromEnd = 0; // comms cursor: 0 = latest message, +1 = one older, …
     let logBodyOffset = 0; // when expanded: lines scrolled within the message body
@@ -570,9 +576,18 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         selectedKey = null;
         return;
       }
-      if (selectedIndex() < 0) {
+      const idx = selectedIndex();
+      if (idx < 0) {
         // selected agent churned out — clamp to the first row.
         selectedKey = agentKey(snapshot.agents[0]);
+        return;
+      }
+      // The selected agent just DIED while dead rows are folded — it's no longer a
+      // navigable/visible row. Re-anchor to the first live agent (the sorted prefix) so
+      // the cursor doesn't strand on a hidden corpse. Skip if the whole fleet is dead.
+      if (collapseDead && snapshot.agents[idx].liveness === "dead") {
+        const live = snapshot.agents.find((a) => a.liveness !== "dead");
+        if (live) selectedKey = agentKey(live);
       }
     }
 
@@ -584,7 +599,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     function footerKeyLines(width: number): string[] {
       const items = [
         "↑↓ move", "⏎ jump", "n nudge", "m msg", "S fleet", "R reset", "K kill",
-        "l log", "w thread", "b bg", "d dock", "r refresh", "? help", "⌃C quit",
+        "l log", "w thread", "b bg", "x dead", "d dock", "r refresh", "? help", "⌃C quit",
       ];
       const maxW = Math.max(16, width - 2);
       const lines: string[] = [];
@@ -624,6 +639,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         "  m             compose a message (Enter send · ⌥⏎/⌃J newline · ⌃X unattach · Esc cancel)",
         "                attach: drag a file then ⌃A · ⌃V pastes a clipboard image (copy then ⌃V)",
         "  b             show/hide detached background processes (MCP children / codex exec with no tmux pane)",
+        "  x             fold/unfold ⚫dead sessions — folded by default into one summary line (⚫N · ✉mail · ⚑stranded); their mail/work counts stay visible",
         "  d             toggle dock ↔ full — collapse the fleet to a compact one-line-per-agent HUD strip (for a short pane) and back",
         "  l             toggle the comms-log bottom panel (fleet stays visible above)",
         "  w             open the selected agent's thread in the panel (per-agent)",
@@ -673,7 +689,10 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
           : showBackground
             ? 1 + Math.min(bg.length, BACKGROUND_ROW_CAP) + (bg.length > BACKGROUND_ROW_CAP ? 1 : 0)
             : 1;
-      return 1 + attn + 1 + footerRows + wgLines + bgLines + snapshot.warnings.length + 2 + 1;
+      // The folded ⚫dead summary occupies one line below the agent window — reserve it so
+      // the live rows window ABOVE it instead of the summary overflowing the frame.
+      const deadLine = collapseDead && snapshot.agents.some((a) => a.liveness === "dead") ? 1 : 0;
+      return 1 + attn + 1 + footerRows + wgLines + bgLines + deadLine + snapshot.warnings.length + 2 + 1;
     }
 
     function fleetFrame(width: number, rows: number): string {
@@ -688,6 +707,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         toolActivity: activityCache, // sticky overlay — never mutates the snapshot
         burstFrames: animEnabled ? bursts : undefined, // per-agent one-shot bursts
         showBackground,
+        collapseDead,
       });
     }
 
@@ -1035,8 +1055,16 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
         // it. Runs in OUR process after the window settled, so it can't lose the race the
         // weld-side resize did. Converges: resize → SIGWINCH → repaint → rows == want.
         if (selfManagedDock && dockSelfPane) {
-          // header + agents + footer is +2; +2 more for a little breathing room (David).
-          const want = Math.min(Math.max(4, snapshot.agents.length + 4), DOCK_MAX_ROWS);
+          // Size to the VISIBLE rows: when dead are folded that's the live agents + one
+          // summary line, so a dock buried under 15 corpses shrinks to a snug live strip
+          // instead of pinning to DOCK_MAX_ROWS. header + agents + footer is +2; +2 more
+          // for a little breathing room (David).
+          const deadN = snapshot.agents.filter((a) => a.liveness === "dead").length;
+          const visibleAgents =
+            collapseDead && deadN > 0
+              ? snapshot.agents.length - deadN + 1 // live rows + the folded summary line
+              : snapshot.agents.length;
+          const want = Math.min(Math.max(4, visibleAgents + 4), DOCK_MAX_ROWS);
           // Shrink-only: pin it snug when tmux gave us too much (the half-screen bug), and
           // keep it snug if the window later grows; never fight a user who wants it taller.
           if (rows > want) {
@@ -1055,6 +1083,7 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
           // Reserve the header + footer rows; renderDock windows the agents to the rest
           // (with "⋯ N more" markers) so a tall fleet doesn't silently truncate.
           maxAgentRows: Math.max(1, rows - 2),
+          collapseDead, // fold ⚫dead breadcrumbs into one summary line (default on)
           // Surface a live confirm/feedback line in the strip's footer (the full table
           // rides these on its own footer; the dock has no other seam).
           dockStatus: Date.now() < statusUntil && status ? status : undefined,
@@ -1149,10 +1178,16 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       if (snapshot.agents.length === 0) return;
       dockAutoSelect = false; // you've taken the cursor — stop snapping to the window-agent
       ensureDockFocusPoll(); // watch for your return so we re-arm (no-op for a non-managed dock)
-      let idx = selectedIndex();
-      if (idx < 0) idx = 0;
-      idx = (idx + delta + snapshot.agents.length) % snapshot.agents.length;
-      selectedKey = agentKey(snapshot.agents[idx]);
+      // When the dead rows are folded, the cursor walks ONLY the live agents (dead ones
+      // aren't rendered, so landing on one would strand the highlight on a hidden row).
+      // Build the navigable list explicitly rather than assuming dead are a suffix; fall
+      // back to the full list when nothing's collapsed or the whole fleet is dead.
+      const live = collapseDead ? snapshot.agents.filter((a) => a.liveness !== "dead") : snapshot.agents;
+      const nav = live.length > 0 ? live : snapshot.agents;
+      let pos = nav.findIndex((a) => agentKey(a) === selectedKey);
+      if (pos < 0) pos = 0;
+      pos = (pos + delta + nav.length) % nav.length;
+      selectedKey = agentKey(nav[pos]);
       // Walking the fleet re-points the per-agent thread → reset the comms cursor to
       // that agent's latest message + collapse (item 4 follow-selection).
       logCursorFromEnd = 0;
@@ -2421,6 +2456,16 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
           return setStatus(dim("no detached background processes", opts.color));
         }
         showBackground = !showBackground;
+        return paint();
+      }
+      if (s === "x") {
+        // Fold/unfold the ⚫dead-breadcrumb rows. A no-op toggle when there are none —
+        // say so rather than silently doing nothing (matches the `b` posture).
+        if (!snapshot.agents.some((a) => a.liveness === "dead")) {
+          return setStatus(dim("no dead sessions to fold", opts.color));
+        }
+        collapseDead = !collapseDead;
+        reconcileSelection(); // unfolding is safe; folding may hide the selected corpse
         return paint();
       }
       if (s === "n") {
