@@ -60,6 +60,7 @@ import {
   type WakeStatus,
 } from "./wake.js";
 import { recordWakeIntent, runSelfHealTick, SELF_WAKE_INTERVAL_MS } from "./self-heal.js";
+import { runWaiterHealTick, WAITER_HEAL_INTERVAL_MS } from "./waiter-heal.js";
 
 // CLI subcommand dispatch must run before any MCP setup so that
 // `npx oxtail install-hook` doesn't open an MCP transport or register a
@@ -642,12 +643,14 @@ const entry = buildEntry(client);
 maybeRecoverStickyClaim();
 register(entry);
 
-// Self-heal watchdog timer (assigned in the invokedDirectly block below). Module-
-// scoped so cleanup can clear it on every exit path.
+// Self-heal + waiter-heal watchdog timers (assigned in the invokedDirectly block
+// below). Module-scoped so cleanup can clear them on every exit path.
 let selfHealTimer: ReturnType<typeof setInterval> | undefined;
+let waiterHealTimer: ReturnType<typeof setInterval> | undefined;
 
 const cleanup = (): void => {
   if (selfHealTimer) clearInterval(selfHealTimer);
+  if (waiterHealTimer) clearInterval(waiterHealTimer);
   unregister(entry.server_pid);
 };
 process.on("exit", cleanup);
@@ -2455,6 +2458,17 @@ if (invokedDirectly) {
     void runSelfHealTick(entry).catch((e) => trace("self_heal_tick_error", { error: String(e) }));
   }, SELF_WAKE_INTERVAL_MS);
   selfHealTimer.unref?.();
+
+  // Waiter-heal watchdog (scenario B). The sibling of self-heal: from the waiter's
+  // OWN server — the process alive while THIS agent is the blocked party — re-poke a
+  // delegated peer that has gone silent (a durable expectation past its grace with no
+  // receipt), so a peer that never replies self-heals instead of stalling the fleet.
+  // Same unref'd + never-throws posture as self-heal; longer interval (a re-poke is
+  // less urgent, and the spacing keeps the cross-agent keystroke rate low).
+  waiterHealTimer = setInterval(() => {
+    void runWaiterHealTick(entry).catch((e) => trace("waiter_heal_tick_error", { error: String(e) }));
+  }, WAITER_HEAL_INTERVAL_MS);
+  waiterHealTimer.unref?.();
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
