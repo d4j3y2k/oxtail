@@ -1256,11 +1256,46 @@ server.registerTool(
       !!action_required &&
       peer.client.session_id != null &&
       peer.capabilities?.mailbox?.obligations === true;
-    const msg = deliverToPeer(routeFor(peer), body, fromSessionId, {
-      reply_to,
-      source_message_id,
-      action_required: obligationDurable,
-    });
+    // Waiter-side expectation (the two-sided half of a durable delegation): give the
+    // SENDER a durable "I'm owed a result" record — keyed exactly like an ask_peer
+    // wait — so the sender's OWN server watchdog (waiter-heal.ts) can re-poke the peer
+    // when a delegated result never comes (scenario B), and the peer's complete_work
+    // consumes it via the EXISTING reply-correlation path (resolveSendWake →
+    // consumePendingAsk). Only for a real durable obligation with a claimed sender: a
+    // non-durable action_required has no obligation the peer can close, so no
+    // expectation could ever be satisfied — recording one would just re-poke pointlessly.
+    // Mint a request_id so complete_work's reply_to correlates; pre-mint the message id
+    // so the expectation stores the delegation's msg_id (its delivery RECEIPT is the
+    // watchdog's pre-/post-receipt pivot). RECORDED BEFORE deliver (record-before-append):
+    // if the sender crashes right after enqueue, the record already exists to pull it back.
+    const delegationRequestId =
+      obligationDurable && fromSessionId ? randomBytes(8).toString("hex") : undefined;
+    const delegationMsgId = delegationRequestId ? randomBytes(8).toString("hex") : undefined;
+    if (delegationRequestId && delegationMsgId && fromSessionId) {
+      recordPendingAsk(defaultPendingAskDir(), fromSessionId, delegationRequestId, Date.now(), {
+        target: peer.client.session_id,
+        messageId: delegationMsgId,
+        ownerEpoch: entry.started_at,
+      });
+    }
+    let msg: mailbox.Mailbox;
+    try {
+      msg = deliverToPeer(routeFor(peer), body, fromSessionId, {
+        reply_to,
+        source_message_id,
+        action_required: obligationDurable,
+        ...(delegationRequestId ? { request_id: delegationRequestId } : {}),
+        ...(delegationMsgId ? { id: delegationMsgId } : {}),
+      });
+    } catch (e) {
+      // H1 fail-loud: the durable-obligation ledger write failed, so delivery did NOT
+      // happen. Drop the just-recorded waiter expectation so the watchdog doesn't
+      // re-poke the peer for a delegation it never received; the sender retries (fresh ids).
+      if (delegationRequestId && fromSessionId) {
+        consumePendingAsk(defaultPendingAskDir(), fromSessionId, delegationRequestId);
+      }
+      throw e;
+    }
     const { wake_status, wake_reason, delivery_outlook } = await resolveSendWake(peer, effectiveWake, reply_to);
     // Self-heal backstop: if a wake was intended but not confidently delivered,
     // record a pending-wake so the recipient's own server can retry (§self-heal.ts).
@@ -2212,7 +2247,17 @@ server.registerTool(
         // Write the pending obligation BEFORE the final drain (write-before-
         // final-drain): a reply that lands after the drain finds this record and
         // wakes us via resolveSendWake; one that landed before is caught below.
-        if (!recordPendingAsk(dir, fromSessionId, requestId, Date.now())) {
+        // Attach the waiter-expectation metadata (target peer, the ask's msg_id for
+        // the receipt pivot, our incarnation epoch) so waiter-heal.ts can also
+        // re-poke a timed-out ask whose peer went silent (scenario B), not just an
+        // action_required delegation.
+        if (
+          !recordPendingAsk(dir, fromSessionId, requestId, Date.now(), {
+            target: expectedSessionId,
+            messageId: msg.id,
+            ownerEpoch: entry.started_at,
+          })
+        ) {
           // Store unwritable → silently degrades to the read_my_messages path
           // (no durable pull-back). Surface it so the degradation is observable.
           trace("ask_peer_pending_record_failed", { request_id: requestId });

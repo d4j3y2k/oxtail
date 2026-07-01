@@ -6,9 +6,12 @@ import { test } from "node:test";
 
 import {
   PENDING_ASK_TTL_MS,
+  bumpPendingAskAttempt,
   consumePendingAsk,
   gcPendingAsk,
   hasPendingAsk,
+  listLivePendingAsks,
+  listPendingAsksForOwner,
   recordPendingAsk,
 } from "./pending-ask.js";
 
@@ -178,4 +181,92 @@ test("gcPendingAsk: missing dir is a no-op (no throw)", () => {
   // Does not throw.
   gcPendingAsk(dir, NOW);
   assert.ok(true);
+});
+
+// --- waiter-expectation extension (v0.32) ------------------------------------
+
+const TARGET = "22222222-3333-4444-5555-666666666666";
+const MSGID = "beefcafe0102";
+
+test("recordPendingAsk with meta: surfaced by listLivePendingAsks; a bare record has attempts=0, no target", () => {
+  const dir = tmp();
+  try {
+    recordPendingAsk(dir, SID, REQ, NOW, { target: TARGET, messageId: MSGID, ownerEpoch: 1700 });
+    recordPendingAsk(dir, SID, "bare", NOW); // legacy 4-arg shape
+    const live = listLivePendingAsks(dir, NOW);
+    const withMeta = live.find((r) => r.requestId === REQ);
+    const bare = live.find((r) => r.requestId === "bare");
+    assert.ok(withMeta, "meta record present");
+    assert.equal(withMeta!.target, TARGET);
+    assert.equal(withMeta!.messageId, MSGID);
+    assert.equal(withMeta!.ownerEpoch, 1700);
+    assert.equal(withMeta!.attempts, 0);
+    assert.ok(bare, "bare record present");
+    assert.equal(bare!.target, undefined, "legacy record has no target");
+    assert.equal(bare!.attempts, 0, "legacy record defaults attempts to 0");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("listPendingAsksForOwner: returns only records owned by the given session", () => {
+  const dir = tmp();
+  const SID2 = "99999999-8888-7777-6666-555555555555";
+  try {
+    recordPendingAsk(dir, SID, REQ, NOW, { target: TARGET, messageId: MSGID });
+    recordPendingAsk(dir, SID, "req2", NOW, { target: TARGET, messageId: "aa11" });
+    recordPendingAsk(dir, SID2, REQ, NOW, { target: TARGET, messageId: "bb22" });
+    const mine = listPendingAsksForOwner(dir, SID, NOW);
+    assert.equal(mine.length, 2, "two records owned by SID");
+    assert.ok(mine.every((r) => r.sessionId === SID));
+    assert.equal(listPendingAsksForOwner(dir, null, NOW).length, 0, "null owner → empty");
+    assert.equal(listPendingAsksForOwner(dir, "nobody", NOW).length, 0, "unknown owner → empty");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bumpPendingAskAttempt: increments attempts WITHOUT resetting the TTL clock", () => {
+  const dir = tmp();
+  try {
+    recordPendingAsk(dir, SID, REQ, NOW, { target: TARGET, messageId: MSGID });
+    bumpPendingAskAttempt(dir, SID, REQ, NOW + 5_000);
+    bumpPendingAskAttempt(dir, SID, REQ, NOW + 6_000);
+    const r = listLivePendingAsks(dir, NOW + 6_000).find((x) => x.requestId === REQ);
+    assert.equal(r!.attempts, 2, "attempts incremented");
+    // TTL still counts from the ORIGINAL record mtime, not the bump.
+    assert.equal(hasPendingAsk(dir, SID, REQ, NOW + PENDING_ASK_TTL_MS - 1), true, "still live pre-TTL");
+    assert.equal(hasPendingAsk(dir, SID, REQ, NOW + PENDING_ASK_TTL_MS), false, "expired at TTL from original");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bumpPendingAskAttempt: missing record is a no-op (no throw)", () => {
+  const dir = tmp();
+  try {
+    bumpPendingAskAttempt(dir, SID, REQ, NOW); // nothing recorded
+    assert.ok(true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a crash-orphaned .tmp (from a bump) is NOT listed as a record, but IS gc'd by age", () => {
+  const dir = tmp();
+  try {
+    recordPendingAsk(dir, SID, REQ, NOW, { target: TARGET, messageId: MSGID });
+    // Simulate a bump temp orphaned by a crash between write and rename: same
+    // `p-<hash>` prefix + a `.tmp.<pid>.<hex>` suffix, holding a valid JSON body.
+    const orphan = join(dir, `p-${"0".repeat(32)}.tmp.12345.deadbeef`);
+    writeFileSync(orphan, JSON.stringify({ sessionId: SID, requestId: "ghost", at: NOW }));
+    const live = listLivePendingAsks(dir, NOW);
+    assert.equal(live.length, 1, "only the real record is listed, not the .tmp orphan");
+    assert.equal(live[0].requestId, REQ);
+    // gc (broad `p` prefix) still reclaims the orphan once it ages past the TTL.
+    gcPendingAsk(dir, NOW + PENDING_ASK_TTL_MS + 1_000);
+    assert.equal(readdirSync(dir).some((n) => n.includes(".tmp.")), false, "orphan gc'd");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
