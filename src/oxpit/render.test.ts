@@ -277,6 +277,46 @@ test("render: waiting edge and purpose caption", () => {
   assert.match(out, /⏳ waiter awaiting reply from codex \(45s\)/); // wait-graph block
 });
 
+test("render: a re-poked wait shows the ↻ count; a fresh wait does not", () => {
+  const repoked = renderSnapshot(
+    snap([
+      agent({
+        short_id: "waiter",
+        waiting: {
+          target_session_id: "x",
+          target_short_id: "codex",
+          age_s: 300,
+          orphaned: false,
+          in_cycle: false,
+          cycle_all_live: false,
+          repoke_attempts: 2,
+        },
+      }),
+    ]),
+    { color: false },
+  );
+  assert.match(repoked, /⏳codex 5m ↻2/, "re-poked wait shows the re-poke count");
+
+  const fresh = renderSnapshot(
+    snap([
+      agent({
+        short_id: "waiter",
+        waiting: {
+          target_session_id: "x",
+          target_short_id: "codex",
+          age_s: 45,
+          orphaned: false,
+          in_cycle: false,
+          cycle_all_live: false,
+          repoke_attempts: 0,
+        },
+      }),
+    ]),
+    { color: false },
+  );
+  assert.doesNotMatch(fresh, /↻/, "a not-yet-re-poked wait shows no ↻ suffix");
+});
+
 test("render: wait-graph and badge use window-name labels for both ends", () => {
   const target = agent({ short_id: "tc", session_id: "stc", window_name: "codex" });
   const waiter = agent({
