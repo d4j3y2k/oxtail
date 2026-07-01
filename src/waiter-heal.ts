@@ -41,7 +41,7 @@
 // Module DAG (no cycles): pending-ask/wake/resolve-target/received (leaves) ← waiter-heal ← server.
 
 import { createHash } from "node:crypto";
-import { closeSync, mkdirSync, openSync, statSync, unlinkSync, utimesSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, renameSync, statSync, unlinkSync, utimesSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -98,7 +98,11 @@ export function waiterHealKillSwitchOff(env: NodeJS.ProcessEnv = process.env): b
 // One re-poke per target-session per window — regardless of how many expectations
 // reference it, how many dual-scope MCP children tick, OR how many distinct waiters
 // target the same B (one poke drains B's whole mailbox, so coalescing per-target is
-// correct, not lossy). Separate namespace from self-heal's ~/.oxtail/self-wake (keyed
+// correct, not lossy). NOTE the attempt CAP is per-RECORD, so K distinct live
+// expectations to the same silent B can still yield up to K×cap re-pokes over time
+// (each ≥ a throttle window apart, each gated by B's fresh-busy check) — bounded and
+// low-harm, just more than a naive "cap per target" reading of this coalescing.
+// Separate namespace from self-heal's ~/.oxtail/self-wake (keyed
 // on the OWN session's self-nudge; this is keyed on the TARGET) so the two never
 // interfere. mtime is the source of truth.
 //
@@ -124,10 +128,24 @@ export function claimWaiterRepoke(
     try {
       const st = statSync(p);
       if (nowMs - st.mtimeMs < throttleMs) return false; // a fresh claim exists → throttled
-      unlinkSync(p); // stale → clear so the slot can be re-won this window
+      // Stale → clear the slot for a fresh exclusive create. Do NOT unlink(p) directly:
+      // a plain unlink lets two racers both delete + both `wx`-create (the second's unlink
+      // would remove the FIRST's just-created fresh claim → both fire — the stale-reclaim
+      // race the compile-sim Interpreter caught). Instead atomically MOVE the stale file
+      // aside: renameSync of a given source succeeds for at most one racer (the loser gets
+      // ENOENT and falls through), and it never removes a fresh claim — so the openSync
+      // "wx" below stays a true single-winner even across the window boundary.
+      const grab = `${p}.stale.${process.pid}.${createHash("sha256").update(`${nowMs}:${process.pid}`).digest("hex").slice(0, 8)}`;
+      try {
+        renameSync(p, grab);
+        unlinkSync(grab);
+      } catch {
+        // p was already moved/created by another racer, or grab vanished — fall through;
+        // the exclusive create below decides the single winner.
+      }
     } catch (e) {
-      // ENOENT = no prior claim (the common path). Any OTHER error (couldn't unlink a
-      // stale claim on an unhealthy store) → propagate to the fail-safe catch below.
+      // ENOENT = no prior claim (the common path). Any OTHER error (e.g. a stat failure
+      // on an unhealthy store) → propagate to the fail-safe catch below.
       if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
     }
     const fd = openSync(p, "wx"); // atomic create-exclusive — the single-winner gate
@@ -140,8 +158,8 @@ export function claimWaiterRepoke(
     }
     return true;
   } catch (e) {
-    // EEXIST: a concurrent claimant won the race → coalesce (skip). Any other error:
-    // the store is unusable → FAIL-SAFE. A broken throttle must NOT green-light an
+    // EEXIST: a concurrent claimant already created the slot → coalesce (skip). Any other
+    // error: the store is unusable → FAIL-SAFE. A broken throttle must NOT green-light an
     // unbounded blind cross-agent fire, so return false (no re-poke this tick).
     if ((e as NodeJS.ErrnoException).code === "EEXIST") return false;
     return false;

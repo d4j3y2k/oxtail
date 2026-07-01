@@ -91,8 +91,12 @@ function setMtime(path: string, nowMs: number): void {
 //                  reply ⇒ stop poking, escalate).
 //   ownerEpoch   — the owner server's started_at (seconds) at record time — the
 //                  de-facto incarnation stamp (no epoch field exists in the registry;
-//                  started_at is the tiebreaker used by dedupeBySessionId). Lets a
-//                  restarted owner tell its own orphaned records from a live sibling's.
+//                  started_at is the tiebreaker used by dedupeBySessionId). Recorded for
+//                  PROVENANCE/observability (which incarnation created this) — it is NOT
+//                  currently read for any adoption decision: adopt-on-restart falls out of
+//                  the session-keyed store (a restarted owner shares its session_id and so
+//                  lists its own orphans), and dual-scope sibling serialization is done by
+//                  the atomic per-target claim (waiter-heal claimWaiterRepoke), not epoch.
 //   attempts     — re-poke count (capped, mirrors pending-wake).
 //   lastRepokeAt — last re-poke wall-clock (debug/observability).
 type PendingAskBody = {
