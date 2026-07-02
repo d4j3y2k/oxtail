@@ -2,7 +2,9 @@
 // (interactive TUI). Both are thin wrappers over the pure snapshot/render layer.
 
 import { buildSnapshot } from "./snapshot.js";
-import { captureFleetPanes, type PaneActivity } from "./activity.js";
+import { busyMapFromPanes, captureFleetPanes, type PaneActivity } from "./activity.js";
+import { readAllPassive, type RegistryEntry } from "../registry.js";
+import { panePresence, type PaneInfo } from "./jump.js";
 import { computeAgentLabels, fleetTrouble, renderCommsLog, renderSnapshot, type FleetTrouble } from "./render.js";
 import { buildCommsLog } from "./comms.js";
 import {
@@ -150,11 +152,19 @@ export function runStatus(
     out(USAGE);
     return 0;
   }
-  const snap = buildSnapshot({
+  // Read the registry + tmux pane table ONCE and reuse across builds below — the
+  // human path rebuilds the snapshot after capturing pane_busy, and both builds must
+  // see the same fleet (and not fork list-panes twice) for a consistent, cheap render.
+  let cachedEntries: RegistryEntry[] | null = null;
+  let cachedPaneInfo: Map<string, PaneInfo> | null = null;
+  const baseOpts = {
     allProjects: a.all,
     projectRoot: a.project,
     readActivity: !a.noActivity, // real-time tool sub-state badges (on by default)
-  });
+    readEntries: () => (cachedEntries ??= readAllPassive()),
+    resolvePaneInfo: () => (cachedPaneInfo ??= panePresence()),
+  };
+  let snap = buildSnapshot(baseOpts);
   const limit = a.limit && Number.isFinite(a.limit) && a.limit > 0 ? a.limit : DEFAULT_LOG_LIMIT;
   // --check: a HARD fleet problem makes the one-shot a scriptable health probe (see
   // checkExitCode for what does/doesn't count).
@@ -175,6 +185,12 @@ export function runStatus(
   if (!a.noActivity && process.stdout.isTTY) {
     try {
       paneActivity = captureFleetPanes(snap.agents);
+      // Re-derive liveness with the content-verified busy signal: a working-but-quiet-
+      // transcript agent now reads active/pane_fresh off "esc to interrupt", and — the
+      // fix — an idle agent whose pane merely repaints (docked dock pane / ticking
+      // "Worked for Ns" counter) NO LONGER reads a false active. Reuses the cached
+      // registry+pane reads, so this is one extra pure build, no extra tmux forks.
+      snap = buildSnapshot({ ...baseOpts, paneBusy: busyMapFromPanes(paneActivity) });
     } catch {
       paneActivity = undefined; // tmux absent / capture failed — degrade silently
     }

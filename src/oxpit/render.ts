@@ -201,8 +201,9 @@ function statusText(a: FleetAgent): string {
   }
   if (a.liveness === "active") {
     // Each of the 3 active reasons is legible from the status cell ALONE (not only via
-    // the badge cluster): pane_fresh → ✻pane-age (the transcript can be minutes stale
-    // mid-turn, so show the live pane-repaint age, not "active 2m"); tool_running →
+    // the badge cluster): pane_fresh → ✻pane-age (the pane shows "esc to interrupt" — a
+    // turn in flight — while the transcript can be minutes stale mid-turn, so show the
+    // live pane-repaint age, not "active 2m"); tool_running →
     // ⧖tx-age (a tool is in flight while tx+pane are both quiet — the transcript mtime
     // is the unclosed tool_use write, i.e. the practical tool-call age, bounded by
     // STALL_WINDOW_S); else transcript_fresh → plain tx-age. Both markers are VERIFIED
@@ -233,9 +234,10 @@ function badges(
     parts.push(painted);
     len += displayWidth(raw) + 1; // +1 for the joining space; width-aware (emoji=2)
   };
-  // (The pane-recent signal now folds straight into liveness as pane_fresh ⇒ active
-  // — see snapshot.ts buildAgent — so the old "idle-but-✽" badge is gone; statusText
-  // renders the pane age behind the active glyph instead.)
+  // (The content-verified busy signal folds into liveness as pane_fresh ⇒ active — see
+  // snapshot.ts buildAgent — so the old "idle-but-✽" badge is gone; statusText renders
+  // the pane age behind the active glyph instead. The raw pane-repaint TIMESTAMP is no
+  // longer a liveness input: it ticks on a docked dock pane / an idle client's counter.)
   // Live tool sub-state FIRST — "what it's doing right now". Bright (family color +
   // bold) while the call is in-flight; dim once it has returned ("last did X").
   if (act) {

@@ -133,7 +133,8 @@ test("agentKey — session id else pid", () => {
 });
 
 // ── EXEC class: capture-pane activity ───────────────────────────────────────────
-import { capturePaneActivity, extractPaneActivity } from "./activity.js";
+import { busyMapFromPanes, capturePaneActivity, extractPaneActivity } from "./activity.js";
+import type { PaneActivity } from "./activity.js";
 import { sanitizeCaptured, displayWidth } from "./format.js";
 import type { RegistryEntry } from "../registry.js";
 
@@ -168,6 +169,21 @@ test("extractPaneActivity — Codex working line", () => {
   const r = extractPaneActivity(CODEX_ACTIVE.split("\n"), "codex");
   assert.equal(r.pane_busy, true);
   assert.equal(r.pane_tail, "Working (38s esc to interrupt)"); // · dropped (ambiguous-width)
+});
+
+test("busyMapFromPanes — keeps only busy panes; idle/tail-only agents are absent (not-busy)", () => {
+  const pa = (over: Partial<PaneActivity>): PaneActivity => ({ pane_tail: null, pane_busy: false, ...over });
+  const busy = busyMapFromPanes(
+    new Map([
+      ["main", pa({ pane_busy: true, pane_tail: "Thinking (…)" })], // busy ⇒ kept
+      ["codex", pa({ pane_busy: false, pane_tail: "leftover text" })], // tail but not busy ⇒ dropped
+      ["max", pa({ pane_busy: false })], // idle ⇒ dropped
+    ]),
+  );
+  assert.equal(busy.get("main"), true);
+  assert.equal(busy.has("codex"), false, "a non-busy pane must not seed a false pane_fresh");
+  assert.equal(busy.has("max"), false);
+  assert.equal(busy.size, 1);
 });
 
 test("extractPaneActivity — idle pane with STALE 'Working (...)' text is NOT live (codex)", () => {
