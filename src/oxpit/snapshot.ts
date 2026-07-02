@@ -44,7 +44,7 @@ import {
 import { defaultPendingAskDir, listLivePendingAsks } from "../pending-ask.js";
 import { inferProjectRoot, pathBelongsToProjectScope, safeRealpath } from "../scope.js";
 import { panePresence, type PaneInfo } from "./jump.js";
-import { scanLatestTool, type AgentActivity } from "./activity.js";
+import { agentKey, scanLatestTool, type AgentActivity } from "./activity.js";
 
 function envPosInt(name: string, def: number, env: NodeJS.ProcessEnv = process.env): number {
   const v = env[name];
@@ -147,11 +147,14 @@ export type FleetAgent = {
   liveness_reason: LivenessReason;
   transcript_age_s: number | null; // null = no transcript file resolved/found
   proc_sig: "ok" | "reused" | "unknown";
-  // Seconds since the agent's tmux pane last produced OUTPUT (pty activity). FOLDS
-  // INTO liveness: a fresh repaint within the active window ⇒ active/pane_fresh (a
-  // long thinking turn keeps the pane spinning while the transcript mtime lags). The
-  // raw age is always shown behind the glyph ("active ✻Ns") so it's never a binary-
-  // 🟢 overpromise. null = no pane / no tmux.
+  // Seconds since the agent's tmux pane last produced OUTPUT (pty activity). DISPLAY
+  // ONLY — it does NOT drive liveness. A repaint timestamp can't tell working from
+  // idle: a docked window's dock pane repaints every second (bumping window-scoped
+  // window_activity), and an idle client TUI keeps ticking its "Worked for Ns"
+  // counter/spinner — both make this age perpetually ~0 even when the agent is idle.
+  // pane_fresh is instead gated on a CONTENT signal (pane_busy — "esc to interrupt",
+  // captured), so this age is only the ✻Ns marker shown behind an already-active glyph.
+  // null = no pane / no tmux.
   pane_activity_age_s: number | null;
   // The raw ABSOLUTE pty-activity epoch (unix seconds) behind that age. Carried so
   // the TUI's capture change-detector compares stable epochs instead of round-tripping
@@ -167,12 +170,14 @@ export type FleetAgent = {
   // Worklist signal (max's v1 cut): an idle agent that is NOT parked on a peer, NOT
   // maybe-hung, and HAS a transcript (a real session sitting at its prompt) is
   // "awaiting you" — your move. The COMPLEMENT of the wait-graph within idle-space, so
-  // the cockpit answers "who needs me right now", not just "who's alive". Crucially a
-  // PURE snapshot derivation: "working" is already excluded by the active enum
-  // (transcript_fresh ∨ pane_fresh ∨ tool_running ⇒ active), so by the time a row reads
-  // idle the pane needn't be re-captured — the signal is fleet-complete in BOTH `oxtail
-  // status` AND the selected-row-only TUI, no exec cost. capture-pane only ENRICHES it
-  // later (the permission-gate upgrade + false-"awaiting" suppression), never sources it.
+  // the cockpit answers "who needs me right now", not just "who's alive". "working" is
+  // excluded by the active enum (transcript_fresh ∨ pane_fresh ∨ tool_running ⇒ active).
+  // transcript_fresh + tool_running are pure READ-class derivations (fleet-complete, no
+  // exec); pane_fresh needs the captured pane_busy signal, so an agent in a long tool-
+  // less think reads idle (and may flag awaiting) until its pane is captured — accurate
+  // wherever capture runs (fleet-wide in `oxtail status` + on the TUI's slow tick),
+  // soft-and-self-healing where it hasn't yet. Far better than the old repaint-timestamp
+  // pane_fresh, which read EVERY idle agent active and made this signal never fire.
   awaiting_human: boolean;
 
   // Transcript path (display/activity only; jump RE-RESOLVES identity separately).
@@ -249,6 +254,12 @@ export type BuildSnapshotOptions = {
   // call (window label + the orthogonal pane-recent hint). Injectable for tests /
   // to disable (return new Map()).
   resolvePaneInfo?: () => Map<string, PaneInfo>;
+  // agentKey → captured pane_busy ("esc to interrupt" present). Sources the pane_fresh
+  // liveness reason for the keyed agents; agents not in the map fall through to the
+  // read-class signals (transcript_fresh / tool_running / idle). Populated by the
+  // caller from an EXEC-class capture-pane pass (fleet-wide in `oxtail status`, the
+  // slow tick in the TUI); default empty ⇒ pane_fresh never fires (pure read path).
+  paneBusy?: Map<string, boolean>;
   // Resolve which server pids currently own a live tmux pane (process-subtree
   // ancestry — the SAME signal `jump` uses). Drives the background/foreground split.
   // Defaults to the real batched resolver; injectable so tests can declare a fleet's
@@ -452,6 +463,10 @@ type AgentCtx = {
   checkProcSig: boolean;
   readActivity: boolean;
   paneInfo: Map<string, PaneInfo>;
+  // agentKey → true when the captured pane shows the client's "esc to interrupt"
+  // marker (a turn in flight). Sources the pane_fresh liveness reason. Empty when no
+  // pane capture ran this pass (the READ-class path); an absent key ⇒ not-busy.
+  paneBusy: Map<string, boolean>;
   isAlive: (pid: number) => boolean;
 };
 
@@ -490,12 +505,20 @@ function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
   }
 
   // Pane-recent signal (pty output time). Clamp ≥0 and guard a non-finite/empty
-  // reading — it's a wall-clock time_t that can be stale or garbage. Folds into
-  // liveness (pane_fresh ⇒ active, below) AND drives the TUI capture change-detector.
+  // reading — it's a wall-clock time_t that can be stale or garbage. DISPLAY-ONLY now
+  // (the ✻Ns marker + the TUI's capture change-detector); it no longer drives liveness,
+  // because a repaint timestamp can't distinguish working from idle (a docked dock pane
+  // or a ticking "Worked for Ns" counter keeps it perpetually fresh). Liveness's
+  // pane_fresh is gated on the CONTENT signal ctx.paneBusy instead (see below).
   const paneInfo = e.tmux_pane ? ctx.paneInfo.get(e.tmux_pane) : undefined;
   const paneActAt = paneInfo?.activity_at ?? null;
   const paneActivityAgeS =
     paneActAt != null && Number.isFinite(paneActAt) ? ageOrSkew(ctx.nowSec, paneActAt) : null;
+  // CONTENT-verified "working right now": the captured pane shows the client's own
+  // "esc to interrupt" marker (extractPaneActivity → pane_busy). Present ONLY while a
+  // turn is in flight for both Claude Code and Codex; absent at the idle prompt even as
+  // the clock keeps ticking. Undefined when this agent's pane wasn't captured this pass.
+  const paneBusy = ctx.paneBusy.get(agentKey({ session_id: sid, server_pid: e.server_pid })) === true;
 
   // Liveness + the real-time tool sub-state are decided together: transcript mtime
   // alone LAGS during a long thinking/tool turn (David watched a clearly-working
@@ -526,11 +549,15 @@ function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
     if (transcriptAgeS !== null && transcriptAgeS <= ctx.activeWindowS) {
       liveness = "active";
       reason = "transcript_fresh";
-    } else if (paneActivityAgeS !== null && paneActivityAgeS <= ctx.activeWindowS) {
-      // Pane repainted within the window ⇒ producing output / spinner = working.
-      // (Reverses max's Q3 "window_activity stays out of the enum": dogfood showed
-      // idle panes go stale 27–56s while a working pane reads 0s, so the 20s window
-      // separates them cleanly. Pane output ≠ proof, so the raw age stays visible.)
+    } else if (paneBusy && transcriptAgeS !== null && transcriptAgeS <= STALL_WINDOW_S) {
+      // The captured pane shows "esc to interrupt" ⇒ a turn is in flight RIGHT NOW —
+      // catches a long tool-less think while the transcript mtime lags (David watched a
+      // clearly-working agent read idle at 158s tx-age). This REPLACES the old repaint-
+      // timestamp pane_fresh, which fired for every idle agent (a docked dock pane / a
+      // ticking "Worked for Ns" counter keeps window_activity perpetually fresh). Bounded
+      // by STALL_WINDOW_S exactly like tool_running below: a wedged process leaves "esc
+      // to interrupt" frozen in the pane buffer, so past the window it must hand off to
+      // idle → possibly_stalled rather than read active forever off a stale glyph.
       liveness = "active";
       reason = "pane_fresh";
     } else if (
@@ -775,6 +802,7 @@ export function buildSnapshot(opts: BuildSnapshotOptions = {}): FleetSnapshot {
     checkProcSig,
     readActivity,
     paneInfo,
+    paneBusy: opts.paneBusy ?? new Map(),
     isAlive: opts.isAlive ?? isAlive,
   };
 

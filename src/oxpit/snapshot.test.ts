@@ -162,30 +162,80 @@ test("liveness: missing transcript ⇒ idle/no_transcript", () => {
 
 // ── item-5: working-but-quiet-transcript agents must read ACTIVE ────────────────
 // David watched a clearly-thinking agent read idle because transcript mtime lags
-// during a long turn. A fresh pane repaint OR an in-flight tool now promotes it.
+// during a long turn. A CONTENT-verified busy pane ("esc to interrupt") OR an
+// in-flight tool now promotes it — NOT a bare pane-repaint timestamp, which ticks on
+// an idle client's "Worked for Ns" counter / a docked dock pane and read EVERY idle
+// agent falsely 🟢 (the perpetual-green bug this replaced).
 
-test("liveness: stale transcript but a fresh pane ⇒ active/pane_fresh (item-5)", () => {
+const BUSY_SID = "00000000-0000-0000-0000-0000000000b5";
+
+test("liveness: stale transcript but the pane shows 'esc to interrupt' ⇒ active/pane_fresh (item-5)", () => {
   withHome((home) => {
-    const tx = writeTranscript(home, "tx-quiet.jsonl", 600); // transcript cold 10m
+    const tx = writeTranscript(home, "tx-quiet.jsonl", 300); // transcript cold 5m
+    const snap = buildSnapshot({
+      readEntries: () => [
+        makeEntry({ tmux_pane: "%1", client: { transcript_path: tx, session_id: BUSY_SID } as never }),
+      ],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      resolvePaneInfo: () =>
+        new Map([["%1", { name: "main", activity_at: NOW_S - 2, window_index: 0 }]]),
+      paneBusy: new Map([[BUSY_SID, true]]), // captured "esc to interrupt" ⇒ a turn in flight
+    });
+    const a = snap.agents[0];
+    assert.equal(a.liveness, "active");
+    assert.equal(a.liveness_reason, "pane_fresh");
+    assert.equal(a.transcript_age_s, 300); // raw transcript age still reported, unhidden
+  });
+});
+
+test("liveness: fresh pane TIMESTAMP but NOT busy ⇒ stays idle (perpetual-🟢 regression guard)", () => {
+  withHome((home) => {
+    const tx = writeTranscript(home, "tx-tick.jsonl", 600);
     const snap = buildSnapshot({
       readEntries: () => [makeEntry({ tmux_pane: "%1", client: { transcript_path: tx } as never })],
       allProjects: true,
       nowMs: NOW_MS,
       checkProcSig: false,
       selfSessionId: null,
-      // pane repainted 2s ago ⇒ the agent is producing output / spinning right now.
+      // Pane "repainted" 1s ago (an idle client's ticking counter / a docked dock pane
+      // bumping window_activity) but NO captured busy signal ⇒ must NOT read active off
+      // the timestamp alone. This is the exact false-🟢 the fix removes.
       resolvePaneInfo: () =>
-        new Map([["%1", { name: "main", activity_at: NOW_S - 2, window_index: 0 }]]),
+        new Map([["%1", { name: "main", activity_at: NOW_S - 1, window_index: 0 }]]),
+      paneBusy: new Map(),
     });
     const a = snap.agents[0];
-    assert.equal(a.liveness, "active");
-    assert.equal(a.liveness_reason, "pane_fresh");
-    assert.equal(a.pane_activity_age_s, 2);
-    assert.equal(a.transcript_age_s, 600); // raw transcript age still reported, unhidden
+    assert.equal(a.liveness, "idle");
+    assert.equal(a.liveness_reason, "idle");
+    assert.equal(a.pane_activity_age_s, 1); // fresh repaint age still SHOWN, just not trusted
   });
 });
 
-test("liveness: stale transcript AND a stale pane ⇒ stays idle (negative control)", () => {
+test("liveness: pane busy but transcript cold past STALL_WINDOW_S ⇒ idle (wedge bound)", () => {
+  withHome((home) => {
+    const tx = writeTranscript(home, "tx-wedged.jsonl", 601); // just past the 600s bound
+    const snap = buildSnapshot({
+      readEntries: () => [
+        makeEntry({ tmux_pane: "%1", client: { transcript_path: tx, session_id: BUSY_SID } as never }),
+      ],
+      allProjects: true,
+      nowMs: NOW_MS,
+      checkProcSig: false,
+      selfSessionId: null,
+      paneBusy: new Map([[BUSY_SID, true]]),
+    });
+    const a = snap.agents[0];
+    // A wedged process leaves "esc to interrupt" frozen in the pane buffer; past the
+    // bound it hands off to idle (→ possibly_stalled), never reads active off a stale glyph.
+    assert.equal(a.liveness, "idle");
+    assert.equal(a.liveness_reason, "idle");
+  });
+});
+
+test("liveness: stale transcript AND not busy ⇒ stays idle (negative control)", () => {
   withHome((home) => {
     const tx = writeTranscript(home, "tx-quiet2.jsonl", 600);
     const snap = buildSnapshot({

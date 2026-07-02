@@ -278,6 +278,16 @@ type CapturableAgent = AgentRef & {
 // `status --all` across many projects can't fork dozens of capture-panes (max).
 export const CAPTURE_FLEET_CAP = 16;
 
+// Project a captured pane-activity map down to the busy signal buildSnapshot needs for
+// liveness: agentKey → true where the pane shows "esc to interrupt" (a turn in flight).
+// Only truthy entries are kept — an absent key means "not busy" (buildAgent treats a
+// missing key as not-busy), so idle/uncaptured agents fall through to the read signals.
+export function busyMapFromPanes(panes: Map<string, PaneActivity>): Map<string, boolean> {
+  const busy = new Map<string, boolean>();
+  for (const [key, pa] of panes) if (pa.pane_busy) busy.set(key, true);
+  return busy;
+}
+
 // Capture EVERY eligible agent's pane (one exec each, up to CAPTURE_FLEET_CAP) — for
 // the one-shot `oxtail status`, where on-demand exec cost is acceptable. The TUI does
 // NOT use this (it captures the selected row only). Skips dead (nothing to show),

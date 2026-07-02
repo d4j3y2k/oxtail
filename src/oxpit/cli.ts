@@ -2,7 +2,9 @@
 // (interactive TUI). Both are thin wrappers over the pure snapshot/render layer.
 
 import { buildSnapshot } from "./snapshot.js";
-import { captureFleetPanes, type PaneActivity } from "./activity.js";
+import { busyMapFromPanes, captureFleetPanes, type PaneActivity } from "./activity.js";
+import { isAlive, readAllPassive, resolveJumpablePids, type RegistryEntry } from "../registry.js";
+import { panePresence, type PaneInfo } from "./jump.js";
 import { computeAgentLabels, fleetTrouble, renderCommsLog, renderSnapshot, type FleetTrouble } from "./render.js";
 import { buildCommsLog } from "./comms.js";
 import {
@@ -150,11 +152,45 @@ export function runStatus(
     out(USAGE);
     return 0;
   }
-  const snap = buildSnapshot({
+  // Read every fleet-derivation input ONCE and reuse across the two builds below — the
+  // TTY path rebuilds the snapshot with the captured pane_busy signal, and both builds
+  // must see an IDENTICAL fleet (same entries, same pane table, AND the same ps-based
+  // background/liveness classification) so the busy map — captured against build 1's
+  // fleet — lands on the same rows in build 2. Memoizing these also means no second
+  // registry read / list-panes / ps fork: the rebuild is one extra PURE build.
+  let cachedEntries: RegistryEntry[] | null = null;
+  let cachedPaneInfo: Map<string, PaneInfo> | null = null;
+  let cachedJumpable: Set<number> | null = null;
+  const aliveCache = new Map<number, boolean>();
+  const baseOpts = {
     allProjects: a.all,
     projectRoot: a.project,
     readActivity: !a.noActivity, // real-time tool sub-state badges (on by default)
-  });
+    readEntries: () => (cachedEntries ??= readAllPassive()),
+    resolvePaneInfo: () => (cachedPaneInfo ??= panePresence()),
+    // Same in-scope entries ⇒ same pid list both builds, so caching the first Set is
+    // valid (and pins the foreground/background split against a single ps sample).
+    resolveJumpablePids: (pids: number[]) => (cachedJumpable ??= resolveJumpablePids(pids)),
+    isAlive: (pid: number) => {
+      let v = aliveCache.get(pid);
+      if (v === undefined) aliveCache.set(pid, (v = isAlive(pid)));
+      return v;
+    },
+  };
+  let snap = buildSnapshot(baseOpts);
+  // Enrich liveness with the content-verified busy signal (pane_fresh from "esc to
+  // interrupt"), so the HUMAN render AND `--json` report the SAME liveness for the same
+  // fleet. EXEC-class, so gated on a TTY — a piped/CI `--json` (isTTY false) stays pure
+  // read-class and forks NO capture-pane. Reuses the cached reads ⇒ one extra pure build.
+  let paneActivity: Map<string, PaneActivity> | undefined;
+  if (!a.noActivity && process.stdout.isTTY) {
+    try {
+      paneActivity = captureFleetPanes(snap.agents);
+      snap = buildSnapshot({ ...baseOpts, paneBusy: busyMapFromPanes(paneActivity) });
+    } catch {
+      paneActivity = undefined; // tmux absent / capture failed — degrade silently
+    }
+  }
   const limit = a.limit && Number.isFinite(a.limit) && a.limit > 0 ? a.limit : DEFAULT_LOG_LIMIT;
   // --check: a HARD fleet problem makes the one-shot a scriptable health probe (see
   // checkExitCode for what does/doesn't count).
@@ -168,17 +204,6 @@ export function runStatus(
   }
   const color = a.color ?? autoColor();
   const width = a.width && Number.isFinite(a.width) ? a.width : process.stdout.columns || 100;
-  // Live pane bottom-line per agent (capture-pane). EXEC-class, so auto-off when
-  // stdout isn't a TTY (piped / `watch` / scripts) — don't fork capture-pane for
-  // every agent in a non-interactive run. The read-class tool badges still show.
-  let paneActivity: Map<string, PaneActivity> | undefined;
-  if (!a.noActivity && process.stdout.isTTY) {
-    try {
-      paneActivity = captureFleetPanes(snap.agents);
-    } catch {
-      paneActivity = undefined; // tmux absent / capture failed — degrade silently
-    }
-  }
   out(renderSnapshot(snap, { color, width, paneActivity }));
   if (a.log) {
     // Background (detached) peers can still have sent/received fleet mail — include

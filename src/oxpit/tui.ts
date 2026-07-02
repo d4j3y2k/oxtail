@@ -17,7 +17,14 @@ import { dirname, join } from "node:path";
 import { buildSnapshot, type FleetAgent, type FleetSnapshot } from "./snapshot.js";
 import { ANIM_FRAMES, attentionLine, BACKGROUND_ROW_CAP, commsBodyLines, computeAgentLabels, renderDock, renderSnapshot, windowWithMarkers } from "./render.js";
 import { buildCommsLog, type CommsMessage } from "./comms.js";
-import { agentKey, capturePaneActivity, type AgentActivity, type PaneActivity } from "./activity.js";
+import {
+  agentKey,
+  busyMapFromPanes,
+  capturePaneActivity,
+  captureFleetPanes,
+  type AgentActivity,
+  type PaneActivity,
+} from "./activity.js";
 import { clipToWidth, scrubBufferText } from "./format.js";
 import { jumpToAgent, realTmux } from "./jump.js";
 import { NUDGE_TEXT, sendOperatorMessage } from "./operator.js";
@@ -349,6 +356,12 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
     let paneActivity = new Map<string, PaneActivity>();
     let lastCapKey: string | null = null; // agentKey of the last pane we captured
     let lastCapAt: number | null = null; // absolute pty-activity epoch at that capture
+    // Content-verified per-agent busy signal (agentKey → "esc to interrupt" present),
+    // refreshed by a bounded fleet capture-pane on the SLOW tick and threaded into the
+    // build so a working-but-quiet-transcript agent reads active/pane_fresh — WITHOUT
+    // the old repaint-timestamp pane_fresh that read every idle agent falsely active.
+    // Sticky across the cheap fast ticks (they reuse it, no fork), like activityCache.
+    let fleetBusy = new Map<string, boolean>();
     let status = "";
     let statusUntil = 0;
     let debounceTimer: NodeJS.Timeout | null = null;
@@ -1145,7 +1158,24 @@ function runInteractive(opts: InteractiveOpts): Promise<number> {
       // bounded and stops at the first tool_use, so a per-tick read is cheap. The
       // sticky activityCache still backs the renderer's toolActivity overlay (a torn/
       // degraded read blips the badge off for one tick instead of forking truth).
-      snapshot = buildSnapshot({ ...opts.buildOpts, checkProcSig: full, readActivity: true });
+      // On the slow/forced tick, refresh the content-verified busy map with a bounded
+      // fleet capture-pane (rides `full` alongside the costly checkProcSig, so the 200ms
+      // fast ticks reuse the sticky map with no fork). Captured from the CURRENT agent
+      // set (about to be rebuilt below), which is stable tick-to-tick; a brand-new agent
+      // is picked up on the next slow tick. Skips self/dead/pane-less, capped internally.
+      if (full) {
+        try {
+          fleetBusy = busyMapFromPanes(captureFleetPanes(snapshot.agents));
+        } catch {
+          fleetBusy = new Map(); // tmux absent / capture failed — degrade to read-class liveness
+        }
+      }
+      snapshot = buildSnapshot({
+        ...opts.buildOpts,
+        checkProcSig: full,
+        readActivity: true,
+        paneBusy: fleetBusy,
+      });
       applyDockAutoSelect(); // re-snap to our window-agent once it registers (until the user moves)
       activityCache = new Map(snapshot.agents.map((a) => [agentKey(a), a.activity]));
       // Burst any agent whose liveness CHANGED since the last build ("becomes awake",
