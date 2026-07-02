@@ -8,6 +8,25 @@ behavioral changes). Dates are release dates of the published npm tag.
 The hook protocol has its own version (`HOOK_MARKER_VERSION`); when it bumps,
 re-run `npx oxtail install-hook`. The current hook version is noted per release.
 
+## [0.32.1] — 2026-07-02
+
+**oxpit's 🟢 stops lying — idle agents no longer read "active" forever.**
+- The cockpit painted every idle peer green. `pane_fresh` (the "working right now"
+  liveness signal) fired off tmux's pane-repaint *timestamp*, which advances on **any**
+  pty output. Two things keep that timestamp perpetually fresh for an idle agent: the
+  dock cockpit puts a second pane (the oxpit dock, repainting every second) in every
+  agent window — bumping the window-scoped `window_activity` — and an idle client TUI
+  keeps ticking its "Worked for Ns" counter. So a fresh repaint ≠ working, and the glyph
+  lied. A lying green also killed the "awaiting you" worklist (nothing ever read idle).
+- Fix: `pane_fresh` is now sourced from a **content-verified** signal — the client's own
+  "esc to interrupt" marker in the captured pane (present only while a turn is in flight,
+  for both Claude Code and Codex), not the repaint timestamp. Bounded like `tool_running`
+  so a wedged process (frozen glyph) hands off to idle→possibly-stalled instead of reading
+  active forever. `oxtail status` captures the fleet; the TUI refreshes a bounded busy
+  map on its slow tick; `--json` and the human view report the same liveness on a TTY.
+- Verified live (before/after on the same idle fleet) and hardened by a 3-lens compile-sim
+  pass. Pre-existing bug (not introduced by v0.32.0). No hook-protocol change (still v14).
+
 ## [0.32.0] — 2026-07-01
 
 **A silent delegated peer now self-heals — a delegator never waits forever for a reply that never comes ("scenario B").**
