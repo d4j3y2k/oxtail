@@ -60,6 +60,7 @@ import {
   type WakeStatus,
 } from "./wake.js";
 import { recordWakeIntent, runSelfHealTick, SELF_WAKE_INTERVAL_MS } from "./self-heal.js";
+import { runWaiterHealTick, WAITER_HEAL_INTERVAL_MS } from "./waiter-heal.js";
 
 // CLI subcommand dispatch must run before any MCP setup so that
 // `npx oxtail install-hook` doesn't open an MCP transport or register a
@@ -642,12 +643,14 @@ const entry = buildEntry(client);
 maybeRecoverStickyClaim();
 register(entry);
 
-// Self-heal watchdog timer (assigned in the invokedDirectly block below). Module-
-// scoped so cleanup can clear it on every exit path.
+// Self-heal + waiter-heal watchdog timers (assigned in the invokedDirectly block
+// below). Module-scoped so cleanup can clear them on every exit path.
 let selfHealTimer: ReturnType<typeof setInterval> | undefined;
+let waiterHealTimer: ReturnType<typeof setInterval> | undefined;
 
 const cleanup = (): void => {
   if (selfHealTimer) clearInterval(selfHealTimer);
+  if (waiterHealTimer) clearInterval(waiterHealTimer);
   unregister(entry.server_pid);
 };
 process.on("exit", cleanup);
@@ -1256,10 +1259,49 @@ server.registerTool(
       !!action_required &&
       peer.client.session_id != null &&
       peer.capabilities?.mailbox?.obligations === true;
+    // Waiter-side expectation (the two-sided half of a durable delegation): give the
+    // SENDER a durable "I'm owed a result" record — keyed exactly like an ask_peer
+    // wait — so the sender's OWN server watchdog (waiter-heal.ts) can re-poke the peer
+    // when a delegated result never comes (scenario B), and the peer's complete_work
+    // consumes it via the EXISTING reply-correlation path (resolveSendWake →
+    // consumePendingAsk). Only for a real durable obligation with a claimed sender: a
+    // non-durable action_required has no obligation the peer can close, so no
+    // expectation could ever be satisfied — recording one would just re-poke pointlessly.
+    // Mint a request_id so complete_work's reply_to correlates; pre-mint the message id
+    // so the expectation stores the delegation's msg_id (its delivery RECEIPT is the
+    // watchdog's pre-/post-receipt pivot). RECORDED BEFORE deliver (record-before-append):
+    // if the sender crashes right after enqueue, the record already exists to pull it back.
+    // Gate: a real durable obligation, a claimed sender to own the expectation, AND
+    // the caller did NOT explicitly opt out of wakes. wake:"off" is fire-and-forget,
+    // so it must NOT earn a delayed waiter-heal re-poke either — recording an
+    // expectation there would fire a wake 4 min later and break the wake:"off"
+    // contract (codex F2), inconsistent with the late-reply path that consumes-but-
+    // does-not-wake under explicit off.
+    const wantWaiterExpectation = obligationDurable && !!fromSessionId && wake !== "off";
+    const delegationRequestId = wantWaiterExpectation ? randomBytes(8).toString("hex") : undefined;
+    const delegationMsgId = delegationRequestId ? randomBytes(8).toString("hex") : undefined;
+    if (delegationRequestId && delegationMsgId && fromSessionId) {
+      recordPendingAsk(defaultPendingAskDir(), fromSessionId, delegationRequestId, Date.now(), {
+        target: peer.client.session_id,
+        messageId: delegationMsgId,
+        ownerEpoch: entry.started_at,
+      });
+    }
+    // NOTE (codex F1): the expectation is recorded BEFORE deliver and is deliberately
+    // NOT rolled back if deliverToPeer throws. deliverToPeer writes B's obligation
+    // ledger BEFORE the mailbox append, so a POST-ledger append failure leaves B with
+    // an OPEN obligation and no mailbox line/receipt/wake — the surviving expectation
+    // is exactly what lets waiter-heal re-poke B into read_my_messages/my_open_work to
+    // discover and act on it. A PRE-ledger failure (H1: ledger write aborted) leaves
+    // nothing on B; the orphan expectation then simply ages out via TTL after a few
+    // throttled no-op re-pokes (harmless, bounded). Either way the throw still
+    // propagates (H1 fail-loud → the sender sees the error and can retry).
     const msg = deliverToPeer(routeFor(peer), body, fromSessionId, {
       reply_to,
       source_message_id,
       action_required: obligationDurable,
+      ...(delegationRequestId ? { request_id: delegationRequestId } : {}),
+      ...(delegationMsgId ? { id: delegationMsgId } : {}),
     });
     const { wake_status, wake_reason, delivery_outlook } = await resolveSendWake(peer, effectiveWake, reply_to);
     // Self-heal backstop: if a wake was intended but not confidently delivered,
@@ -2212,7 +2254,17 @@ server.registerTool(
         // Write the pending obligation BEFORE the final drain (write-before-
         // final-drain): a reply that lands after the drain finds this record and
         // wakes us via resolveSendWake; one that landed before is caught below.
-        if (!recordPendingAsk(dir, fromSessionId, requestId, Date.now())) {
+        // Attach the waiter-expectation metadata (target peer, the ask's msg_id for
+        // the receipt pivot, our incarnation epoch) so waiter-heal.ts can also
+        // re-poke a timed-out ask whose peer went silent (scenario B), not just an
+        // action_required delegation.
+        if (
+          !recordPendingAsk(dir, fromSessionId, requestId, Date.now(), {
+            target: expectedSessionId,
+            messageId: msg.id,
+            ownerEpoch: entry.started_at,
+          })
+        ) {
           // Store unwritable → silently degrades to the read_my_messages path
           // (no durable pull-back). Surface it so the degradation is observable.
           trace("ask_peer_pending_record_failed", { request_id: requestId });
@@ -2410,6 +2462,17 @@ if (invokedDirectly) {
     void runSelfHealTick(entry).catch((e) => trace("self_heal_tick_error", { error: String(e) }));
   }, SELF_WAKE_INTERVAL_MS);
   selfHealTimer.unref?.();
+
+  // Waiter-heal watchdog (scenario B). The sibling of self-heal: from the waiter's
+  // OWN server — the process alive while THIS agent is the blocked party — re-poke a
+  // delegated peer that has gone silent (a durable expectation past its grace with no
+  // receipt), so a peer that never replies self-heals instead of stalling the fleet.
+  // Same unref'd + never-throws posture as self-heal; longer interval (a re-poke is
+  // less urgent, and the spacing keeps the cross-agent keystroke rate low).
+  waiterHealTimer = setInterval(() => {
+    void runWaiterHealTick(entry).catch((e) => trace("waiter_heal_tick_error", { error: String(e) }));
+  }, WAITER_HEAL_INTERVAL_MS);
+  waiterHealTimer.unref?.();
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

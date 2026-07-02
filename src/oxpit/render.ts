@@ -257,7 +257,11 @@ function badges(
       (w.target_short_id && labels.get(w.target_short_id)) || w.target_short_id || "?";
     // Default framing is "awaiting reply" — a timed-out ask_peer is parked for a
     // late reply, NOT synchronously blocked. Hard DEADLOCK only for a live cycle.
-    let raw = `⏳${tgt} ${fmtAge(w.age_s)}`;
+    // A re-poke suffix (waiter-heal has been nudging this silent target) — appended
+    // to the normal "awaiting" framing so the operator sees the wait is being WORKED,
+    // not just aging. Suppressed for the cycle/orphan alarms (those own the framing).
+    const repoke = w.repoke_attempts > 0 ? ` ↻${w.repoke_attempts}` : "";
+    let raw = `⏳${tgt} ${fmtAge(w.age_s)}${repoke}`;
     let codes = [C.yellow];
     if (w.in_cycle && w.cycle_all_live) {
       raw = `⛔DEADLOCK ${tgt}`;

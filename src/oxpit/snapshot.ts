@@ -124,6 +124,10 @@ export type WaitEdge = {
   // the cycle this edge belongs to has all members alive ⇒ a credible LIVE
   // deadlock; false ⇒ stale/possible cycle (don't render a hard DEADLOCK).
   cycle_all_live: boolean;
+  // How many times the waiter's own server has RE-POKED the target (waiter-heal,
+  // v0.32). 0 = a normal parked wait; >0 = the waiter has been actively nudging a
+  // silent peer, so the operator sees this wait is being worked, not just aging.
+  repoke_attempts: number;
 };
 
 export type FleetAgent = {
@@ -318,7 +322,7 @@ function countUnread(sessionId: string): { count: number; confidence: Confidence
   return { count: seenIds.size, confidence: degraded ? "low" : "high" };
 }
 
-type PendingAsk = { requestId: string; ageS: number };
+type PendingAsk = { requestId: string; ageS: number; attempts: number };
 
 // Read the pending-ask registry into a map: requester session_id → freshest live
 // pending ask. A record is the durable note that an agent's ask_peer timed out and
@@ -330,11 +334,16 @@ function readPendingAsks(nowMs: number): Map<string, PendingAsk> {
   for (const rec of listLivePendingAsks(defaultPendingAskDir(), nowMs)) {
     const prior = out.get(rec.sessionId);
     if (!prior || rec.mtimeMs > prior.mtimeMs) {
-      out.set(rec.sessionId, { requestId: rec.requestId, ageS: rec.ageS, mtimeMs: rec.mtimeMs });
+      out.set(rec.sessionId, {
+        requestId: rec.requestId,
+        ageS: rec.ageS,
+        attempts: rec.attempts,
+        mtimeMs: rec.mtimeMs,
+      });
     }
   }
   const result = new Map<string, PendingAsk>();
-  for (const [sid, v] of out) result.set(sid, { requestId: v.requestId, ageS: v.ageS });
+  for (const [sid, v] of out) result.set(sid, { requestId: v.requestId, ageS: v.ageS, attempts: v.attempts });
   return result;
 }
 
@@ -591,6 +600,7 @@ function buildAgent(e: RegistryEntry, ctx: AgentCtx): FleetAgent {
         orphaned: false,
         in_cycle: false,
         cycle_all_live: false,
+        repoke_attempts: pend.attempts,
       }
     : null;
 

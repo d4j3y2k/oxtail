@@ -25,6 +25,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  renameSync,
   statSync,
   unlinkSync,
   utimesSync,
@@ -61,6 +62,13 @@ function recordPath(dir: string, sessionId: string, requestId: string): string {
   return join(dir, `p-${hash(JSON.stringify([sessionId, requestId]))}`);
 }
 
+// Exact record-file shape. `listLivePendingAsks` matches on THIS (not a bare `p`
+// prefix) so a bumpPendingAskAttempt temp orphaned by a crash
+// (`p-<hash>.tmp.<pid>.<hex>`) is never mistaken for a real record. gc keeps the
+// broad `p` prefix so it still reclaims such orphans by age. (Mirrors
+// pending-wake.ts's RECORD_RE — the phantom-record fix.)
+const RECORD_RE = /^p-[0-9a-f]{32}$/;
+
 function setMtime(path: string, nowMs: number): void {
   const t = nowMs / 1000;
   try {
@@ -71,15 +79,56 @@ function setMtime(path: string, nowMs: number): void {
   }
 }
 
+// The durable record body. `sessionId`/`requestId`/`at` are the original v0.15
+// fields (every consumer keys on these). The rest are the v0.32 WAITER-EXPECTATION
+// extension: they let the owner's OWN server watchdog (waiter-heal.ts) re-poke the
+// awaited peer when a delegated result never comes (scenario B) — all OPTIONAL so a
+// legacy record (or a record written by the original 4-arg recordPendingAsk) still
+// parses and behaves exactly as before.
+//   target       — the awaited peer's session_id (who to re-poke).
+//   messageId    — the delegation/ask outbound message_id (its delivery RECEIPT is
+//                  the pre-/post-receipt pivot: no receipt ⇒ re-poke; receipt but no
+//                  reply ⇒ stop poking, escalate).
+//   ownerEpoch   — the owner server's started_at (seconds) at record time — the
+//                  de-facto incarnation stamp (no epoch field exists in the registry;
+//                  started_at is the tiebreaker used by dedupeBySessionId). Recorded for
+//                  PROVENANCE/observability (which incarnation created this) — it is NOT
+//                  currently read for any adoption decision: adopt-on-restart falls out of
+//                  the session-keyed store (a restarted owner shares its session_id and so
+//                  lists its own orphans), and dual-scope sibling serialization is done by
+//                  the atomic per-target claim (waiter-heal claimWaiterRepoke), not epoch.
+//   attempts     — re-poke count (capped, mirrors pending-wake).
+//   lastRepokeAt — last re-poke wall-clock (debug/observability).
+type PendingAskBody = {
+  sessionId: string;
+  requestId: string;
+  at: number;
+  target?: string | null;
+  messageId?: string;
+  ownerEpoch?: number;
+  attempts?: number;
+  lastRepokeAt?: number | null;
+};
+
+// Optional waiter-expectation metadata passed at record time (see PendingAskBody).
+export type PendingAskMeta = {
+  target?: string | null;
+  messageId?: string;
+  ownerEpoch?: number;
+};
+
 // Record a pending ask. Atomic create-exclusive so a duplicate record (same
 // requester + request_id) is a no-op rather than resetting the TTL clock.
 // Returns true if a record now exists for this pair (freshly written OR already
 // present), false only on a missing identity or an unusable store. Never throws.
+// `meta` (optional) attaches the waiter-expectation fields; omitting it writes the
+// original v0.15 shape.
 export function recordPendingAsk(
   dir: string,
   sessionId: string | null,
   requestId: string,
   nowMs: number,
+  meta?: PendingAskMeta,
 ): boolean {
   // Never key on an empty identity: an unclaimed requester can't be correlated
   // or replied-to, so there's nothing to wake later.
@@ -90,7 +139,15 @@ export function recordPendingAsk(
     try {
       const fd = openSync(p, "wx"); // atomic create-exclusive
       try {
-        writeFileSync(fd, JSON.stringify({ sessionId, requestId, at: nowMs }));
+        const body: PendingAskBody = { sessionId, requestId, at: nowMs };
+        if (meta) {
+          if (meta.target !== undefined) body.target = meta.target;
+          if (meta.messageId !== undefined) body.messageId = meta.messageId;
+          if (meta.ownerEpoch !== undefined) body.ownerEpoch = meta.ownerEpoch;
+          body.attempts = 0;
+          body.lastRepokeAt = null;
+        }
+        writeFileSync(fd, JSON.stringify(body));
       } finally {
         closeSync(fd);
       }
@@ -171,6 +228,11 @@ export type LivePendingAsk = {
   requestId: string;
   ageS: number;
   mtimeMs: number;
+  // Waiter-expectation fields (present only on v0.32+ records; see PendingAskBody).
+  target?: string | null;
+  messageId?: string;
+  ownerEpoch?: number;
+  attempts: number;
 };
 
 // Canonical read-only listing of every LIVE (within-TTL) pending ask. A read-only
@@ -192,7 +254,7 @@ export function listLivePendingAsks(
   }
   const out: LivePendingAsk[] = [];
   for (const name of names) {
-    if (name[0] !== "p") continue;
+    if (!RECORD_RE.test(name)) continue; // exact shape — skip crash-orphaned .tmp files
     const p = join(dir, name);
     let mtimeMs: number;
     try {
@@ -201,9 +263,9 @@ export function listLivePendingAsks(
       continue;
     }
     if (nowMs - mtimeMs >= ttlMs) continue; // stale → not a live wait
-    let body: { sessionId?: string; requestId?: string };
+    let body: Partial<PendingAskBody>;
     try {
-      body = JSON.parse(readFileSync(p, "utf8")) as { sessionId?: string; requestId?: string };
+      body = JSON.parse(readFileSync(p, "utf8")) as Partial<PendingAskBody>;
     } catch {
       continue;
     }
@@ -213,9 +275,64 @@ export function listLivePendingAsks(
       requestId: body.requestId,
       ageS: Math.max(0, Math.floor((nowMs - mtimeMs) / 1000)),
       mtimeMs,
+      target: body.target ?? undefined,
+      messageId: body.messageId,
+      ownerEpoch: body.ownerEpoch,
+      attempts: typeof body.attempts === "number" && body.attempts >= 0 ? body.attempts : 0,
     });
   }
   return out;
+}
+
+// Waiter-watchdog view: every LIVE pending-ask OWNED by `ownerSessionId` (the
+// blocked/requesting agent). Filters the canonical listing so the staleness rule
+// stays in one place. A restarted owner shares its session_id, so its own
+// pre-crash records surface here automatically (adopt-on-restart is a property of
+// the session-keyed store; ownerEpoch only DISAMBIGUATES own-orphan vs live-sibling).
+export function listPendingAsksForOwner(
+  dir: string,
+  ownerSessionId: string | null,
+  nowMs: number,
+  ttlMs: number = PENDING_ASK_TTL_MS,
+): LivePendingAsk[] {
+  if (!ownerSessionId) return [];
+  return listLivePendingAsks(dir, nowMs, ttlMs).filter((r) => r.sessionId === ownerSessionId);
+}
+
+// Increment a record's re-poke attempt counter WITHOUT touching its mtime (mtime
+// is the TTL clock; a re-poke must NOT extend the tracking window). Atomic
+// temp+rename with the original mtime restored on the TMP before the swap, so the
+// record carries the TTL clock the instant it becomes visible — mirrors
+// pending-wake.ts:bumpAttempt exactly. Best-effort; never throws.
+export function bumpPendingAskAttempt(
+  dir: string,
+  sessionId: string | null,
+  requestId: string,
+  nowMs: number,
+): void {
+  if (!sessionId || !requestId) return;
+  const p = recordPath(dir, sessionId, requestId);
+  try {
+    const st = statSync(p);
+    const body = JSON.parse(readFileSync(p, "utf8")) as PendingAskBody;
+    body.attempts = (typeof body.attempts === "number" ? body.attempts : 0) + 1;
+    body.lastRepokeAt = nowMs;
+    const tmp = `${p}.tmp.${process.pid}.${createHash("sha256").update(String(nowMs)).digest("hex").slice(0, 8)}`;
+    try {
+      writeFileSync(tmp, JSON.stringify(body), { mode: 0o600 });
+      setMtime(tmp, st.mtimeMs); // restore TTL clock on the TMP, before the atomic swap
+      renameSync(tmp, p);
+    } catch (err) {
+      try {
+        unlinkSync(tmp);
+      } catch {
+        // already gone
+      }
+      throw err;
+    }
+  } catch {
+    // record gone / store error — best effort
+  }
 }
 
 // Remove pending-ask records older than the TTL. Cheap, low-volume dir; run

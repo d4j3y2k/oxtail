@@ -8,6 +8,40 @@ behavioral changes). Dates are release dates of the published npm tag.
 The hook protocol has its own version (`HOOK_MARKER_VERSION`); when it bumps,
 re-run `npx oxtail install-hook`. The current hook version is noted per release.
 
+## [0.32.0] — 2026-07-01
+
+**A silent delegated peer now self-heals — a delegator never waits forever for a reply that never comes ("scenario B").**
+- Closes the counterpart to v0.31's dropped-baton fix. v0.31 recovers a *missed wake on a
+  delivered reply*; it does nothing when the peer **never replies at all** — it stalls
+  mid-task, dies, or silently drops the delegation. Until now the delegator sat idle
+  forever until a human poked it.
+- The fix runs from the one process alive exactly when *this* agent is the blocked party:
+  the delegator's **own MCP server**. A durable `action_required` delegation now records a
+  waiter-side **expectation** (before delivery), making delegation *two-sided* — the
+  delegator gets an "I'm owed a result" record symmetric to the receiver's obligation. A
+  new waiter watchdog scans those expectations and, past a grace longer than v0.31's whole
+  retry window, **re-pokes the silent peer** so it drains the delegation and acts. This
+  also covers a missed wake to a *waited-on* Codex recipient from the outside — no idle
+  proxy needed.
+- **Two-phase, off the delivery receipt:** pre-receipt (the wake missed) → one bounded
+  re-poke; post-receipt-but-no-reply (the peer has it, can't tell working-from-dropped) →
+  stop poking, surface it to the operator. Every re-poke fires **only** through the
+  verified resolver (live process-tree pane, proc_sig/pid-reuse guarded — never a stored
+  pane), respects the peer's own busy gate, and is bounded by an atomic per-target
+  single-winner claim (dual-scope siblings + multiple waiters coalesce), a per-record cap,
+  and the existing `OXTAIL_SELF_WAKE` / `OXTAIL_AUTOWAKE` kill-switches. Adopt-on-restart is
+  automatic (expectations are session-keyed). A peer's reply consumes the expectation via
+  the existing correlation path — no new consume seam.
+- **oxpit** shows the re-poke count on a wait (`⏳codex 5m ↻2`), so a stuck delegation reads
+  as *worked*, not merely aging.
+- **`oxpit dock` / `oxtail setup` model picker** gains **Fable 5** (`claude --model fable`).
+- Tunables: `OXTAIL_WAITER_HEAL_INTERVAL_MS` / `_GRACE_MS` / `_THROTTLE_MS` / `_CAP`. Hooks
+  unchanged (still v14). Verified with the fleet: codex adversarial review (3 findings, 2
+  HIGH) + a 3-lens compile-sim (1 MEDIUM) + a live send-keys fire-path check.
+- Deferred to a follow-up: the hookless-waiter reply-leg self-nudge (Codex-as-requester
+  whose pull-back wake missed) — it relaxes v0.31's self-heal `no_marker` gate and gets its
+  own focused safety pass, matching how v0.31 deferred hookless coverage.
+
 ## [0.31.0] — 2026-07-01
 
 **A missed wake now self-heals — an idle agent never sits forever on undrained mail.**
